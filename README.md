@@ -109,9 +109,84 @@ PSK 两端必须一致。客户端 `pinned_spki_sha256` 填上一步打印的值
 | `metrics_listen` | Prometheus `/metrics`；空 = 不听 | 空 |
 | `instance_name` | 实例名；打开 `[obs.otel]` 时必填 | 空 |
 
-远程 OTLP 默认关。打开后 metrics / logs / traces 走同一 Resource（`nya.project=nya-link-aggregation`，`service.name=nya-client|nya-server`，`nya.instance.name` = `instance_name`）。stderr 仍用 `RUST_LOG`；OTLP 日志级别是 `[obs.otel.logs].level`（默认 `info`）。batch 默认 `queue_size=8192`、`batch_size=512`、`delay_ms=5000`。示例 collector：[`examples/otel-collector.yaml`](examples/otel-collector.yaml)。紧急关闭：`OTEL_SDK_DISABLED=true`。
+## 远程 OTLP
 
-Prometheus 里点号会变成下划线：`{nya_project="nya-link-aggregation",nya_instance_name="edge-sh-03"}`。Loki 必须在 collector 里把这四个键做成 stream label。histogram 分位数只保证 loopback `/metrics`；OTLP 路径是兼容 series。
+默认关，不配 `[obs.otel].enabled = true` 就不会连 collector。打开时 **必须** 有非空 `instance_name`（或环境变量 `NYA_INSTANCE_NAME`），否则进程拒绝启动。完整键表、信号开关、PII、span 清单见 [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md)「远程 OTLP」。示例 collector：[`examples/otel-collector.yaml`](examples/otel-collector.yaml)。
+
+`[obs.otel]`（未知键是解析错误）：
+
+| 键 | 含义 | 默认 |
+| --- | --- | --- |
+| `enabled` | 总开关；`false` 时三信号全关 | `false` |
+| `endpoint` | OTLP 基址，如 `http://127.0.0.1:4318` | 空（开启时必填，或用 env） |
+| `protocol` | `http/protobuf` 或 `grpc` | `http/protobuf` |
+| `gzip` | 压缩 | `true` |
+| `timeout_ms` | 每次导出超时；traces/logs shutdown flush | 5000 |
+| `export_interval_ms` | **仅 metrics** 推送周期 | 10000 |
+| `sample_ratio` | traces 采样，须在 `[0.0, 1.0]` | `1.0` |
+| `environment` | Resource `deployment.environment`；空则省略 | 空 |
+| `redact_targets` | **仅 OTLP logs**：`host` / `target` 等改成 `*` | `false` |
+| `[obs.otel.headers]` | HTTP 头 / gRPC metadata。用来做 **Basic / Bearer** | 空 |
+
+嵌套 `[obs.otel.traces]` / `[obs.otel.metrics]` / `[obs.otel.logs]`：
+
+| 键 | 适用 | 含义 | 默认 |
+| --- | --- | --- | --- |
+| `enabled` | 三路 | `false` 关这一路；缺省跟随父 `enabled` | 跟随父 |
+| `endpoint` | 三路 | 覆盖父 endpoint | 父 / env |
+| `level` | **仅 logs** | OTLP 最低级别 `error\|warn\|info\|debug\|trace`。stderr 仍是 `RUST_LOG` | `info` |
+| `queue_size` | logs、traces | 内存队列 | 8192 |
+| `batch_size` | logs、traces | 单次导出条数，须 `<= queue_size` | 512 |
+| `delay_ms` | logs、traces | 定时 flush，最小 10 | 5000 |
+
+`level` 写在 metrics/traces 下、或 `queue_size` 写在 metrics 下，启动失败。gRPC 需要编译 `--features otel-grpc`，否则 `protocol = "grpc"` 启动失败。发行包默认带 OTel SDK，运行时仍默认不导出；`--no-default-features` 编出不含 SDK 的二进制。
+
+HTTP Basic Auth（没有单独的 username/password 键）：
+
+```toml
+[obs]
+instance_name = "edge-sh-03"
+
+[obs.otel]
+enabled = true
+endpoint = "http://collector:4318"
+protocol = "http/protobuf"
+
+[obs.otel.headers]
+Authorization = "Basic dXNlcjpwYXNz"
+```
+
+`dXNlcjpwYXNz` 是 `user:pass` 的 Base64（`printf 'user:pass' | base64`）。Bearer：`Authorization = "Bearer <token>"`。头值不会打进业务日志。
+
+环境变量（**非空 TOML 赢**；`OTEL_SDK_DISABLED=true` 或 `1` **永远**关整栈）：
+
+| 变量 | 作用 |
+| --- | --- |
+| `OTEL_SDK_DISABLED` | `true`/`1` 紧急关闭 |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | TOML `endpoint` 为空时使用 |
+| `OTEL_EXPORTER_OTLP_PROTOCOL` | TOML `protocol` 为空时：`http/protobuf` / `http` / `grpc` |
+| `OTEL_EXPORTER_OTLP_HEADERS` | 逗号分隔 `k=v`，与 TOML headers 合并，同名 TOML 赢 |
+| `OTEL_RESOURCE_ATTRIBUTES` | 追加 Resource；不能覆盖 `service.namespace` / `service.name` / `service.instance.id` / `nya.project` / `nya.instance.name` |
+| `NYA_INSTANCE_NAME` | TOML `instance_name` 为空时使用 |
+| `NYA_OTEL_LOG_LEVEL` | TOML `[obs.otel.logs].level` 为空时使用 |
+
+不读 `OTEL_SERVICE_NAME`（避免把 `service.name` 打成 `client` 撞车）。Ctrl-C 先停 overlay 再 flush。
+
+过滤（Prometheus 把 `.` 变成 `_`；Tempo 保留点；Loki **必须**在 collector 里把 Resource 做成 stream label，见示例 yaml）：
+
+```promql
+nya_failbacks_total{nya_project="nya-link-aggregation", nya_instance_name="edge-sh-03"}
+```
+
+```logql
+{nya_project="nya-link-aggregation", service_name="nya-client", nya_instance_name="edge-sh-03"}
+```
+
+```traceql
+{resource.nya.project="nya-link-aggregation" && resource.nya.instance.name="edge-sh-03"}
+```
+
+OTLP histogram 是 `_bucket`/`_sum`/`_count` 兼容 series，**不能** `histogram_quantile`；分位数只用 loopback `/metrics`。
 
 健康判定、failback 公式、队列深度等在 `nya_core::Tuning`，**不能**写进 TOML。改算法请改 `Tuning::STANDARD` 并跑 e2e，不要给运维暴露一堆旋钮。
 

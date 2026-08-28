@@ -19,15 +19,32 @@ max_paths = 32
 # instance_name = "edge-sh-03"
 #
 # Remote OTLP (default off). instance_name is required when enabled.
+# No username/password keys: HTTP Basic/Bearer go in [obs.otel.headers].
 # [obs.otel]
 # enabled = true
 # endpoint = "http://127.0.0.1:4318"
-# protocol = "http/protobuf"
+# protocol = "http/protobuf"   # or grpc (rebuild --features otel-grpc)
+# gzip = true
+# timeout_ms = 5000
+# export_interval_ms = 10000   # metrics push only
+# sample_ratio = 1.0
+# environment = "prod"
+# redact_targets = false       # OTLP logs only
+# [obs.otel.headers]
+# Authorization = "Basic dXNlcjpwYXNz"   # printf 'user:pass' | base64
+# # Authorization = "Bearer change-me"
+# [obs.otel.traces]
+# enabled = true
+# [obs.otel.metrics]
+# enabled = true
 # [obs.otel.logs]
-# level = "info"
+# enabled = true
+# level = "info"               # stderr is still RUST_LOG
 # queue_size = 8192
 # batch_size = 512
 # delay_ms = 5000
+# Emergency off: OTEL_SDK_DISABLED=true
+# Headers env: OTEL_EXPORTER_OTLP_HEADERS=Authorization=Basic\ dXNlcjpwYXNz
 
 # Independent TCP+TLS connections per link (default 2). Isolates HOL
 # on one connection from the rest of the traffic on the same link.

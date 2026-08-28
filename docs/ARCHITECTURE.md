@@ -110,7 +110,7 @@ HOL 隔离靠「每链路多连接 + 姐妹优先 backup」，不是按 ISP 钉�
 
 ## 配置分层
 
-运维 TOML（`SessionOpts`）只有四个键：探测预算、路径上限、全 down 放弃。`#[serde(deny_unknown_fields)]`。顶层可选 `[obs]`（snapshot 间隔、metrics 监听、instance_name、嵌套 `[obs.otel]`），stderr 日志级别只走 `RUST_LOG`。
+运维 TOML（`SessionOpts`）只有四个键：探测预算、路径上限、全 down 放弃。`#[serde(deny_unknown_fields)]`。顶层可选 `[obs]`（snapshot 间隔、metrics 监听、instance_name、嵌套 `[obs.otel]`），stderr 日志级别只走 `RUST_LOG`。OTLP 认证用 `[obs.otel.headers]`，见 [OBSERVABILITY.md](OBSERVABILITY.md)「远程 OTLP」。
 
 算法常数在 `Tuning::STANDARD`：loss/down 倍数、failback 阈值、队列深度、重连退避、交互帧上限。测试里可以 clone 再改；生产路径只有这一张表。
 

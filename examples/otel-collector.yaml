@@ -1,4 +1,7 @@
 # Example pipeline. Not a default dependency of the binaries.
+# Point nya [obs.otel].endpoint at http://<this-host>:4318
+# HTTP Basic on the app side: [obs.otel.headers] Authorization = "Basic …"
+# (collector auth is configured on the receiver, not in this file).
 receivers:
   otlp:
     protocols:

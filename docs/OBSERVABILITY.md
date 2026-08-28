@@ -1070,13 +1070,132 @@ pub sessions_live: AtomicU64, // gauge
 | metrics 端口无认证 | 中 | 非 loopback 拒绝；不做伪认证 |
 | auth 失败用户枚举 | 低 | 保持 `"auth failed"`，不加 user_id |
 | HTTP 请求过大 / path 穿越 | 低 | 8 KiB cap；精确 `GET /metrics` 与 `GET /` |
+| OTLP `Authorization` / header 值进日志 | 高 | 禁止把 header 值打进 tracing；TOML 里不要用 PSK 当 token |
+| 完整 session hex 进 Loki | 高 | OTLP logs DenyList 丢掉字段名 `session` / `psk` / `proof` / `exporter`；stderr 仍可打印 hex |
+| SOCKS host 进 OTLP logs | 中 | 默认保留；`[obs.otel].redact_targets = true` 抹成 `*`（**只作用于 logs**，span 上的 `nya.host` 仍在） |
+
+---
+
+## 远程 OTLP
+
+默认关。`[obs.otel].enabled = true` 才安装 exporter。开启时 `instance_name`（或 `NYA_INSTANCE_NAME`）trim 后不能为空，否则 `install()` 失败。endpoint 在 TOML 父/子表和 `OTEL_EXPORTER_OTLP_ENDPOINT` 都空同样失败。未知 TOML 键（含平铺 `endpoint_metrics`）是解析错误。
+
+实现：crate `nya-obs`，只从 `nya-client` / `nya-server` 的 `main.rs` 调用。`nya-core` 只反序列化配置。metrics 名字只来自 `visit_metrics`（与 `/metrics`、snapshot 数字键同一份 catalog）。
+
+### Resource（三信号同一套）
+
+| Attribute | 值 |
+| --- | --- |
+| `service.namespace` | `nya-link-aggregation` |
+| `service.name` | `nya-client` 或 `nya-server` |
+| `service.version` | `CARGO_PKG_VERSION` |
+| `service.instance.id` | 与 `nya.instance.name` **相同**（必填实例名，无 UUID） |
+| `nya.project` | `nya-link-aggregation` |
+| `nya.role` | `client` / `server` |
+| `nya.instance.name` | `[obs].instance_name` 或 `NYA_INSTANCE_NAME` |
+| `process.pid` | pid |
+| `host.name` | `HOSTNAME`，否则 `gethostname`，否则 `unknown` |
+| `deployment.environment` | `[obs.otel].environment`；空则省略 |
+
+不读 `OTEL_SERVICE_NAME`。`OTEL_RESOURCE_ATTRIBUTES` 可追加，但不能覆盖上表里的身份键。
+
+Prometheus 点号 → 下划线（`nya_instance_name`）。Tempo TraceQL 保留点。Loki 不会自动把 Resource 当 stream label，必须在 collector 里映射（`examples/otel-collector.yaml`）。Prometheus exporter 要 `resource_to_telemetry_conversion.enabled = true`，且 `translation_strategy: UnderscoreEscapingWithoutSuffixes`（catalog 名已带 `_total`，不要再加后缀）。
+
+### `[obs.otel]` 键
+
+| 键 | 默认 | 说明 |
+| --- | --- | --- |
+| `enabled` | `false` | 总开关 |
+| `endpoint` | 空 | 如 `http://127.0.0.1:4318`。HTTP 路径由 SDK 追加 `/v1/metrics` `/v1/logs` `/v1/traces` |
+| `protocol` | `http/protobuf` | 另可 `grpc`（须 `--features otel-grpc`） |
+| `gzip` | `true` | HTTP 始终编了 gzip；gRPC 编进 `otel-grpc` |
+| `timeout_ms` | 5000 | 每次 OTLP 导出超时；traces/logs `shutdown` flush。0.31 PeriodicReader **没有** collection timeout |
+| `export_interval_ms` | 10000 | **仅 metrics** 推送间隔 |
+| `sample_ratio` | `1.0` | traces；越界 `install()` 失败 |
+| `environment` | 省略 | Resource `deployment.environment` |
+| `redact_targets` | `false` | **仅 logs**：`host` / `target` / `nya.host` / `nya.target` / `server.address` → `*` |
+| `[obs.otel.headers]` | 空 | 见下节认证 |
+
+`[obs.otel.traces|metrics|logs]`：
+
+| 键 | traces | metrics | logs | 默认 |
+| --- | --- | --- | --- | --- |
+| `enabled` | ✓ | ✓ | ✓ | 跟随父 `enabled`；父 `false` 则全关 |
+| `endpoint` | ✓ | ✓ | ✓ | 父 / `OTEL_EXPORTER_OTLP_ENDPOINT` |
+| `level` | 非法 | 非法 | ✓ | `info`（`error\|warn\|info\|debug\|trace`） |
+| `queue_size` | ✓ | 非法 | ✓ | 8192 |
+| `batch_size` | ✓ | 非法 | ✓ | 512（须 `<= queue_size`） |
+| `delay_ms` | ✓ | 非法 | ✓ | 5000（须 `>= 10`） |
+
+stderr 级别只看 `RUST_LOG`（默认 `nya_client=info,nya_core=info`）。OTLP logs 用 `logs.level`，两层 filter 独立：stderr `info` + 远程 `debug` 时 debug 会创建并上报、不打到 stderr。
+
+### HTTP 认证（Basic / Bearer / 任意头）
+
+没有单独的 `username` / `password` 键。认证走 **HTTP 头**（gRPC 则是 metadata）：
+
+```toml
+[obs.otel.headers]
+Authorization = "Basic dXNlcjpwYXNz"
+# Authorization = "Bearer change-me"
+# X-Scope-OrgID = "fake"
+```
+
+Basic：`Authorization = Basic ` + Base64(`user:pass`)，例如 `printf 'user:pass' | base64`。环境变量（逗号分隔，同名 TOML 赢）：
+
+```bash
+OTEL_EXPORTER_OTLP_HEADERS="Authorization=Basic dXNlcjpwYXNz"
+```
+
+头值禁止进 tracing。不要把 overlay PSK 填进 headers。
+
+### 环境变量
+
+| 变量 | 行为 |
+| --- | --- |
+| `OTEL_SDK_DISABLED` | `true` 或 `1`：**永远**关，忽略 TOML |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | TOML `endpoint` 为空时 |
+| `OTEL_EXPORTER_OTLP_PROTOCOL` | TOML `protocol` 为空：`http/protobuf` / `http` / `grpc` |
+| `OTEL_EXPORTER_OTLP_HEADERS` | 与 TOML headers 合并，同名 TOML 赢 |
+| `OTEL_RESOURCE_ATTRIBUTES` | 追加 Resource，不能覆盖身份键 |
+| `NYA_INSTANCE_NAME` | TOML `instance_name` 为空时 |
+| `NYA_OTEL_LOG_LEVEL` | TOML `logs.level` 为空时 |
+
+其余 `OTEL_*`（含 `OTEL_SERVICE_NAME`）应用层不读。Ctrl-C：先停 overlay，再 flush（默认 `timeout_ms`）。
+
+### Cargo feature
+
+`nya-client` / `nya-server` 默认 `otel`（链上 SDK，**运行时仍默认不导出**）。`--no-default-features` 只有 fmt。gRPC：`--features otel-grpc`。e2e 不启用 otel。
+
+### Logs
+
+全量 `tracing` 事件（无 allowlist），按 `logs.level` 裁。DenyList 字段名：`psk`、`proof`、`exporter`、`session`（完整 hex）。队列满丢最旧，最多每 10s 一条 `otel log queue full`，不堵 overlay。成功握手时若当前有控制面 span，日志会带 `trace_id` / `span_id`。
+
+### Traces（控制面）
+
+`target = nya_otel`，fmt 过滤器不含该 target，所以默认 stderr 不变。不包 `add_path.await` / `copy_bidirectional`。
+
+| Span | 位置 | `otel.kind` |
+| --- | --- | --- |
+| `nya.startup` | `main`：start/bind + attach | internal |
+| `nya.link.dial` | client `connect_pinned` | client |
+| `nya.link.accept` | server TLS accept | server |
+| `nya.handshake` | create/join I/O；属性 `nya.kind=create\|join` | client / server |
+| `nya.path.up` | path 注册瞬间（毫秒） | internal |
+| `nya.inbound.socks5` / `nya.inbound.forward` | 到 `open_stream` 返回 | server |
+| `nya.outbound.dial` | `TcpStream::connect` | client |
+
+失败：`otel.status_code=ERROR`。无协议 `traceparent`。
+
+### Metrics
+
+OTLP = `visit_metrics` 投影，cumulative。histogram 是 `_bucket`/`_sum`/`_count` + `le`，**不是** native histogram，`histogram_quantile` 只用 `/metrics`。无 `nya_bytes_wire_*`、无 `nya_link_rtt_known`。
 
 ---
 
 ## Observability
 
 - **日志：** `target=nya_core::obs` 定期 snapshot；exporter bind/拒绝 `warn`；决策 `debug`。
-- **远程 OTLP：** `[obs.otel].enabled`；metrics 是 `visit_metrics` 投影；logs 全量 + `[obs.otel.logs].level`；traces 控制面。见 README 与 `examples/otel-collector.yaml`。
+- **远程 OTLP：** 见上一节。示例 pipeline `examples/otel-collector.yaml`。
 - **告警（运维，非正式）：** `session_all_down_resets` 增加；`inbound_open_fail` / `stream_resets_timeout` 比率；`nya_failover_ms` p99 相对基线（**overlay 静默**，不是 e2e gap）；`failbacks` 速率（对齐 25/min）；无计划损伤时 `path_down` 持续增加。
 - **不要**对 `migrates` 绝对阈值告警。
 
