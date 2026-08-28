@@ -10,12 +10,24 @@ ping_interval_max_ms = 50
 all_down_timeout_ms = 8000
 max_paths = 32
 
-# Observability. Log level is RUST_LOG only (e.g. nya_core=debug).
+# Observability. Log level for stderr is RUST_LOG only (e.g. nya_core=debug).
 # snapshot_interval_ms = 0 disables the 10s snapshot. metrics_listen must
 # be a numeric loopback SocketAddr (not localhost / 0.0.0.0).
 # [obs]
 # snapshot_interval_ms = 10000
 # metrics_listen = "127.0.0.1:9100"
+# instance_name = "edge-sh-03"
+#
+# Remote OTLP (default off). instance_name is required when enabled.
+# [obs.otel]
+# enabled = true
+# endpoint = "http://127.0.0.1:4318"
+# protocol = "http/protobuf"
+# [obs.otel.logs]
+# level = "info"
+# queue_size = 8192
+# batch_size = 512
+# delay_ms = 5000
 
 # Independent TCP+TLS connections per link (default 2). Isolates HOL
 # on one connection from the rest of the traffic on the same link.

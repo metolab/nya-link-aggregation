@@ -1047,7 +1047,7 @@ pub sessions_live: AtomicU64, // gauge
 
 ### E. OpenTelemetry traces
 
-- 对这个体量的二进制过重。**以后再说。**
+- 热路径 traces 仍过重。v1 只在进程边缘打控制面 span（`target=nya_otel`），SDK 在 `nya-obs`，默认关。数据面（STREAM_DATA / `add_path` 寿命）不打 span。
 
 ### F. statsd/UDP
 
@@ -1076,6 +1076,7 @@ pub sessions_live: AtomicU64, // gauge
 ## Observability
 
 - **日志：** `target=nya_core::obs` 定期 snapshot；exporter bind/拒绝 `warn`；决策 `debug`。
+- **远程 OTLP：** `[obs.otel].enabled`；metrics 是 `visit_metrics` 投影；logs 全量 + `[obs.otel.logs].level`；traces 控制面。见 README 与 `examples/otel-collector.yaml`。
 - **告警（运维，非正式）：** `session_all_down_resets` 增加；`inbound_open_fail` / `stream_resets_timeout` 比率；`nya_failover_ms` p99 相对基线（**overlay 静默**，不是 e2e gap）；`failbacks` 速率（对齐 25/min）；无计划损伤时 `path_down` 持续增加。
 - **不要**对 `migrates` 绝对阈值告警。
 

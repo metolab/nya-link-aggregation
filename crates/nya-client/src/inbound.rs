@@ -4,7 +4,7 @@ use std::sync::atomic::Ordering;
 use anyhow::{bail, Context, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tracing::{info, warn};
+use tracing::{info, warn, Instrument};
 
 use nya_core::Session;
 use nya_proto::Target;
@@ -77,8 +77,20 @@ pub async fn serve_forward_listener(
                 let session = session.clone();
                 let dest = dest.clone();
                 tokio::spawn(async move {
-                    match session.open_stream(dest).await {
+                    let span = tracing::info_span!(
+                        target: "nya_otel",
+                        "nya.inbound.forward",
+                        otel.kind = "server",
+                        nya.target = %dest,
+                        otel.status_code = tracing::field::Empty,
+                    );
+                    let opened = session
+                        .open_stream(dest.clone())
+                        .instrument(span.clone())
+                        .await;
+                    match opened {
                         Ok(mut tun) => {
+                            drop(span);
                             session
                                 .process()
                                 .inbound_accept
@@ -86,11 +98,15 @@ pub async fn serve_forward_listener(
                             let _ = tokio::io::copy_bidirectional(&mut tcp, &mut tun).await;
                         }
                         Err(e) => {
+                            span.record("otel.status_code", "ERROR");
                             session
                                 .process()
                                 .inbound_open_fail
                                 .fetch_add(1, Ordering::Relaxed);
-                            warn!(%peer, error = %e, "open forward stream");
+                            {
+                                let _g = span.enter();
+                                warn!(%peer, error = %e, "open forward stream");
+                            }
                         }
                     }
                 });
@@ -163,14 +179,24 @@ async fn serve_socks5(mut tcp: TcpStream, session: Session) -> Result<()> {
     tcp.read_exact(&mut pb).await?;
     let port = u16::from_be_bytes(pb);
 
-    match session
+    let span = tracing::info_span!(
+        target: "nya_otel",
+        "nya.inbound.socks5",
+        otel.kind = "server",
+        nya.host = %host,
+        nya.port = port,
+        otel.status_code = tracing::field::Empty,
+    );
+    let opened = session
         .open_stream(Target {
             host: host.clone(),
             port,
         })
-        .await
-    {
+        .instrument(span.clone())
+        .await;
+    match opened {
         Ok(mut tun) => {
+            drop(span);
             session
                 .process()
                 .inbound_accept
@@ -179,12 +205,16 @@ async fn serve_socks5(mut tcp: TcpStream, session: Session) -> Result<()> {
             let _ = tokio::io::copy_bidirectional(&mut tcp, &mut tun).await;
         }
         Err(e) => {
+            span.record("otel.status_code", "ERROR");
             session
                 .process()
                 .inbound_open_fail
                 .fetch_add(1, Ordering::Relaxed);
             reply(&mut tcp, 0x04).await?;
-            warn!(%host, port, error = %e, "socks connect failed");
+            {
+                let _g = span.enter();
+                warn!(%host, port, error = %e, "socks connect failed");
+            }
         }
     }
     Ok(())

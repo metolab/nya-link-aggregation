@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use tokio::sync::Notify;
-use tracing::{info, warn};
+use tracing::{info, warn, Instrument};
 
 use nya_core::{
     client_create_session, client_join_session, connect_pinned, export_from_client, parse_pin_hex,
@@ -135,10 +135,19 @@ async fn connect_one(
     hs: Duration,
 ) -> Result<()> {
     info!(path = %path_name, addr = %link.addr, "dialing");
-    let mut tls = tokio::time::timeout(hs, connect_pinned(&link.addr, pin))
-        .await
-        .map_err(|_| anyhow::anyhow!("tls connect timeout"))?
-        .map_err(|e| anyhow::anyhow!("tls connect: {e}"))?;
+    let mut tls = tokio::time::timeout(
+        hs,
+        connect_pinned(&link.addr, pin).instrument(tracing::info_span!(
+            target: "nya_otel",
+            "nya.link.dial",
+            otel.kind = "client",
+            nya.path_name = %path_name,
+            server.address = %link.addr,
+        )),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("tls connect timeout"))?
+    .map_err(|e| anyhow::anyhow!("tls connect: {e}"))?;
     let exporter = export_from_client(&tls).map_err(|e| anyhow::anyhow!("exporter: {e}"))?;
 
     enum Role {
@@ -175,9 +184,17 @@ async fn connect_one(
 
     match role {
         Role::Create => {
+            let span = tracing::info_span!(
+                target: "nya_otel",
+                "nya.handshake",
+                otel.kind = "client",
+                nya.kind = "create",
+                nya.path_name = %path_name,
+                otel.status_code = tracing::field::Empty,
+            );
             match tokio::time::timeout(
                 hs,
-                client_create_session(&mut tls, psk, &exporter, "default"),
+                client_create_session(&mut tls, psk, &exporter, "default").instrument(span.clone()),
             )
             .await
             {
@@ -191,12 +208,14 @@ async fn connect_one(
                     info!(path = %path_name, "session created");
                 }
                 Ok(Err(e)) => {
+                    span.record("otel.status_code", "ERROR");
                     session.process().inc_handshake_fail(&e);
                     join.creating.store(false, Ordering::SeqCst);
                     join.ready.notify_waiters();
                     return Err(e.into());
                 }
                 Err(_) => {
+                    span.record("otel.status_code", "ERROR");
                     join.creating.store(false, Ordering::SeqCst);
                     join.ready.notify_waiters();
                     return Err(anyhow::anyhow!("create-session timeout"));
@@ -204,9 +223,18 @@ async fn connect_one(
             }
         }
         Role::Join(sid) => {
+            let span = tracing::info_span!(
+                target: "nya_otel",
+                "nya.handshake",
+                otel.kind = "client",
+                nya.kind = "join",
+                nya.path_name = %path_name,
+                otel.status_code = tracing::field::Empty,
+            );
             match tokio::time::timeout(
                 hs,
-                client_join_session(&mut tls, psk, &exporter, sid, path_name),
+                client_join_session(&mut tls, psk, &exporter, sid, path_name)
+                    .instrument(span.clone()),
             )
             .await
             {
@@ -217,15 +245,27 @@ async fn connect_one(
                         .fetch_add(1, Ordering::Relaxed);
                 }
                 Ok(Err(e)) => {
+                    span.record("otel.status_code", "ERROR");
                     session.process().inc_handshake_fail(&e);
                     return Err(anyhow::anyhow!("join: {e}"));
                 }
-                Err(_) => return Err(anyhow::anyhow!("join timeout")),
+                Err(_) => {
+                    span.record("otel.status_code", "ERROR");
+                    return Err(anyhow::anyhow!("join timeout"));
+                }
             }
         }
     }
 
     info!(path = %path_name, addr = %link.addr, "path up");
+    {
+        let _up = tracing::info_span!(
+            target: "nya_otel",
+            "nya.path.up",
+            nya.path_name = %path_name,
+        )
+        .entered();
+    }
     session
         .process()
         .reconnect_ok

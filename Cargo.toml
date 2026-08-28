@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/nya-proto",
     "crates/nya-core",
+    "crates/nya-obs",
     "crates/nya-client",
     "crates/nya-server",
     "crates/nya-e2e",
@@ -20,13 +21,15 @@ homepage = "https://github.com/metolab/nya-link-aggregation"
 [workspace.dependencies]
 nya-proto = { path = "crates/nya-proto" }
 nya-core = { path = "crates/nya-core" }
-nya-client = { path = "crates/nya-client" }
-nya-server = { path = "crates/nya-server" }
+nya-obs = { path = "crates/nya-obs" }
+nya-client = { path = "crates/nya-client", default-features = false }
+nya-server = { path = "crates/nya-server", default-features = false }
 
 anyhow = "1"
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
 hex = "0.4"
+libc = "0.2"
 hmac = "0.12"
 hkdf = "0.12"
 rand = "0.8"

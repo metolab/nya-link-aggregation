@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -5,13 +6,77 @@ use serde::Deserialize;
 use crate::tuning::Tuning;
 
 /// Operator-facing observability. Log verbosity stays on `RUST_LOG`.
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+/// `Eq` is omitted because nested `sample_ratio` is `f64`.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ObsOpts {
     /// `None` → 10s. `Some(0)` → disable the periodic snapshot.
     pub snapshot_interval_ms: Option<u64>,
     /// Empty / `None` → do not listen. Must be a numeric loopback `SocketAddr`.
     pub metrics_listen: Option<String>,
+    /// Operator instance name. Required by `nya_obs::install` when OTel is on.
+    pub instance_name: Option<String>,
+    #[serde(default)]
+    pub otel: OtelOpts,
+}
+
+/// Remote OTLP export. Default-off. Nested under `[obs.otel]`.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct OtelOpts {
+    /// Master switch. `false` / missing = all signals off.
+    #[serde(default)]
+    pub enabled: bool,
+    pub endpoint: Option<String>,
+    pub protocol: Option<OtelProtocol>,
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+    pub environment: Option<String>,
+    /// Metrics PeriodicReader interval. Default 10000.
+    pub export_interval_ms: Option<u64>,
+    /// OTLP export timeout and traces/logs shutdown flush. Default 5000.
+    /// Metrics PeriodicReader has no collection timeout in the 0.31 SDK.
+    pub timeout_ms: Option<u64>,
+    /// Default true.
+    pub gzip: Option<bool>,
+    #[serde(default)]
+    pub traces: OtelSignalOpts,
+    #[serde(default)]
+    pub metrics: OtelSignalOpts,
+    #[serde(default)]
+    pub logs: OtelSignalOpts,
+    /// Trace sample ratio. Default 1.0. Rejected outside [0.0, 1.0] at install.
+    pub sample_ratio: Option<f64>,
+    /// Logs only: rewrite host/target attributes to `*`.
+    #[serde(default)]
+    pub redact_targets: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum OtelProtocol {
+    #[default]
+    #[serde(rename = "http/protobuf")]
+    HttpProtobuf,
+    #[serde(rename = "grpc")]
+    Grpc,
+}
+
+/// Per-signal overrides under `[obs.otel.{traces,metrics,logs}]`.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct OtelSignalOpts {
+    /// `None` follows parent `obs.otel.enabled`.
+    pub enabled: Option<bool>,
+    pub endpoint: Option<String>,
+    /// Logs only: `error`/`warn`/`info`/`debug`/`trace`.
+    pub level: Option<String>,
+    /// Logs and traces: BatchLog/SpanProcessor max queue.
+    pub queue_size: Option<u32>,
+    /// Logs and traces: max export batch size.
+    pub batch_size: Option<u32>,
+    /// Logs and traces: scheduled delay in milliseconds.
+    pub delay_ms: Option<u64>,
 }
 
 impl ObsOpts {
@@ -150,6 +215,7 @@ mod tests {
         let off = ObsOpts {
             snapshot_interval_ms: Some(0),
             metrics_listen: Some(String::new()),
+            ..Default::default()
         };
         assert!(off.snapshot_interval().is_none());
         assert!(off.metrics_listen().is_none());
@@ -182,5 +248,61 @@ mod tests {
             let _ = opts.apply(SessionConfig::default());
             let _ = name;
         }
+    }
+
+    #[test]
+    fn otel_nested_table_deserializes_and_sample_ratio_is_f64() {
+        let o: ObsOpts = toml::from_str(
+            r#"
+instance_name = "edge-sh-03"
+[otel]
+enabled = true
+endpoint = "http://127.0.0.1:4318"
+protocol = "http/protobuf"
+sample_ratio = 1.0
+[otel.logs]
+level = "info"
+queue_size = 8192
+batch_size = 512
+delay_ms = 5000
+"#,
+        )
+        .expect("otel opts");
+        assert_eq!(o.instance_name.as_deref(), Some("edge-sh-03"));
+        assert!(o.otel.enabled);
+        assert_eq!(o.otel.sample_ratio, Some(1.0));
+        assert_eq!(o.otel.logs.level.as_deref(), Some("info"));
+        assert_eq!(o.otel.logs.queue_size, Some(8192));
+    }
+
+    #[test]
+    fn otel_flat_endpoint_metrics_is_unknown_field() {
+        let err = toml::from_str::<ObsOpts>(
+            r#"
+[otel]
+enabled = true
+endpoint_metrics = "http://127.0.0.1:4318"
+"#,
+        )
+        .expect_err("flat key");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unknown field") || msg.contains("did you mean"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn enabled_false_may_carry_other_keys() {
+        let o: ObsOpts = toml::from_str(
+            r#"
+[otel]
+enabled = false
+endpoint = "http://127.0.0.1:4318"
+"#,
+        )
+        .expect("disabled with endpoint");
+        assert!(!o.otel.enabled);
+        assert!(o.otel.endpoint.is_some());
     }
 }

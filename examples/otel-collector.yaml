@@ -1,0 +1,48 @@
+# Example pipeline. Not a default dependency of the binaries.
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch: {}
+  filter/debug:
+    logs:
+      log_record:
+        - 'severity_number < SEVERITY_NUMBER_INFO'
+
+exporters:
+  prometheus:
+    endpoint: 0.0.0.0:8889
+    resource_to_telemetry_conversion:
+      enabled: true
+    # Catalog names already end in _total; do not append another suffix.
+    translation_strategy: UnderscoreEscapingWithoutSuffixes
+  loki:
+    endpoint: http://loki:3100/loki/api/v1/push
+    labels:
+      resource:
+        nya.project: nya_project
+        nya.instance.name: nya_instance_name
+        service.name: service_name
+        service.namespace: service_namespace
+  otlp/tempo:
+    endpoint: tempo:4317
+    tls:
+      insecure: true
+
+service:
+  pipelines:
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [prometheus]
+    logs:
+      receivers: [otlp]
+      processors: [filter/debug, batch]
+      exporters: [loki]
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlp/tempo]

@@ -20,13 +20,15 @@ jobs:
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy (runtime crates)
-        run: cargo clippy -p nya-proto -p nya-core -p nya-client -p nya-server --all-targets -- -D warnings
+        run: cargo clippy -p nya-proto -p nya-core -p nya-obs -p nya-client -p nya-server --all-targets -- -D warnings
       - name: Clippy (e2e harness)
         run: cargo clippy -p nya-e2e --all-targets
       - name: Unit tests
         env:
           RUSTFLAGS: -D warnings
         run: cargo test --workspace --exclude nya-e2e
+      - name: No-otel compile
+        run: cargo check -p nya-client --no-default-features && cargo check -p nya-server --no-default-features
       - name: E2E crate unit tests
         env:
           RUSTFLAGS: -D warnings

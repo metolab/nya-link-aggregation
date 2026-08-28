@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio_rustls::TlsAcceptor;
-use tracing::{error, info, warn};
+use tracing::{error, info, warn, Instrument};
 
 use nya_core::{
     export_from_server, load_server_config, server_accept_handshake, spawn_obs_table, spki_sha256,
@@ -54,15 +54,29 @@ pub async fn run_on(listener: TcpListener, cfg: ServerConfig) -> Result<()> {
     run_on_until(listener, cfg, rx).await
 }
 
+pub fn new_session_table(cfg: &ServerConfig) -> Arc<SessionTable> {
+    Arc::new(SessionTable::new(cfg.session_config()))
+}
+
 /// Like [`run_on`], but return after `stop` becomes true (shuts every session).
 pub async fn run_on_until(
     listener: TcpListener,
     cfg: ServerConfig,
+    stop: watch::Receiver<bool>,
+) -> Result<()> {
+    let table = new_session_table(&cfg);
+    run_on_table(listener, cfg, stop, table).await
+}
+
+/// Serve on `listener` using an already-built session table.
+pub async fn run_on_table(
+    listener: TcpListener,
+    cfg: ServerConfig,
     mut stop: watch::Receiver<bool>,
+    table: Arc<SessionTable>,
 ) -> Result<()> {
     let tls = load_server_config(&cfg.cert, &cfg.key).map_err(|e| anyhow::anyhow!("{e}"))?;
     let acceptor = TlsAcceptor::from(Arc::new(tls));
-    let table = Arc::new(SessionTable::new(cfg.session_config()));
     spawn_obs_table(table.clone(), cfg.obs.clone(), stop.clone());
     let psk = Arc::new(cfg.psk.clone().into_bytes());
     info!("listening on {}", listener.local_addr()?);
@@ -102,18 +116,40 @@ async fn serve_one(
     if table.is_closed() {
         return Ok(());
     }
-    let mut tls = acceptor.accept(tcp).await.context("tls accept")?;
+    let mut tls = acceptor
+        .accept(tcp)
+        .instrument(tracing::info_span!(
+            target: "nya_otel",
+            "nya.link.accept",
+            otel.kind = "server",
+            peer = %peer,
+        ))
+        .await
+        .context("tls accept")?;
     if table.is_closed() {
         return Ok(());
     }
     let exporter = export_from_server(&tls).map_err(|e| anyhow::anyhow!("exporter: {e}"))?;
-    match server_accept_handshake(&mut tls, &psk, &exporter, &table).await {
+    let hs_span = tracing::info_span!(
+        target: "nya_otel",
+        "nya.handshake",
+        otel.kind = "server",
+        peer = %peer,
+        nya.kind = tracing::field::Empty,
+        otel.status_code = tracing::field::Empty,
+    );
+    let result = server_accept_handshake(&mut tls, &psk, &exporter, &table)
+        .instrument(hs_span.clone())
+        .await;
+    match result {
         Ok(HandshakeResult::Created {
             session,
             incoming,
             path_name,
             session_id,
         }) => {
+            hs_span.record("nya.kind", "create");
+            drop(hs_span);
             session
                 .process()
                 .handshake_create_ok
@@ -124,9 +160,19 @@ async fn serve_one(
                 return Ok(());
             }
             tokio::spawn(handle_incoming(incoming));
+            {
+                let _up = tracing::info_span!(
+                    target: "nya_otel",
+                    "nya.path.up",
+                    nya.path_name = %path_name,
+                )
+                .entered();
+            }
             session.add_path(path_name, tls).await;
         }
         Ok(HandshakeResult::Joined { session, path_name }) => {
+            hs_span.record("nya.kind", "join");
+            drop(hs_span);
             session
                 .process()
                 .handshake_join_ok
@@ -135,11 +181,23 @@ async fn serve_one(
             if table.is_closed() {
                 return Ok(());
             }
+            {
+                let _up = tracing::info_span!(
+                    target: "nya_otel",
+                    "nya.path.up",
+                    nya.path_name = %path_name,
+                )
+                .entered();
+            }
             session.add_path(path_name, tls).await;
         }
         Err(e) => {
+            hs_span.record("otel.status_code", "ERROR");
             table.process().inc_handshake_fail(&e);
-            error!(%peer, error = %e, "handshake failed");
+            {
+                let _g = hs_span.enter();
+                error!(%peer, error = %e, "handshake failed");
+            }
         }
     }
     Ok(())

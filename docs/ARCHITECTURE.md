@@ -101,7 +101,7 @@ HOL 隔离靠「每链路多连接 + 姐妹优先 backup」，不是按 ISP 钉�
 
 ## 可观测性
 
-`Counters` 挂在每个 `Session` 上，进程边缘（入站 / 出站 / 握手 / 重连）走 `ProcessCounters`（始终在 `Inner` 上）。默认每 10s 一条 `nya_core::obs` snapshot；`[obs].metrics_listen` 默认关。决策点（pick / migrate / failback / HOL）是结构化 `debug!`。热路径（STREAM_DATA / ACK / Ping）不打日志。
+`Counters` 挂在每个 `Session` 上，进程边缘（入站 / 出站 / 握手 / 重连）走 `ProcessCounters`（始终在 `Inner` 上）。默认每 10s 一条 `nya_core::obs` snapshot；`[obs].metrics_listen` 默认关。决策点（pick / migrate / failback / HOL）是结构化 `debug!`。热路径（STREAM_DATA / ACK / Ping）不打日志。可选 OTLP 在独立 crate `nya-obs`（只从二进制 `main` 安装）；名字来自 `visit_metrics` 一份 catalog。
 
 线路状态按 `link_key` 汇总（`a#0`/`a#1` → `a`）：up/deg 连接数、RTT 范围、sticky、inflight、队列、rx 新鲜/最旧。迁移原因拆成 speculative / path_down / ensure_sticky / send_blocked；另有 retransmit/hedge、probe_miss、未知 RTT pick。snapshot 带压缩 `streams=`（不进 Prometheus 标签）。
 
@@ -109,7 +109,7 @@ HOL 隔离靠「每链路多连接 + 姐妹优先 backup」，不是按 ISP 钉�
 
 ## 配置分层
 
-运维 TOML（`SessionOpts`）只有四个键：探测预算、路径上限、全 down 放弃。`#[serde(deny_unknown_fields)]`。顶层可选 `[obs]` 两键（snapshot 间隔、metrics 监听），日志级别只走 `RUST_LOG`。
+运维 TOML（`SessionOpts`）只有四个键：探测预算、路径上限、全 down 放弃。`#[serde(deny_unknown_fields)]`。顶层可选 `[obs]`（snapshot 间隔、metrics 监听、instance_name、嵌套 `[obs.otel]`），stderr 日志级别只走 `RUST_LOG`。
 
 算法常数在 `Tuning::STANDARD`：loss/down 倍数、failback 阈值、队列深度、重连退避、交互帧上限。测试里可以 clone 再改；生产路径只有这一张表。
 

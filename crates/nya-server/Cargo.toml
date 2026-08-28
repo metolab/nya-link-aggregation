@@ -8,8 +8,14 @@ publish.workspace = true
 authors.workspace = true
 repository.workspace = true
 
+[features]
+default = ["otel"]
+otel = ["dep:nya-obs"]
+otel-grpc = ["otel", "nya-obs/grpc"]
+
 [dependencies]
 nya-core.workspace = true
+nya-obs = { workspace = true, optional = true }
 nya-proto.workspace = true
 anyhow.workspace = true
 clap.workspace = true

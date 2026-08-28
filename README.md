@@ -107,6 +107,11 @@ PSK 两端必须一致。客户端 `pinned_spki_sha256` 填上一步打印的值
 | --- | --- | --- |
 | `snapshot_interval_ms` | 定期 snapshot 间隔；`0` 关闭 | 10000 |
 | `metrics_listen` | Prometheus `/metrics`；空 = 不听 | 空 |
+| `instance_name` | 实例名；打开 `[obs.otel]` 时必填 | 空 |
+
+远程 OTLP 默认关。打开后 metrics / logs / traces 走同一 Resource（`nya.project=nya-link-aggregation`，`service.name=nya-client|nya-server`，`nya.instance.name` = `instance_name`）。stderr 仍用 `RUST_LOG`；OTLP 日志级别是 `[obs.otel.logs].level`（默认 `info`）。batch 默认 `queue_size=8192`、`batch_size=512`、`delay_ms=5000`。示例 collector：[`examples/otel-collector.yaml`](examples/otel-collector.yaml)。紧急关闭：`OTEL_SDK_DISABLED=true`。
+
+Prometheus 里点号会变成下划线：`{nya_project="nya-link-aggregation",nya_instance_name="edge-sh-03"}`。Loki 必须在 collector 里把这四个键做成 stream label。histogram 分位数只保证 loopback `/metrics`；OTLP 路径是兼容 series。
 
 健康判定、failback 公式、队列深度等在 `nya_core::Tuning`，**不能**写进 TOML。改算法请改 `Tuning::STANDARD` 并跑 e2e，不要给运维暴露一堆旋钮。
 

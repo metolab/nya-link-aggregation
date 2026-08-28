@@ -19,6 +19,7 @@
 #![forbid(unsafe_code)]
 
 mod auth;
+mod catalog;
 mod cfg;
 mod export;
 mod handshake;
@@ -31,7 +32,11 @@ mod stream;
 pub mod tls;
 mod tuning;
 
-pub use cfg::{ObsOpts, SessionConfig, SessionOpts};
+pub use catalog::{
+    metric_descriptors, prometheus_metric_names, render_prometheus, visit_metrics, InstrumentKind,
+    MetricDesc, MetricSink,
+};
+pub use cfg::{ObsOpts, OtelOpts, OtelProtocol, OtelSignalOpts, SessionConfig, SessionOpts};
 pub use export::{parse_metrics_listen, spawn_obs_session, spawn_obs_table};
 pub use handshake::{
     client_create_session, client_join_session, server_accept_handshake, HandshakeError,
