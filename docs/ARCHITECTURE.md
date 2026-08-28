@@ -66,9 +66,10 @@ PSK 证明「谁能加入这条会话」；pin 证明「TLS 对端是这张证�
 
 | 时钟 | 大致公式 | 作用 |
 | --- | --- | --- |
-| probe | `clamp(rtt, ping_min, ping_max)` | Ping 间隔 |
+| probe | `clamp(min(fast, stable), ping_min, ping_max)`；未知 RTT 用 `ping_min` | Ping 间隔。`degrade_timeout` 里的 probe 项仍用 stable，不用 `probe_interval_for` |
 | loss | `clamp(2×rtt, 20ms, 2s)` | 一次探测 / 发送算丢 |
-| down | `max(5×rtt, 320ms) + probe`，上限 5s | 静默后标 down |
+| degrade | `max(loss, probe+rtt, ping_max)`；未知再抬到 `unknown_degrade_min` (300ms) | 静默后标 degraded。`ping_max` 是「必须已发出 Ping」；Pong 等待靠 in-flight / `probe_miss` |
+| down | `max(5×rtt, 320ms) + probe`，上限 5s | 静默后标 down。probe 项用 `assumed_rtt`，不要改成 `min(fast, stable)` |
 | failback 同类 | `max(8ms, 0.45×更好路径 RTT)` | 同 class 内要差这么多才迁回 |
 | failback 跨 class | 当前 ≥ 更好 × 1.5 + 8ms | 明显更好的 class 才 Upgrade |
 

@@ -1,7 +1,8 @@
 //! RTT-adaptive loss / path-down / failback timers.
 //!
-//! Timeouts are derived from the path's *stable* RTT so a 10ms link is
-//! judged on a ~20ms clock and a 200ms link on a ~400ms clock.
+//! Loss is 2× stable RTT (20ms floor): is this Ping dead?
+//! Degrade covers a probe *send* cycle: `max(loss, probe+rtt, ping_max)`.
+//! Down stays `max(5×rtt, 320ms)+probe` so 80–250ms spikes do not tear TCP.
 
 use std::time::Duration;
 
@@ -18,8 +19,15 @@ pub fn down_timeout(cfg: &SessionConfig, stable_rtt: Duration, probe: Duration) 
     cfg.tuning.down_timeout(stable_rtt, probe)
 }
 
-pub fn probe_interval(cfg: &SessionConfig, stable_rtt: Duration) -> Duration {
-    clamp(stable_rtt, cfg.ping_interval_min, cfg.ping_interval_max)
+/// RTT that drives probe spacing. `min` so a fast-EWMA spike cannot
+/// stretch the gap past degrade, and a recovered path is not stuck on
+/// a stale-high stable.
+pub fn probe_rtt(fast: Duration, stable: Duration) -> Duration {
+    fast.min(stable)
+}
+
+pub fn probe_interval(cfg: &SessionConfig, probe_rtt: Duration) -> Duration {
+    clamp(probe_rtt, cfg.ping_interval_min, cfg.ping_interval_max)
 }
 
 pub fn is_backup(cfg: &SessionConfig, rtt: Duration, min_rtt: Duration) -> bool {
@@ -71,14 +79,38 @@ pub fn assumed_rtt(
     }
 }
 
-/// Phase-1 silence: 2× stable RTT. Unknown RTT is floored at `unknown_degrade_min`.
+/// Silence past `degrade_for` marks DEGRADED when a Ping has been
+/// declared lost (`probe_miss > 0`) or we have not asked
+/// (`pending_after_expire == 0`). A young in-flight Ping (`miss == 0`
+/// && `pending > 0`) means we asked and 2×RTT has not elapsed.
+///
+/// Call *after* `expire_stale_pings(loss_timeout)` — expire's API
+/// returns a count only, and the drop *is* the missed-probe signal.
+pub fn should_mark_degraded(
+    ago: Duration,
+    degrade_for: Duration,
+    probe_miss: u64,
+    pending_after_expire: u64,
+) -> bool {
+    if ago < degrade_for {
+        return false;
+    }
+    probe_miss > 0 || pending_after_expire == 0
+}
+
+/// Phase-1 silence: one probe *send* cycle, not 2×RTT.
+/// `ping_interval_max` is "must have *sent* a Ping"; the Pong wait is
+/// [`should_mark_degraded`]. Unknown RTT is floored at `unknown_degrade_min`.
 pub fn degrade_timeout(cfg: &SessionConfig, rtt_known: bool, stable: Duration) -> Duration {
     let rtt = if rtt_known {
         stable
     } else {
         stable.max(cfg.ping_interval_max * 2)
     };
-    let t = loss_timeout(cfg, rtt);
+    let loss = loss_timeout(cfg, rtt);
+    let probe = probe_interval(cfg, rtt);
+    let cycle = probe.saturating_add(rtt);
+    let t = loss.max(cycle).max(cfg.ping_interval_max);
     if rtt_known {
         t
     } else {
@@ -133,13 +165,40 @@ mod tests {
     }
 
     #[test]
-    fn degrade_is_2x_on_known_12ms() {
+    fn degrade_covers_ping_max_on_fast_path() {
         let cfg = SessionConfig::default();
-        let d = degrade_timeout(&cfg, true, Duration::from_millis(12));
-        assert!(
-            d >= Duration::from_millis(24) && d <= Duration::from_millis(40),
-            "degrade {d:?}"
-        );
+        for ms in [7_u64, 12] {
+            let d = degrade_timeout(&cfg, true, Duration::from_millis(ms));
+            assert!(
+                d >= cfg.ping_interval_max && d < Duration::from_millis(100),
+                "{ms}ms path degrade {d:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn degrade_stays_2x_on_60ms() {
+        let cfg = SessionConfig::default();
+        let d = degrade_timeout(&cfg, true, Duration::from_millis(60));
+        assert_eq!(d, Duration::from_millis(120));
+    }
+
+    #[test]
+    fn probe_uses_min_fast_stable() {
+        let cfg = SessionConfig::default();
+        let rtt = probe_rtt(Duration::from_millis(47), Duration::from_millis(7));
+        assert_eq!(probe_interval(&cfg, rtt), cfg.ping_interval_min);
+    }
+
+    #[test]
+    fn should_mark_degraded_table() {
+        let d50 = Duration::from_millis(50);
+        assert!(!should_mark_degraded(Duration::from_millis(19), d50, 0, 0));
+        assert!(!should_mark_degraded(Duration::from_millis(25), d50, 1, 0));
+        assert!(should_mark_degraded(Duration::from_millis(51), d50, 0, 0));
+        assert!(!should_mark_degraded(Duration::from_millis(51), d50, 0, 1));
+        assert!(should_mark_degraded(Duration::from_millis(51), d50, 1, 0));
+        assert!(should_mark_degraded(Duration::from_millis(51), d50, 1, 1));
     }
 
     #[test]

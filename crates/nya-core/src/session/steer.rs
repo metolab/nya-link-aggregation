@@ -4,7 +4,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 use crate::metrics::{mono_ms, path_state_label};
 
@@ -48,7 +48,8 @@ impl Session {
             if !p.is_alive() {
                 continue;
             }
-            let miss = p.expire_stale_pings(health::loss_timeout(&self.inner.cfg, p.stable_rtt()));
+            let loss_for = health::loss_timeout(&self.inner.cfg, p.stable_rtt());
+            let miss = p.expire_stale_pings(loss_for);
             if miss > 0 {
                 self.inner
                     .metrics
@@ -59,19 +60,25 @@ impl Session {
             if ago >= self.down_for(p) {
                 warn!(path = %p.name, ?ago, down = ?self.down_for(p), "path silent, marking down");
                 self.path_failed(p.id);
-            } else if ago >= self.degrade_for(p) {
-                let ping_inflight = p
-                    .pending_ping_age()
-                    .map(|a| a < self.degrade_for(p))
-                    .unwrap_or(false);
-                if p.is_up() && !ping_inflight {
-                    info!(path = %p.name, ?ago, "path silent, marking degraded");
-                    p.mark_degraded();
-                    self.inner
-                        .metrics
-                        .path_degraded
-                        .fetch_add(1, Ordering::Relaxed);
-                }
+            } else if p.is_up()
+                && health::should_mark_degraded(
+                    ago,
+                    self.degrade_for(p),
+                    miss,
+                    p.pending_ping_count(),
+                )
+            {
+                debug!(
+                    path = %p.name,
+                    ?ago,
+                    degrade = ?self.degrade_for(p),
+                    "path silent, marking degraded"
+                );
+                p.mark_degraded();
+                self.inner
+                    .metrics
+                    .path_degraded
+                    .fetch_add(1, Ordering::Relaxed);
             }
         }
 
@@ -544,6 +551,10 @@ impl Session {
     }
 
     fn down_for(&self, p: &PathState) -> Duration {
+        // `assumed_rtt` is max(fast, stable) when known, so a spike can
+        // already lift down. Do not also feed probe_interval_for
+        // (min(fast, stable) / unknown ping_min) into this probe term —
+        // that would shrink unknown 550ms → 510ms.
         let rtt = health::assumed_rtt(&self.inner.cfg, p.rtt_known(), p.rtt(), p.stable_rtt());
         health::down_timeout(
             &self.inner.cfg,
@@ -553,8 +564,11 @@ impl Session {
     }
 
     pub fn probe_interval_for(&self, p: &PathState) -> Duration {
-        // Fast RTT so a recovered path probes on its true timescale,
-        // not on a spike-poisoned stable baseline.
-        health::probe_interval(&self.inner.cfg, p.rtt())
+        if !p.rtt_known() {
+            // First Pong as soon as the operator min allows. Unknown must
+            // not wait 20ms (placeholder) or 50ms (assumed) before asking.
+            return self.inner.cfg.ping_interval_min;
+        }
+        health::probe_interval(&self.inner.cfg, health::probe_rtt(p.rtt(), p.stable_rtt()))
     }
 }

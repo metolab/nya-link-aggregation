@@ -101,7 +101,9 @@ pub(crate) fn fastest_class_set<'a>(
         .iter()
         .copied()
         .filter(|p| {
-            p.is_schedulable() && !health::is_backup(cfg, effective_class_rtt(cfg, p), min_rtt)
+            p.is_schedulable()
+                && p.rtt_known()
+                && !health::is_backup(cfg, effective_class_rtt(cfg, p), min_rtt)
         })
         .collect();
     if candidates.is_empty() {
@@ -1118,5 +1120,46 @@ mod tests {
         a1.set_congested(true);
         let a0 = mk_named(1, "a#0".into(), 0); // unknown → 20ms fallback
         assert_eq!(backup_prefer_class(&[a1, a0], 2, &cfg), Some(1));
+    }
+
+    #[test]
+    fn unknown_not_in_fastest_class_with_7ms_peers() {
+        let cfg = SessionConfig::default();
+        let known = mk_named(1, "a#0".into(), 7);
+        let unk = mk_named(2, "b#0".into(), 0);
+        assert!(!unk.rtt_known());
+        let ids: Vec<u32> = fastest_class_set(&[known.clone(), unk.clone()], &cfg)
+            .iter()
+            .map(|p| p.id)
+            .collect();
+        assert_eq!(ids, vec![1]);
+        assert_eq!(pick_path(&[known, unk], &cfg), Some(1));
+    }
+
+    #[test]
+    fn unknown_not_in_fastest_class_with_13ms_peers() {
+        let cfg = SessionConfig::default();
+        let known = mk_named(1, "a#0".into(), 13);
+        let unk = mk_named(2, "b#0".into(), 0);
+        assert_eq!(pick_path(&[known, unk], &cfg), Some(1));
+    }
+
+    #[test]
+    fn unknown_picked_when_known_are_degraded() {
+        let cfg = SessionConfig::default();
+        let known = mk_named(1, "a#0".into(), 7);
+        known
+            .state
+            .store(crate::path::STATE_DEGRADED, Ordering::Relaxed);
+        let unk = mk_named(2, "b#0".into(), 0);
+        assert_eq!(pick_path(&[known, unk], &cfg), Some(2));
+    }
+
+    #[test]
+    fn all_unknown_still_picked() {
+        let cfg = SessionConfig::default();
+        let a = mk_named(1, "a#0".into(), 0);
+        let b = mk_named(2, "b#0".into(), 0);
+        assert!(pick_path(&[a, b], &cfg).is_some());
     }
 }

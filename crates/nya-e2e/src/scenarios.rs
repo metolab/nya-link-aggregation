@@ -201,6 +201,46 @@ pub async fn blackhole_one(dur: Duration) -> Result<ScenarioReport> {
     ))
 }
 
+/// Two 10ms links; blackhole one. Speculative migrate must hop at
+/// DEGRADED (~50ms), not wait for down (~330ms). Hetero `blackhole_a_*`
+/// does not hop 10→60 while the path is still alive.
+pub async fn blackhole_same_class() -> Result<ScenarioReport> {
+    let h = start(HarnessSpec {
+        link_cfgs: vec![
+            (
+                "a".into(),
+                ImpairConfig {
+                    rtt: Duration::from_millis(10),
+                    ..Default::default()
+                },
+            ),
+            (
+                "b".into(),
+                ImpairConfig {
+                    rtt: Duration::from_millis(10),
+                    ..Default::default()
+                },
+            ),
+        ],
+        psk: "e2e-psk".into(),
+        ..Default::default()
+    })
+    .await?;
+    let mut tcp = h.connect_forward().await?;
+    let _warm = ping_for(&mut tcp, Duration::from_millis(500), PING, PING_TO).await;
+    let t0 = Instant::now();
+    h.link("a").set_blackhole(true);
+    let rest = ping_for(&mut tcp, Duration::from_secs(3), PING, PING_TO).await;
+    let gap = rest.gap_around(t0).as_millis() as u64;
+    Ok(finish(
+        "blackhole_same_class",
+        &h,
+        rest,
+        Sla::failover(80, 200),
+        Some(gap),
+    ))
+}
+
 pub async fn blackhole_all(dur: Duration) -> Result<ScenarioReport> {
     let h = start(three_paths([10, 10, 10])).await?;
     let mut tcp = h.connect_forward().await?;
@@ -1090,6 +1130,7 @@ pub fn catalog() -> Vec<Scenario> {
         sc!("loss_a_3pct", false, loss_on_one(0.03)),
         sc!("timed_spike_a", false, timed_spike()),
         sc!("random_spikes_a", false, random_spikes()),
+        sc!("blackhole_same_class", false, blackhole_same_class()),
         sc!(
             "blackhole_a_5s",
             false,

@@ -367,7 +367,7 @@ goodput = data / wire                    // 重传的 STREAM_DATA 算 data，诚
 | 事件 | 分类 | 说明 |
 | --- | --- | --- |
 | silent → down | **ops warn** 已有 | 保留 |
-| silent → degraded | **ops info** 已有 + **met** `path_degraded` | 补 counter |
+| silent → degraded | **dbg** + **met** `path_degraded` | 20ms 假 degraded 会刷屏；path-down 仍是 warn |
 | `maybe_speculative` 真正迁 | **dbg**（现 info 降级）+ `migrates`；failover hist 按 Q3 | 字段：stream_id, from, to, same_link, from_state |
 | `maybe_speculative` 重传/hedge 单帧 | **no** | 热路径 |
 | `maybe_failback` 真正迁 | **dbg**（现 info 降级，保留全部 RTT 字段）+ 跨 link 走现有 failback counters；同 link 走 `failbacks_same_link` | `reason=upgrade\|class_empty`，`cross_link=bool` |
@@ -938,7 +938,7 @@ pub use cfg::ObsOpts;
 | `info!("speculative migrate")` | info | debug |
 | `info!("stream migrated")` | info | debug |
 | `info!("outbound connected")` | info | debug |
-| `info!("path silent, marking degraded")` | info | **保持 info** |
+| `info!("path silent, marking degraded")` | info | debug |
 | `warn!("path silent, marking down")` | warn | 保持 |
 | `info!("path added/down")` | info | 保持 |
 

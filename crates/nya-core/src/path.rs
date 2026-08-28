@@ -219,7 +219,7 @@ impl PathState {
             .unwrap()
             .values()
             .map(|t| t.elapsed())
-            .min()
+            .max()
     }
 
     pub fn last_tx_ago(&self) -> Duration {
@@ -470,6 +470,7 @@ pub fn spawn_path_io<T>(
             return;
         }
 
+        let mut next_ping = tokio::time::Instant::now();
         loop {
             if session.is_dead() || !path.is_alive() {
                 break;
@@ -518,11 +519,12 @@ pub fn spawn_path_io<T>(
                         break;
                     }
                 }
-                _ = tokio::time::sleep(ping_every) => {
+                _ = tokio::time::sleep_until(next_ping) => {
                     if session.is_dead() || !path.is_alive() {
                         break;
                     }
-                    if path.last_rx_ago() >= ping_every {
+                    let ago = path.last_rx_ago();
+                    if ago >= ping_every && path.pending_ping_count() == 0 {
                         let ping = path.next_ping();
                         if let Err(e) =
                             send_frame(&mut framed, &session, &path, Frame::Ping(ping)).await
@@ -530,6 +532,16 @@ pub fn spawn_path_io<T>(
                             warn!(path = %path.name, error = %e, "path ping failed");
                             break;
                         }
+                        next_ping = tokio::time::Instant::now() + ping_every;
+                    } else if ago < ping_every {
+                        // Idle-gate the send; keep the deadline on last_rx.
+                        next_ping = tokio::time::Instant::now()
+                            + ping_every.saturating_sub(ago);
+                    } else {
+                        // pending > 0 and still silent. Must wait a
+                        // non-zero interval — saturating_sub(ago) is 0
+                        // here and would busy-loop sleep_until(now).
+                        next_ping = tokio::time::Instant::now() + ping_every;
                     }
                 }
                 _ = session.wait_dead() => break,
@@ -550,6 +562,19 @@ mod tests {
     fn path() -> Arc<PathState> {
         let (tx, _rx) = mpsc::channel(1);
         PathState::new(1, "t".into(), tx)
+    }
+
+    #[test]
+    fn pending_ping_age_is_oldest() {
+        let p = path();
+        p.next_ping();
+        std::thread::sleep(Duration::from_millis(15));
+        p.next_ping();
+        let age = p.pending_ping_age().expect("pending");
+        assert!(
+            age >= Duration::from_millis(12),
+            "oldest ping age {age:?} must be the first insert, not ~0"
+        );
     }
 
     #[test]

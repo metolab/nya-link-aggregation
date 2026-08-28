@@ -1700,4 +1700,73 @@ mod tests {
         client.shutdown();
         server.shutdown();
     }
+
+    fn inject_known_path(client: &Session, id: u32) -> Arc<PathState> {
+        let (tx, _rx) = mpsc::channel(8);
+        let p = PathState::new(id, format!("t#{id}"), tx);
+        p.rtt_ewma_us.store(7_000, Ordering::Relaxed);
+        p.rtt_stable_us.store(7_000, Ordering::Relaxed);
+        client.inner.paths.lock().unwrap().insert(id, p.clone());
+        p
+    }
+
+    fn age_rx(p: &PathState, ms: u64) {
+        *p.last_rx.lock().unwrap() = Instant::now() - Duration::from_millis(ms);
+    }
+
+    #[tokio::test]
+    async fn silence_without_ping_marks_degraded() {
+        let client = Session::new_client(SessionConfig::default());
+        let p = inject_known_path(&client, 1);
+        age_rx(&p, 60);
+        let before = client.snapshot().path_degraded;
+        client.debug_maintain();
+        assert_eq!(client.snapshot().path_degraded, before + 1);
+        assert_eq!(p.state.load(Ordering::Relaxed), crate::path::STATE_DEGRADED);
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn young_inflight_ping_does_not_degrade() {
+        let client = Session::new_client(SessionConfig::default());
+        let p = inject_known_path(&client, 1);
+        p.next_ping();
+        age_rx(&p, 60);
+        let before = client.snapshot().path_degraded;
+        client.debug_maintain();
+        assert_eq!(client.snapshot().path_degraded, before);
+        assert_eq!(p.state.load(Ordering::Relaxed), crate::path::STATE_UP);
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn expired_ping_marks_degraded() {
+        let client = Session::new_client(SessionConfig::default());
+        let p = inject_known_path(&client, 1);
+        p.next_ping();
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        age_rx(&p, 60);
+        let before = client.snapshot().path_degraded;
+        client.debug_maintain();
+        assert_eq!(client.snapshot().path_degraded, before + 1);
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn stale_ping_degrades_even_if_young_ping_remains() {
+        let client = Session::new_client(SessionConfig::default());
+        let p = inject_known_path(&client, 1);
+        p.next_ping();
+        tokio::time::sleep(Duration::from_millis(12)).await;
+        p.next_ping();
+        age_rx(&p, 60);
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        client.debug_maintain();
+        assert_eq!(
+            p.state.load(Ordering::Relaxed),
+            crate::path::STATE_DEGRADED,
+            "older ping past loss_timeout must degrade even with a young ping left"
+        );
+        client.shutdown();
+    }
 }
