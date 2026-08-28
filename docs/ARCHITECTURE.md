@@ -116,3 +116,5 @@ HOL 隔离靠「每链路多连接 + 姐妹优先 backup」，不是按 ISP 钉�
 | 混合 soak | `nya-e2e --mixed` | near 11–16ms / mid 60–100 / high 120–150 / far 160–200 |
 
 e2e 损伤代理在 TLS 外侧做 stall，不丢 TLS 字节。CI 跑 fmt、clippy、`--exclude nya-e2e` 的单元测试，以及 `nya-e2e` 的 lib/bin 测试；完整 matrix 留给本地或夜间任务。
+
+发版流程（tag `v*` → 两个平台二进制 → GitHub Release）见 [RELEASE.md](RELEASE.md)。

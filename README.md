@@ -44,7 +44,7 @@ crate 划分：
 
 ## 安装
 
-预编译二进制在 [Releases](https://github.com/metolab/nya-link-aggregation/releases)：`nya-client` 和 `nya-server`，覆盖 Linux / macOS / Windows 的 x86_64 与 Linux / macOS 的 aarch64。main 上每次推送也会把同样的包传到 [Actions artifacts](https://github.com/metolab/nya-link-aggregation/actions/workflows/build.yml)。
+预编译二进制在 [Releases](https://github.com/metolab/nya-link-aggregation/releases)：Linux x86_64 与 macOS Apple Silicon 的 `nya-client` / `nya-server`。main 上每次推送也会把同样的包传到 [Actions artifacts](https://github.com/metolab/nya-link-aggregation/actions/workflows/build.yml)。打 tag 发版见 [docs/RELEASE.md](docs/RELEASE.md)。
 
 从源码构建需要 Rust stable（edition 2021）：
 
