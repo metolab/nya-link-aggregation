@@ -20,6 +20,14 @@ async fn short_matrix() {
     assert_all_pass(reports);
 }
 
+/// SOCKS / concurrent / abort / flap churn. Isolated from the p99 catalog.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn stream_lifecycle() {
+    init_tracing();
+    let reports = nya_e2e::run_lifecycle(4).await;
+    assert_all_pass(reports);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
 #[ignore = "15min mixed suite; run with: cargo run -p nya-e2e --bin nya-e2e -- --mixed [--band all]"]
 async fn mixed_15m() {

@@ -59,6 +59,8 @@ pub struct StreamState {
     pub opened_ms: AtomicU64,
     /// CAS winner owns closed-vs-reset accounting.
     pub counted_close: AtomicBool,
+    /// 0 = not closing. First FIN (local or peer) stamps `mono_ms`.
+    pub close_started_ms: AtomicU64,
 }
 
 impl StreamState {
@@ -88,7 +90,19 @@ impl StreamState {
             stall_from_ms: AtomicU64::new(0),
             opened_ms: AtomicU64::new(mono_ms().max(1)),
             counted_close: AtomicBool::new(false),
+            close_started_ms: AtomicU64::new(0),
         })
+    }
+
+    pub fn is_steerable(&self) -> bool {
+        !self.reset.load(Ordering::Relaxed) && !self.counted_close.load(Ordering::Relaxed)
+    }
+
+    pub fn note_close_started(&self) {
+        let now = mono_ms().max(1);
+        let _ =
+            self.close_started_ms
+                .compare_exchange(0, now, Ordering::Relaxed, Ordering::Relaxed);
     }
 
     pub fn note_stick_change(&self) {

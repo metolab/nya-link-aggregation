@@ -69,6 +69,8 @@ pub struct Tuning {
     pub inflight_bias: u64,
     pub min_rebalance_slack: u64,
     pub initial_window: u32,
+    /// Half-closed streams (one FIN, no peer FIN) are reset after this.
+    pub close_linger: Duration,
 
     // --- wait / reconnect ---
     pub handshake_timeout: Duration,
@@ -113,6 +115,7 @@ impl Tuning {
         inflight_bias: 64 * 1024,
         min_rebalance_slack: 16 * 1024,
         initial_window: 128 * 1024,
+        close_linger: Duration::from_secs(1),
         handshake_timeout: Duration::from_secs(3),
         reconnect_backoff_min: Duration::from_millis(200),
         reconnect_backoff_max: Duration::from_secs(2),
@@ -233,6 +236,7 @@ mod tests {
         assert_eq!(t.inflight_bias, 64 * 1024);
         assert_eq!(t.rebalance_slack(), 32 * 1024);
         assert_eq!(t.chan, 64);
+        assert_eq!(t.close_linger, Duration::from_secs(1));
         assert_eq!(t.handshake_timeout, Duration::from_secs(3));
     }
 

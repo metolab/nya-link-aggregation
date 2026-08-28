@@ -107,6 +107,7 @@ impl Session {
     ) {
         let session = self.clone();
         tokio::spawn(async move {
+            let session_reap = session.clone();
             let (mut r, mut w) = tokio::io::split(peer);
             let send = {
                 let session = session.clone();
@@ -147,6 +148,7 @@ impl Session {
                 }
             };
             tokio::join!(send, recv);
+            session_reap.reap_stream(id);
         });
     }
 
@@ -277,6 +279,7 @@ impl Session {
         {
             return Ok(());
         }
+        st.note_close_started();
         if let Some(path_id) = self.ensure_sticky(id) {
             self.send_on_path(path_id, Frame::StreamClose(StreamClose { stream_id: id }));
         }
@@ -298,8 +301,23 @@ impl Session {
             .is_ok()
         {
             self.observe_stream_end(st, None);
-            self.unstick(st);
         }
+        self.remove_held_stream(st.id);
+    }
+
+    pub(super) fn reap_stream(&self, id: u32) {
+        let Some(st) = self.get_stream(id) else {
+            return;
+        };
+        if st.counted_close.load(Ordering::Relaxed) {
+            self.remove_held_stream(id);
+            return;
+        }
+        if st.send_fin_sent.load(Ordering::Relaxed) && st.recv_fin.load(Ordering::Relaxed) {
+            self.maybe_count_graceful(&st);
+            return;
+        }
+        self.finish_stream(id, Some(ResetReason::Timeout), true);
     }
 
     pub fn note_app_read(&self, id: u32, n: usize) {
@@ -427,6 +445,7 @@ impl Session {
         let Some(st) = self.get_stream(id) else {
             return;
         };
+        st.note_close_started();
         if !st.recv_fin.swap(true, Ordering::SeqCst) {
             let _ = st.inbound_tx.try_send(Inbound::Close);
         }

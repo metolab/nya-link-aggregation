@@ -145,6 +145,7 @@ fn emit_snapshot(ps: &ProcessSnapshot) {
         stream_resets_protocol = s.stream_resets_protocol,
         streams_stalled = s.streams_stalled,
         streams_live = s.streams_live,
+        streams_held = s.streams_held,
         stall_count = s.stall_ms.count,
         stall_p99_ms = stall_p99,
         failover_count = s.failover_ms.count,
@@ -621,6 +622,12 @@ pub fn render_prometheus(ps: &ProcessSnapshot) -> String {
     gauge(&mut o, "nya_streams_live", "live streams", s.streams_live);
     gauge(
         &mut o,
+        "nya_streams_held",
+        "streams still in the session table (incl. unreaped closes)",
+        s.streams_held,
+    );
+    gauge(
+        &mut o,
         "nya_sessions_live",
         "live sessions",
         p.sessions_live,
@@ -975,6 +982,7 @@ mod tests {
         assert!(body.contains("nya_failover_ms_bucket{le=\"10\"} 5"));
         assert!(body.contains("nya_failover_ms_count 5"));
         assert!(body.contains("# TYPE nya_sessions_live gauge"));
+        assert!(body.contains("# TYPE nya_streams_held gauge"));
         assert!(body.contains("# TYPE nya_path_added_total counter"));
     }
 }

@@ -397,6 +397,8 @@ pub struct Snapshot {
     pub session_all_down_resets: u64,
     pub streams_stalled: u64,
     pub streams_live: u64,
+    /// HashMap occupancy, including graceful-closed entries not yet reaped.
+    pub streams_held: u64,
     pub failover_ms: HistSnap,
     pub stall_ms: HistSnap,
     pub stream_lifetime_ms: HistSnap,
@@ -443,6 +445,7 @@ impl Snapshot {
         self.session_all_down_resets += other.session_all_down_resets;
         self.streams_stalled += other.streams_stalled;
         self.streams_live += other.streams_live;
+        self.streams_held += other.streams_held;
         self.failover_ms.merge_add(&other.failover_ms);
         self.stall_ms.merge_add(&other.stall_ms);
         self.stream_lifetime_ms.merge_add(&other.stream_lifetime_ms);
@@ -487,6 +490,7 @@ impl Counters {
             session_all_down_resets: self.session_all_down_resets.load(Ordering::Relaxed),
             streams_stalled: self.streams_stalled.load(Ordering::Relaxed),
             streams_live: 0,
+            streams_held: 0,
             failover_ms: self.failover_ms.snap(),
             stall_ms: self.stall_ms.snap(),
             stream_lifetime_ms: self.stream_lifetime_ms.snap(),

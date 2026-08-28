@@ -190,11 +190,17 @@ impl Session {
         self.wait_paths(1, timeout).await
     }
 
-    /// Wait until at least `n` paths are alive (multiple TCP conns per link).
+    /// Wait until at least `n` paths are alive and have a measured RTT.
+    /// Alive-only lets the first stream pick on the unknown-RTT placeholder.
     pub async fn wait_paths(&self, n: usize, timeout: Duration) -> Result<(), SessionError> {
         let start = Instant::now();
         loop {
-            if self.alive_path_count() >= n {
+            let known = self
+                .path_list()
+                .iter()
+                .filter(|p| p.is_alive() && p.rtt_known())
+                .count();
+            if known >= n {
                 return Ok(());
             }
             if self.is_dead() {
@@ -377,6 +383,9 @@ impl Session {
         let Some(st) = self.get_stream(stream_id) else {
             return;
         };
+        if !st.is_steerable() {
+            return;
+        }
         let old = st.sticky.swap(path_id, Ordering::Relaxed);
         if old == path_id {
             return;
@@ -400,6 +409,26 @@ impl Session {
         if let Some(p) = self.get_path(old) {
             p.drop_sticky();
         }
+    }
+
+    fn release_unacked(&self, st: &StreamState) {
+        let leftover: Vec<Unacked> = {
+            let mut g = st.unacked.lock().unwrap();
+            std::mem::take(&mut *g).into_values().collect()
+        };
+        for u in leftover {
+            if let Some(p) = self.get_path(u.path_id) {
+                p.sub_inflight(u.data.len() as u64);
+            }
+        }
+    }
+
+    fn remove_held_stream(&self, id: u32) {
+        let Some(st) = self.inner.streams.lock().unwrap().remove(&id) else {
+            return;
+        };
+        self.unstick(&st);
+        self.release_unacked(&st);
     }
 
     fn xfer_inflight(&self, from: u32, to: u32, n: u64) {
@@ -594,10 +623,7 @@ impl Session {
         {
             self.observe_stream_end(&st, reset_reason);
         }
-        self.unstick(&st);
-        if reset_reason.is_some() {
-            self.inner.streams.lock().unwrap().remove(&id);
-        }
+        self.remove_held_stream(id);
     }
 
     pub(crate) fn observe_stream_end(&self, st: &StreamState, reset_reason: Option<ResetReason>) {
@@ -649,14 +675,15 @@ impl Session {
     pub fn snapshot(&self) -> Snapshot {
         let paths = self.path_list();
         let mut snap = self.inner.metrics.snap_with_paths(&paths);
-        let (live, sample) = self.stream_snaps();
+        let (held, live, sample) = self.stream_snaps();
         snap.streams = sample;
+        snap.streams_held = held;
         snap.streams_live = live;
         snap.links = crate::metrics::rollup_links(&snap.paths);
         snap
     }
 
-    fn stream_snaps(&self) -> (u64, Vec<crate::metrics::StreamSnap>) {
+    fn stream_snaps(&self) -> (u64, u64, Vec<crate::metrics::StreamSnap>) {
         use crate::metrics::{StreamSnap, STREAM_SNAP_CAP};
         let names: HashMap<u32, String> = self
             .inner
@@ -666,15 +693,13 @@ impl Session {
             .iter()
             .map(|(id, p)| (*id, p.name.clone()))
             .collect();
-        let held: Vec<Arc<StreamState>> = {
+        let (held_n, live): (u64, Vec<Arc<StreamState>>) = {
             let g = self.inner.streams.lock().unwrap();
-            g.values()
-                .filter(|st| !st.counted_close.load(Ordering::Relaxed))
-                .cloned()
-                .collect()
+            let held_n = g.len() as u64;
+            let live = g.values().filter(|st| st.is_steerable()).cloned().collect();
+            (held_n, live)
         };
-        let live = held.len() as u64;
-        let sample = held
+        let sample = live
             .iter()
             .take(STREAM_SNAP_CAP)
             .map(|st| {
@@ -691,7 +716,7 @@ impl Session {
                 }
             })
             .collect();
-        (live, sample)
+        (held_n, live.len() as u64, sample)
     }
 
     pub(crate) fn note_migrate(&self, reason: &'static str) {
@@ -971,6 +996,25 @@ mod tests {
         let client = Session::new_client(cfg.clone());
         let (server, incoming) = Session::new_server(cfg);
         (client, server, incoming)
+    }
+
+    async fn pair_echo(names: &[&str]) -> (Session, Session) {
+        let (client, server, incoming) = pair();
+        tokio::spawn(echo_server(incoming));
+        for name in names {
+            let (ca, sa) = duplex(64 * 1024);
+            let c = client.clone();
+            let s = server.clone();
+            let n1 = name.to_string();
+            let n2 = name.to_string();
+            tokio::spawn(async move { c.add_path(n1, ca).await });
+            tokio::spawn(async move { s.add_path(n2, sa).await });
+        }
+        client
+            .wait_paths(names.len(), Duration::from_secs(2))
+            .await
+            .unwrap();
+        (client, server)
     }
 
     async fn echo_server(mut incoming: mpsc::Receiver<IncomingStream>) {
@@ -1473,6 +1517,143 @@ mod tests {
         ));
         assert_eq!(client.snapshot().streams_opened, 0);
         client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn graceful_close_reaps_stream_table() {
+        let (client, server) = pair_echo(&["a", "b"]).await;
+
+        const N: usize = 20;
+        for _ in 0..N {
+            let mut tun = client
+                .open_stream(Target {
+                    host: "echo".into(),
+                    port: 1,
+                })
+                .await
+                .unwrap();
+            tun.write_all(b"ping").await.unwrap();
+            let mut buf = [0u8; 4];
+            tun.read_exact(&mut buf).await.unwrap();
+            assert_eq!(&buf, b"ping");
+            drop(tun);
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let client_held = client.inner.streams.lock().unwrap().len();
+        let server_held = server.inner.streams.lock().unwrap().len();
+        let snap = client.snapshot();
+        assert_eq!(
+            client_held, 0,
+            "client must reap graceful closes, held={client_held} opened={} closed={}",
+            snap.streams_opened, snap.streams_closed
+        );
+        assert_eq!(
+            server_held, 0,
+            "server must reap graceful closes, held={server_held}"
+        );
+        assert_eq!(snap.streams_held, 0);
+        assert_eq!(snap.streams_live, 0);
+
+        let mig0 = snap.migrates;
+        let names = client.debug_path_names();
+        client.debug_drop_path(&names[0]);
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let mig1 = client.snapshot().migrates;
+        assert_eq!(
+            mig1, mig0,
+            "closed streams must not migrate on path down ({mig0} -> {mig1})"
+        );
+
+        client.shutdown();
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn concurrent_open_close_reaps_stream_table() {
+        let (client, server) = pair_echo(&["a", "b"]).await;
+
+        const N: usize = 16;
+        let mut joins = Vec::new();
+        for _ in 0..N {
+            let client = client.clone();
+            joins.push(tokio::spawn(async move {
+                let mut tun = client
+                    .open_stream(Target {
+                        host: "echo".into(),
+                        port: 1,
+                    })
+                    .await
+                    .unwrap();
+                tun.write_all(b"ping").await.unwrap();
+                let mut buf = [0u8; 4];
+                tun.read_exact(&mut buf).await.unwrap();
+            }));
+        }
+        for j in joins {
+            j.await.unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(
+            client.inner.streams.lock().unwrap().len(),
+            0,
+            "client concurrent churn leak"
+        );
+        assert_eq!(
+            server.inner.streams.lock().unwrap().len(),
+            0,
+            "server concurrent churn leak"
+        );
+        client.shutdown();
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn half_close_linger_reaps_stream_table() {
+        let mut cfg = SessionConfig::default();
+        cfg.tuning.loss_timeout_floor = Duration::from_millis(150);
+        cfg.tuning.close_linger = Duration::from_millis(80);
+        cfg.all_down_timeout = Duration::from_secs(2);
+        let client = Session::new_client(cfg.clone());
+        let (server, incoming) = Session::new_server(cfg);
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            let mut incoming = incoming;
+            while let Some(inc) = incoming.recv().await {
+                held.push(inc);
+            }
+            let _ = held;
+        });
+        let (a, b) = duplex(64 * 1024);
+        let c = client.clone();
+        let s = server.clone();
+        tokio::spawn(async move { c.add_path("p1".into(), a).await });
+        tokio::spawn(async move { s.add_path("p1".into(), b).await });
+        client.wait_ready(Duration::from_secs(2)).await.unwrap();
+
+        let mut tun = client
+            .open_stream(Target {
+                host: "echo".into(),
+                port: 1,
+            })
+            .await
+            .unwrap();
+        tun.write_all(b"hi").await.unwrap();
+        drop(tun);
+
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let client_held = client.inner.streams.lock().unwrap().len();
+        let server_held = server.inner.streams.lock().unwrap().len();
+        assert_eq!(
+            client_held, 0,
+            "half-closed client stream must linger-reap, held={client_held}"
+        );
+        assert_eq!(
+            server_held, 0,
+            "half-closed server stream must linger-reap, held={server_held}"
+        );
+        client.shutdown();
+        server.shutdown();
     }
 
     #[tokio::test]

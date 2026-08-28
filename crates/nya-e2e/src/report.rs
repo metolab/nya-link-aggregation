@@ -142,8 +142,12 @@ impl ScenarioReport {
             .join(",");
         vec![
             format!(
-                "overlay stall_p99={stall}ms failover_p99={fail}ms resets={} closed={} opened={}",
-                self.snap.stream_resets, self.snap.streams_closed, self.snap.streams_opened
+                "overlay stall_p99={stall}ms failover_p99={fail}ms resets={} closed={} opened={} held={} live={}",
+                self.snap.stream_resets,
+                self.snap.streams_closed,
+                self.snap.streams_opened,
+                self.snap.streams_held,
+                self.snap.streams_live
             ),
             format!(
                 "links={links} mig spec={} down={} ens={} blk={} retransmit={} hedge={} probe_miss={} unk_pick={}/{}",
@@ -183,16 +187,19 @@ pub fn print_suite(reports: &[ScenarioReport]) {
         for n in r.overlay_notes() {
             println!("    note: {n}");
         }
-        if !r.pass() {
-            for n in r.notes.iter().filter(|n| {
-                n.starts_with("FAIL")
+        for n in &r.notes {
+            let show = !r.pass()
+                && (n.starts_with("FAIL")
                     || n.starts_with("UNCOVERED")
                     || n.starts_with("p50=")
                     || n.contains("incomplete")
                     || n.contains("panicked")
                     || n.contains("failback chatter")
                     || n.contains("did not mix")
-            }) {
+                    || n.contains("stream table leak")
+                    || n.contains("migrate storm")
+                    || n.contains("short-stream"));
+            if show || n.contains("churn=") {
                 println!("    note: {n}");
             }
         }

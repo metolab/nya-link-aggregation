@@ -39,7 +39,7 @@ pub mod workload;
 pub use harness::{start, Harness, HarnessSpec};
 pub use impair::{ImpairConfig, LinkHandle};
 pub use report::ScenarioReport;
-pub use scenarios::{catalog, run_catalog};
+pub use scenarios::{catalog, run_catalog, run_lifecycle};
 
 /// Max concurrent isolated harnesses. Caps below host parallelism so
 /// timer-heavy WAN sims do not inflate p99 of latency SLAs.

@@ -75,12 +75,14 @@ impl Session {
             }
         }
 
+        self.reap_closed_streams();
         let streams: Vec<_> = self
             .inner
             .streams
             .lock()
             .unwrap()
             .values()
+            .filter(|st| st.is_steerable())
             .cloned()
             .collect();
         let mut bulk = Vec::new();
@@ -141,11 +143,44 @@ impl Session {
         }
     }
 
+    fn reap_closed_streams(&self) {
+        let now = mono_ms();
+        let linger_ms = self.inner.cfg.tuning.close_linger.as_millis() as u64;
+        let mut drop_ids = Vec::new();
+        let mut timeout_ids = Vec::new();
+        {
+            let g = self.inner.streams.lock().unwrap();
+            for st in g.values() {
+                if st.counted_close.load(Ordering::Relaxed) || st.reset.load(Ordering::Relaxed) {
+                    drop_ids.push(st.id);
+                    continue;
+                }
+                if !st.send_fin_sent.load(Ordering::Relaxed) && !st.recv_fin.load(Ordering::Relaxed)
+                {
+                    continue;
+                }
+                let start = st.close_started_ms.load(Ordering::Relaxed);
+                if start != 0 && now.saturating_sub(start) >= linger_ms {
+                    timeout_ids.push(st.id);
+                }
+            }
+        }
+        for id in drop_ids {
+            self.remove_held_stream(id);
+        }
+        for id in timeout_ids {
+            self.reset_stream(id, ResetReason::Timeout);
+        }
+    }
+
     fn maybe_speculative(&self, st: Arc<StreamState>) {
-        if st.reset.load(Ordering::Relaxed) {
+        if !st.is_steerable() {
             return;
         }
         let sticky = st.sticky.load(Ordering::Relaxed);
+        if sticky == 0 {
+            return;
+        }
         let cur_path = self.get_path(sticky);
         // Late unacked on a still-live path is usually HOL behind bulk, not
         // a dead link. Only restick when the path itself looks unhealthy.
@@ -226,7 +261,9 @@ impl Session {
 
     fn conn_has_interactive(&self, path_id: u32) -> bool {
         self.inner.streams.lock().unwrap().values().any(|st| {
-            st.sticky.load(Ordering::Relaxed) == path_id && !st.bulk.load(Ordering::Relaxed)
+            st.is_steerable()
+                && st.sticky.load(Ordering::Relaxed) == path_id
+                && !st.bulk.load(Ordering::Relaxed)
         })
     }
 
@@ -250,7 +287,7 @@ impl Session {
     }
 
     fn maybe_hol(&self, st: &StreamState) {
-        if st.reset.load(Ordering::Relaxed) {
+        if !st.is_steerable() {
             return;
         }
         let cur_id = st.sticky.load(Ordering::Relaxed);
@@ -305,7 +342,7 @@ impl Session {
     }
 
     fn maybe_failback(&self, st: Arc<StreamState>) {
-        if st.reset.load(Ordering::Relaxed) {
+        if !st.is_steerable() {
             return;
         }
         let sticky = st.sticky.load(Ordering::Relaxed);
@@ -386,6 +423,7 @@ impl Session {
             .lock()
             .unwrap()
             .values()
+            .filter(|st| st.is_steerable())
             .cloned()
             .collect();
         let backup = {
@@ -411,7 +449,7 @@ impl Session {
     }
 
     fn scan_stall(&self, st: &StreamState) {
-        if st.reset.load(Ordering::Relaxed) || st.counted_close.load(Ordering::Relaxed) {
+        if !st.is_steerable() {
             return;
         }
         let now = mono_ms();

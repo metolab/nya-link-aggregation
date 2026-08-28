@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -212,6 +212,54 @@ impl Harness {
     pub async fn connect_forward(&self) -> Result<TcpStream> {
         let s = TcpStream::connect(self.forward).await?;
         let _ = s.set_nodelay(true);
+        Ok(s)
+    }
+
+    /// SOCKS5 CONNECT to the echo server — the production 204/curl path.
+    pub async fn connect_socks_echo(&self) -> Result<TcpStream> {
+        self.connect_socks(self.echo).await
+    }
+
+    pub async fn connect_socks(&self, dest: SocketAddr) -> Result<TcpStream> {
+        let mut s = TcpStream::connect(self.socks).await?;
+        let _ = s.set_nodelay(true);
+        s.write_all(&[0x05, 0x01, 0x00]).await?;
+        let mut method = [0u8; 2];
+        s.read_exact(&mut method).await?;
+        anyhow::ensure!(method == [0x05, 0x00], "socks method reply {method:?}");
+        let mut req = vec![0x05, 0x01, 0x00];
+        match dest.ip() {
+            IpAddr::V4(ip) => {
+                req.push(0x01);
+                req.extend_from_slice(&ip.octets());
+            }
+            IpAddr::V6(ip) => {
+                req.push(0x04);
+                req.extend_from_slice(&ip.octets());
+            }
+        }
+        req.extend_from_slice(&dest.port().to_be_bytes());
+        s.write_all(&req).await?;
+        let mut hdr = [0u8; 4];
+        s.read_exact(&mut hdr).await?;
+        anyhow::ensure!(hdr[0] == 0x05 && hdr[1] == 0x00, "socks connect {hdr:?}");
+        match hdr[3] {
+            0x01 => {
+                let mut rest = [0u8; 6];
+                s.read_exact(&mut rest).await?;
+            }
+            0x04 => {
+                let mut rest = [0u8; 18];
+                s.read_exact(&mut rest).await?;
+            }
+            0x03 => {
+                let mut len = [0u8; 1];
+                s.read_exact(&mut len).await?;
+                let mut rest = vec![0u8; len[0] as usize + 2];
+                s.read_exact(&mut rest).await?;
+            }
+            atyp => anyhow::bail!("socks atyp {atyp}"),
+        }
         Ok(s)
     }
 

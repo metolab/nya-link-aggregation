@@ -1,7 +1,10 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
-use tokio::io::AsyncWriteExt;
+use anyhow::{anyhow, Result};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tracing::info;
 
 use crate::harness::{start, Harness, HarnessSpec};
@@ -822,7 +825,14 @@ pub async fn same_class_mix_warm() -> Result<ScenarioReport> {
     let h = start(three_paths([12, 14, 16])).await?;
     let mut joins = Vec::new();
     for _ in 0..3 {
+        // Wait until this TCP is an overlay stream before opening the next,
+        // otherwise three concurrent open_stream see sticky=0 and all pick a.
+        let before = h.session.snapshot().streams_live;
         let mut tcp = h.connect_forward().await?;
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while h.session.snapshot().streams_live <= before && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         joins.push(tokio::spawn(async move {
             ping_for(&mut tcp, Duration::from_secs(3), PING, PING_TO).await
         }));
@@ -858,6 +868,193 @@ pub async fn same_class_mix_warm() -> Result<ScenarioReport> {
             .push("stickies did not mix across named links".into());
         r.sla.min_success = 2.0;
     }
+    Ok(r)
+}
+
+async fn echo16(tcp: &mut TcpStream, seq: u64) -> Result<()> {
+    let mut msg = [0u8; 16];
+    msg[..8].copy_from_slice(&seq.to_be_bytes());
+    tcp.write_all(&msg).await?;
+    let mut got = [0u8; 16];
+    tokio::time::timeout(Duration::from_millis(800), tcp.read_exact(&mut got)).await??;
+    Ok(())
+}
+
+fn apply_table_invariants(
+    r: &mut ScenarioReport,
+    n: usize,
+    after: &nya_core::SessionSnapshot,
+    mig_on_flap: u64,
+    io_fail: u64,
+    fail_on_io: bool,
+) {
+    r.notes.push(format!(
+        "churn={n} io_fail={io_fail} held={} live={} closed={} opened={} resets={} mig_on_flap={mig_on_flap}",
+        after.streams_held,
+        after.streams_live,
+        after.streams_closed,
+        after.streams_opened,
+        after.stream_resets
+    ));
+    if after.streams_held > after.streams_live.saturating_add(2) {
+        r.notes.push(format!(
+            "stream table leak: held={} live={} after {n} short closes",
+            after.streams_held, after.streams_live
+        ));
+        r.sla.min_success = 2.0;
+    }
+    if mig_on_flap > 8 {
+        r.notes.push(format!(
+            "migrate storm on closed streams: {mig_on_flap} (limit 8)"
+        ));
+        r.sla.min_success = 2.0;
+    }
+    if fail_on_io && io_fail > 0 {
+        r.notes.push(format!("short-stream io failures: {io_fail}"));
+        r.sla.min_success = 2.0;
+    }
+}
+
+async fn settle_and_ping(
+    h: &Harness,
+    name: &str,
+    n: usize,
+    io_fail: u64,
+    fail_on_io: bool,
+) -> Result<ScenarioReport> {
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let after_close = h.session.snapshot();
+    let mig0 = after_close.migrates;
+    h.link("a").disconnect_conn(0);
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let after_flap = h.session.snapshot();
+    let mig_on_flap = after_flap.migrates.saturating_sub(mig0);
+    let stats = ping_stream(h, Duration::from_secs(2)).await?;
+    let mut r = finish(name, h, stats, Sla::healthy(120), None);
+    apply_table_invariants(&mut r, n, &after_close, mig_on_flap, io_fail, fail_on_io);
+    Ok(r)
+}
+
+/// Sequential short-lived application TCPs must leave the stream table empty.
+///
+/// Production 204 soak: each curl opened a stream, graceful close left the
+/// HashMap entry, and `maintain` speculatively migrated every ghost on path
+/// flap. Long-lived ping SLAs never see that.
+pub async fn short_stream_churn() -> Result<ScenarioReport> {
+    let h = start(three_paths([10, 10, 10])).await?;
+    const N: usize = 64;
+    let mut io_fail = 0u64;
+    for i in 0..N {
+        let mut tcp = h.connect_forward().await?;
+        if echo16(&mut tcp, i as u64 + 1).await.is_err() {
+            io_fail += 1;
+        }
+        drop(tcp);
+    }
+    settle_and_ping(&h, "short_stream_churn", N, io_fail, true).await
+}
+
+/// Same as short_stream_churn but through SOCKS5 CONNECT (curl --socks5-hostname).
+pub async fn socks_short_churn() -> Result<ScenarioReport> {
+    let h = start(three_paths([10, 10, 10])).await?;
+    const N: usize = 32;
+    let mut io_fail = 0u64;
+    for i in 0..N {
+        match h.connect_socks_echo().await {
+            Ok(mut tcp) => {
+                if echo16(&mut tcp, i as u64 + 1).await.is_err() {
+                    io_fail += 1;
+                }
+            }
+            Err(_) => io_fail += 1,
+        }
+    }
+    settle_and_ping(&h, "socks_short_churn", N, io_fail, true).await
+}
+
+/// Overlapping short streams: open/close concurrently, not one-at-a-time.
+pub async fn concurrent_short_churn() -> Result<ScenarioReport> {
+    let h = start(three_paths([10, 10, 10])).await?;
+    const N: usize = 24;
+    let fwd = h.forward;
+    let mut joins = Vec::new();
+    for i in 0..N {
+        joins.push(tokio::spawn(async move {
+            let mut tcp = TcpStream::connect(fwd).await?;
+            let _ = tcp.set_nodelay(true);
+            echo16(&mut tcp, i as u64 + 1).await
+        }));
+    }
+    let mut io_fail = 0u64;
+    for j in joins {
+        match j.await {
+            Ok(Ok(())) => {}
+            _ => io_fail += 1,
+        }
+    }
+    settle_and_ping(&h, "concurrent_short_churn", N, io_fail, true).await
+}
+
+/// Write then drop without reading — RST/timeout style abort, not a clean echo.
+pub async fn abort_unread_churn() -> Result<ScenarioReport> {
+    let h = start(three_paths([10, 10, 10])).await?;
+    const N: usize = 32;
+    let mut io_fail = 0u64;
+    for i in 0..N {
+        match h.connect_forward().await {
+            Ok(mut tcp) => {
+                let mut msg = [0u8; 16];
+                msg[..8].copy_from_slice(&(i as u64 + 1).to_be_bytes());
+                if tcp.write_all(&msg).await.is_err() {
+                    io_fail += 1;
+                }
+                drop(tcp);
+            }
+            Err(_) => io_fail += 1,
+        }
+    }
+    settle_and_ping(&h, "abort_unread_churn", N, io_fail, false).await
+}
+
+/// Close handshake racing path flaps (StreamClose can be lost). After
+/// `close_linger` the table must still drain; a new ping must be healthy.
+pub async fn churn_during_path_flap() -> Result<ScenarioReport> {
+    let h = start(three_paths([10, 10, 10])).await?;
+    let stop = Arc::new(AtomicBool::new(false));
+    let a = h.link("a").clone();
+    let b = h.link("b").clone();
+    let stop_f = stop.clone();
+    let flapper = tokio::spawn(async move {
+        let mut i = 0u32;
+        while !stop_f.load(Ordering::Relaxed) {
+            if i % 2 == 0 {
+                a.disconnect_conn(0);
+            } else {
+                b.disconnect_conn(0);
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            i += 1;
+        }
+    });
+    const N: usize = 32;
+    let mut io_fail = 0u64;
+    for i in 0..N {
+        match h.connect_forward().await {
+            Ok(mut tcp) => {
+                if echo16(&mut tcp, i as u64 + 1).await.is_err() {
+                    io_fail += 1;
+                }
+            }
+            Err(_) => io_fail += 1,
+        }
+    }
+    stop.store(true, Ordering::Relaxed);
+    let _ = flapper.await;
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let after = h.session.snapshot();
+    let stats = ping_stream(&h, Duration::from_secs(2)).await?;
+    let mut r = finish("churn_during_path_flap", &h, stats, Sla::healthy(150), None);
+    apply_table_invariants(&mut r, N, &after, 0, io_fail, false);
     Ok(r)
 }
 
@@ -968,9 +1165,34 @@ pub async fn run_catalog(filter: Option<&str>, long: bool, jobs: usize) -> Vec<S
         .filter(|s| long || !s.long)
         .filter(|s| filter.map(|f| s.name.contains(f)).unwrap_or(true))
         .collect();
+    run_selected(selected, jobs, "catalog").await
+}
+
+/// Isolated stream-lifecycle suite (SOCKS / concurrent / abort / flap).
+/// Kept out of the p99 catalog so connect churn does not inflate neighbours.
+pub async fn run_lifecycle(jobs: usize) -> Vec<ScenarioReport> {
+    run_selected(
+        vec![
+            sc!("short_stream_churn", false, short_stream_churn()),
+            sc!("socks_short_churn", false, socks_short_churn()),
+            sc!("concurrent_short_churn", false, concurrent_short_churn()),
+            sc!("abort_unread_churn", false, abort_unread_churn()),
+            sc!("churn_during_path_flap", false, churn_during_path_flap()),
+        ],
+        jobs,
+        "lifecycle",
+    )
+    .await
+}
+
+async fn run_selected(
+    selected: Vec<Scenario>,
+    jobs: usize,
+    label: &'static str,
+) -> Vec<ScenarioReport> {
     let jobs = jobs.max(1);
-    info!(n = selected.len(), jobs, "catalog start");
-    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(jobs));
+    info!(n = selected.len(), jobs, label, "suite start");
+    let sem = Arc::new(tokio::sync::Semaphore::new(jobs));
     let mut joins = tokio::task::JoinSet::new();
     for (idx, s) in selected.into_iter().enumerate() {
         let sem = sem.clone();
@@ -994,7 +1216,7 @@ pub async fn run_catalog(filter: Option<&str>, long: bool, jobs: usize) -> Vec<S
             Ok(pair) => indexed.push(pair),
             Err(e) => indexed.push((
                 usize::MAX,
-                error_report("join", anyhow::anyhow!("task panicked: {e}")),
+                error_report("join", anyhow!("task panicked: {e}")),
             )),
         }
     }
