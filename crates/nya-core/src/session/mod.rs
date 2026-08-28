@@ -1309,11 +1309,11 @@ mod tests {
         let snap1 = client.snapshot();
         assert_eq!(snap1.path_down, snap0.path_down);
         assert!(
-            snap1.migrates >= snap0.migrates + 1,
+            snap1.migrates > snap0.migrates,
             "degrade migrate must count migrates, {snap0:?} -> {snap1:?}"
         );
         assert!(
-            snap1.migrates_speculative >= snap0.migrates_speculative + 1,
+            snap1.migrates_speculative > snap0.migrates_speculative,
             "degrade migrate is speculative"
         );
         assert!(!snap1.links.is_empty(), "snapshot must roll up links");
@@ -1456,8 +1456,10 @@ mod tests {
 
     #[tokio::test]
     async fn open_without_path_does_not_count_opened() {
-        let mut cfg = SessionConfig::default();
-        cfg.all_down_timeout = Duration::from_millis(20);
+        let cfg = SessionConfig {
+            all_down_timeout: Duration::from_millis(20),
+            ..Default::default()
+        };
         let client = Session::new_client(cfg);
         let err = client
             .open_stream(Target {

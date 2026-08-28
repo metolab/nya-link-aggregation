@@ -956,14 +956,16 @@ mod tests {
 
     #[test]
     fn prometheus_has_type_and_cumulative_buckets() {
-        let mut s = Snapshot::default();
-        s.failover_ms = HistSnap::zeroed(FAILOVER_MS_BOUNDS);
+        let mut s = Snapshot {
+            failover_ms: HistSnap::zeroed(FAILOVER_MS_BOUNDS),
+            stall_ms: HistSnap::zeroed(STALL_MS_BOUNDS),
+            stream_lifetime_ms: HistSnap::zeroed(LIFETIME_MS_BOUNDS),
+            ..Default::default()
+        };
         s.failover_ms.buckets[0] = 2;
         s.failover_ms.buckets[1] = 3;
         s.failover_ms.count = 5;
         s.failover_ms.sum = 20;
-        s.stall_ms = HistSnap::zeroed(STALL_MS_BOUNDS);
-        s.stream_lifetime_ms = HistSnap::zeroed(LIFETIME_MS_BOUNDS);
         let body = render_prometheus(&ProcessSnapshot {
             process: Default::default(),
             session: s,
