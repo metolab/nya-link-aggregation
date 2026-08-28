@@ -99,9 +99,17 @@ HOL 隔离靠「每链路多连接 + 姐妹优先 backup」，不是按 ISP 钉�
 - 未确认数据记在发送路径的 inflight 上；ACK 时减去，并对小帧采样 RTT（bulk ACK 不当时延）
 - 服务端出站拨号失败会 `IncomingStream::reset(DialFailed)`，对端收到 `STREAM_RESET`
 
+## 可观测性
+
+`Counters` 挂在每个 `Session` 上，进程边缘（入站 / 出站 / 握手 / 重连）走 `ProcessCounters`（始终在 `Inner` 上）。默认每 10s 一条 `nya_core::obs` snapshot；`[obs].metrics_listen` 默认关。决策点（pick / migrate / failback / HOL）是结构化 `debug!`。热路径（STREAM_DATA / ACK / Ping）不打日志。
+
+线路状态按 `link_key` 汇总（`a#0`/`a#1` → `a`）：up/deg 连接数、RTT 范围、sticky、inflight、队列、rx 新鲜/最旧。迁移原因拆成 speculative / path_down / ensure_sticky / send_blocked；另有 retransmit/hedge、probe_miss、未知 RTT pick。snapshot 带压缩 `streams=`（不进 Prometheus 标签）。
+
+业务计分卡：流完成比、send-unacked ∪ recv-hole stall、每路径一次 `failover_ms`（`last_rx_ago`）、跨 link `failbacks`、overlay goodput（`path.rs::send_frame` / decode）。e2e SLA 仍用应用 ping；overlay p99 只进 notes。见 [OBSERVABILITY.md](OBSERVABILITY.md)。
+
 ## 配置分层
 
-运维 TOML（`SessionOpts`）只有四个键：探测预算、路径上限、全 down 放弃。`#[serde(deny_unknown_fields)]`。
+运维 TOML（`SessionOpts`）只有四个键：探测预算、路径上限、全 down 放弃。`#[serde(deny_unknown_fields)]`。顶层可选 `[obs]` 两键（snapshot 间隔、metrics 监听），日志级别只走 `RUST_LOG`。
 
 算法常数在 `Tuning::STANDARD`：loss/down 倍数、failback 阈值、队列深度、重连退避、交互帧上限。测试里可以 clone 再改；生产路径只有这一张表。
 

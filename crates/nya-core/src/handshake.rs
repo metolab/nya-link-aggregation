@@ -40,7 +40,7 @@ pub async fn client_create_session<T: AsyncRead + AsyncWrite + Unpin>(
         }),
     )
     .await?;
-    tracing::debug!("create-session written, waiting for ok");
+    tracing::debug!(role = "create", "create-session written, waiting for ok");
     tokio::task::yield_now().await;
     match read_frame(io).await? {
         Frame::CreateSessionOk(ok) => Ok(ok.session_id),

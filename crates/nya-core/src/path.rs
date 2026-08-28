@@ -52,6 +52,10 @@ pub struct PathState {
     high_since: std::sync::Mutex<Option<Instant>>,
     class_high_since: std::sync::Mutex<Option<Instant>>,
     class_low_since: std::sync::Mutex<Option<Instant>>,
+    /// CAS: one failover_ms sample per path.
+    pub failover_recorded: AtomicBool,
+    urgent_queued: AtomicU64,
+    bulk_queued: AtomicU64,
 }
 
 impl PathState {
@@ -89,6 +93,9 @@ impl PathState {
             high_since: std::sync::Mutex::new(None),
             class_high_since: std::sync::Mutex::new(None),
             class_low_since: std::sync::Mutex::new(None),
+            failover_recorded: AtomicBool::new(false),
+            urgent_queued: AtomicU64::new(0),
+            bulk_queued: AtomicU64::new(0),
         })
     }
 
@@ -219,6 +226,45 @@ impl PathState {
         self.last_tx.lock().unwrap().elapsed()
     }
 
+    pub fn queued_urgent(&self) -> u64 {
+        self.urgent_queued.load(Ordering::Relaxed)
+    }
+
+    pub fn queued_bulk(&self) -> u64 {
+        self.bulk_queued.load(Ordering::Relaxed)
+    }
+
+    pub fn note_enqueue(&self, urgent: bool) {
+        if urgent {
+            self.urgent_queued.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.bulk_queued.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn note_dequeue(&self, urgent: bool) {
+        let q = if urgent {
+            &self.urgent_queued
+        } else {
+            &self.bulk_queued
+        };
+        let _ = q.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+            Some(v.saturating_sub(1))
+        });
+    }
+
+    pub fn pending_ping_count(&self) -> u64 {
+        self.pending_ping.lock().unwrap().len() as u64
+    }
+
+    /// Drop pings with no Pong within `max_age`. Returns how many were expired.
+    pub fn expire_stale_pings(&self, max_age: Duration) -> u64 {
+        let mut g = self.pending_ping.lock().unwrap();
+        let n0 = g.len();
+        g.retain(|_, t| t.elapsed() < max_age);
+        n0.saturating_sub(g.len()) as u64
+    }
+
     pub fn note_tx(&self) {
         *self.last_tx.lock().unwrap() = Instant::now();
     }
@@ -272,6 +318,13 @@ impl PathState {
             let n = self.class_init_n.fetch_add(1, Ordering::Relaxed) + 1;
             if n >= 8 {
                 self.rtt_class_us.store(fast, Ordering::Relaxed);
+                tracing::debug!(
+                    path = %self.name,
+                    old_us = 0u64,
+                    new_us = fast,
+                    kind = "init",
+                    "class"
+                );
             }
             return;
         }
@@ -288,8 +341,15 @@ impl PathState {
             *low = None;
             let start = high.get_or_insert_with(Instant::now);
             if start.elapsed() >= hold {
-                self.rtt_class_us
-                    .store((c_old * 7 + fast) / 8, Ordering::Relaxed);
+                let new_us = (c_old * 7 + fast) / 8;
+                self.rtt_class_us.store(new_us, Ordering::Relaxed);
+                tracing::debug!(
+                    path = %self.name,
+                    old_us = c_old,
+                    new_us,
+                    kind = "raise",
+                    "class"
+                );
             }
             return;
         }
@@ -297,8 +357,15 @@ impl PathState {
         if drop {
             let start = low.get_or_insert_with(Instant::now);
             if start.elapsed() >= hold {
-                self.rtt_class_us
-                    .store((c_old * 7 + fast) / 8, Ordering::Relaxed);
+                let new_us = (c_old * 7 + fast) / 8;
+                self.rtt_class_us.store(new_us, Ordering::Relaxed);
+                tracing::debug!(
+                    path = %self.name,
+                    old_us = c_old,
+                    new_us,
+                    kind = "drop",
+                    "class"
+                );
             }
             return;
         }
@@ -359,6 +426,7 @@ pub fn now_ms() -> u64 {
 
 async fn send_frame<T>(
     framed: &mut Framed<T, LengthDelimitedCodec>,
+    session: &Session,
     path: &PathState,
     frame: Frame,
 ) -> std::io::Result<()>
@@ -366,7 +434,11 @@ where
     T: AsyncRead + AsyncWrite + Unpin,
 {
     path.note_tx();
-    framed.send(Bytes::from(frame.encode())).await
+    let encoded = frame.encode();
+    let n = encoded.len();
+    framed.send(Bytes::from(encoded)).await?;
+    session.account_overlay_frame(&frame, n, true);
+    Ok(())
 }
 
 pub fn spawn_path_io<T>(
@@ -407,7 +479,8 @@ pub fn spawn_path_io<T>(
                 biased;
                 out = urgent.recv() => {
                     let Some(frame) = out else { break; };
-                    if let Err(e) = send_frame(&mut framed, &path, frame).await {
+                    path.note_dequeue(true);
+                    if let Err(e) = send_frame(&mut framed, &session, &path, frame).await {
                         warn!(path = %path.name, error = %e, "path write failed");
                         break;
                     }
@@ -425,6 +498,7 @@ pub fn spawn_path_io<T>(
                         Some(Ok(bytes)) => {
                             match Frame::decode(&bytes) {
                                 Ok(frame) => {
+                                    session.account_overlay_frame(&frame, bytes.len(), false);
                                     path.touch_rx();
                                     session.handle_frame(path.id, frame);
                                 }
@@ -438,7 +512,8 @@ pub fn spawn_path_io<T>(
                 }
                 out = rx.recv() => {
                     let Some(frame) = out else { break; };
-                    if let Err(e) = send_frame(&mut framed, &path, frame).await {
+                    path.note_dequeue(false);
+                    if let Err(e) = send_frame(&mut framed, &session, &path, frame).await {
                         warn!(path = %path.name, error = %e, "path write failed");
                         break;
                     }
@@ -449,7 +524,9 @@ pub fn spawn_path_io<T>(
                     }
                     if path.last_rx_ago() >= ping_every {
                         let ping = path.next_ping();
-                        if let Err(e) = send_frame(&mut framed, &path, Frame::Ping(ping)).await {
+                        if let Err(e) =
+                            send_frame(&mut framed, &session, &path, Frame::Ping(ping)).await
+                        {
                             warn!(path = %path.name, error = %e, "path ping failed");
                             break;
                         }
@@ -473,6 +550,18 @@ mod tests {
     fn path() -> Arc<PathState> {
         let (tx, _rx) = mpsc::channel(1);
         PathState::new(1, "t".into(), tx)
+    }
+
+    #[test]
+    fn queued_saturates_at_zero() {
+        let p = path();
+        p.note_enqueue(true);
+        p.note_enqueue(true);
+        assert_eq!(p.queued_urgent(), 2);
+        p.note_dequeue(true);
+        p.note_dequeue(true);
+        p.note_dequeue(true);
+        assert_eq!(p.queued_urgent(), 0);
     }
 
     #[test]

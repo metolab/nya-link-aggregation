@@ -10,7 +10,7 @@ use tokio::sync::watch;
 use tracing::info;
 
 use nya_client::{serve_forward_listener, serve_socks5_listener, spawn_links, ClientConfig, Link};
-use nya_core::{install_crypto, parse_pin_hex, Session, SessionConfig};
+use nya_core::{install_crypto, parse_pin_hex, ObsOpts, Session, SessionConfig};
 use nya_server::{cert_paths, gen_cert, run_on_until, ServerConfig};
 
 use crate::impair::{spawn_link, ImpairConfig, LinkHandle};
@@ -115,6 +115,10 @@ pub async fn start(spec: HarnessSpec) -> Result<Harness> {
         cert,
         key,
         session: Default::default(),
+        obs: ObsOpts {
+            snapshot_interval_ms: Some(0),
+            ..Default::default()
+        },
     };
     let (server_stop, stop_rx) = watch::channel(false);
     tokio::spawn(async move {
@@ -141,6 +145,10 @@ pub async fn start(spec: HarnessSpec) -> Result<Harness> {
         psk: spec.psk,
         pinned_spki_sha256: hex_pin(&pin),
         session: Default::default(),
+        obs: ObsOpts {
+            snapshot_interval_ms: Some(0),
+            ..Default::default()
+        },
         links: links
             .iter()
             .map(|l| Link {

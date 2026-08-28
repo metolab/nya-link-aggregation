@@ -15,7 +15,7 @@ use tracing::{info, warn};
 
 use nya_core::{
     client_create_session, client_join_session, connect_pinned, export_from_client, parse_pin_hex,
-    Session,
+    spawn_obs_session, Session,
 };
 use nya_proto::SESSION_ID_LEN;
 
@@ -78,6 +78,7 @@ pub async fn run_with_inbounds(cfg: ClientConfig) -> Result<()> {
 pub async fn start(cfg: ClientConfig) -> Result<Session> {
     let pin = parse_pin_hex(&cfg.pinned_spki_sha256).map_err(|e| anyhow::anyhow!("{e}"))?;
     let session = Session::new_client(cfg.session_config());
+    spawn_obs_session(session.clone(), cfg.obs.clone());
     spawn_links(&cfg, session.clone(), pin);
     Ok(session)
 }
@@ -106,7 +107,10 @@ async fn run_link(
             r = connect_one(&link, &path_name, &session, pin, &join, &psk, hs) => {
                 match r {
                     Ok(()) => backoff = backoff_min,
-                    Err(e) => warn!(path = %path_name, error = %e, "link failed"),
+                    Err(e) => {
+                        session.process().reconnect_fail.fetch_add(1, Ordering::Relaxed);
+                        warn!(path = %path_name, error = %e, "link failed");
+                    }
                 }
             }
         }
@@ -178,11 +182,16 @@ async fn connect_one(
             .await
             {
                 Ok(Ok(sid)) => {
+                    session
+                        .process()
+                        .handshake_create_ok
+                        .fetch_add(1, Ordering::Relaxed);
                     join.set_id(sid);
                     join.ready.notify_waiters();
                     info!(path = %path_name, "session created");
                 }
                 Ok(Err(e)) => {
+                    session.process().inc_handshake_fail(&e);
                     join.creating.store(false, Ordering::SeqCst);
                     join.ready.notify_waiters();
                     return Err(e.into());
@@ -195,17 +204,32 @@ async fn connect_one(
             }
         }
         Role::Join(sid) => {
-            tokio::time::timeout(
+            match tokio::time::timeout(
                 hs,
                 client_join_session(&mut tls, psk, &exporter, sid, path_name),
             )
             .await
-            .map_err(|_| anyhow::anyhow!("join timeout"))?
-            .map_err(|e| anyhow::anyhow!("join: {e}"))?;
+            {
+                Ok(Ok(())) => {
+                    session
+                        .process()
+                        .handshake_join_ok
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(Err(e)) => {
+                    session.process().inc_handshake_fail(&e);
+                    return Err(anyhow::anyhow!("join: {e}"));
+                }
+                Err(_) => return Err(anyhow::anyhow!("join timeout")),
+            }
         }
     }
 
     info!(path = %path_name, addr = %link.addr, "path up");
+    session
+        .process()
+        .reconnect_ok
+        .fetch_add(1, Ordering::Relaxed);
     session.add_path(path_name.to_string(), tls).await;
     Ok(())
 }

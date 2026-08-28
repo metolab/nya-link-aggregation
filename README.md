@@ -87,7 +87,7 @@ PSK 两端必须一致。客户端 `pinned_spki_sha256` 填上一步打印的值
 ./target/release/nya-client --config client.toml
 ```
 
-默认客户端在 `127.0.0.1:1080` 提供 SOCKS5。日志级别用 `RUST_LOG`，例如 `RUST_LOG=nya_core=debug`。
+默认客户端在 `127.0.0.1:1080` 提供 SOCKS5。日志级别只用 `RUST_LOG`：未设置时落到 `nya_client=info,nya_core=info`（服务端同理）。`RUST_LOG=nya_core=debug` 会打出调度决策（pick / migrate / failback / HOL）的结构化字段。每 10 秒一条 `target=nya_core::obs` 的质量 snapshot（流成功/reset、stall、failover 时延、goodput）。可选 `[obs].metrics_listen = "127.0.0.1:9100"` 提供 Prometheus text（必须是数值 loopback 地址，不要 `localhost` / `0.0.0.0`）。
 
 ## 配置
 
@@ -101,7 +101,16 @@ PSK 两端必须一致。客户端 `pinned_spki_sha256` 填上一步打印的值
 | `all_down_timeout_ms` | 全部路径 down 后拆会话 | 8000 |
 | `max_paths` | 单会话路径上限 | 32 |
 
+可选 `[obs]`（缺省即安静的 10s snapshot、不监听 HTTP）：
+
+| 键 | 含义 | 默认 |
+| --- | --- | --- |
+| `snapshot_interval_ms` | 定期 snapshot 间隔；`0` 关闭 | 10000 |
+| `metrics_listen` | Prometheus `/metrics`；空 = 不听 | 空 |
+
 健康判定、failback 公式、队列深度等在 `nya_core::Tuning`，**不能**写进 TOML。改算法请改 `Tuning::STANDARD` 并跑 e2e，不要给运维暴露一堆旋钮。
+
+计分卡（`nya_core::obs` snapshot / `/metrics`）用来回答「聚合有没有用」：流 `closed/(closed+reset)`、send-unacked ∪ recv-hole stall、路径静默 `failover_ms`、跨 link `failbacks`（e2e chatter 门仍只看这个）、overlay `bytes_data_* / bytes_ctrl_*`。snapshot 里还有 **线路汇总** `links=`（按 `a`/`b` 把 `a#0`/`a#1` 卷起来：up/deg、RTT 范围、sticky、队列）以及压缩的 `streams=` 粘滞表。决策 why 只在 debug。详细清单见 [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md)。
 
 客户端链路：
 

@@ -2,7 +2,7 @@ use std::fmt;
 use std::time::Duration;
 
 use crate::workload::WorkloadStats;
-use nya_core::SessionSnapshot;
+use nya_core::{percentile, SessionSnapshot, FAILOVER_MS_BOUNDS, STALL_MS_BOUNDS};
 
 #[derive(Clone, Debug)]
 pub struct Sla {
@@ -125,11 +125,48 @@ impl ScenarioReport {
             self.snap.frame_send_drop,
         )
     }
+
+    fn overlay_notes(&self) -> Vec<String> {
+        let stall = percentile(&self.snap.stall_ms, STALL_MS_BOUNDS, 99.0)
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "-".into());
+        let fail = percentile(&self.snap.failover_ms, FAILOVER_MS_BOUNDS, 99.0)
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "-".into());
+        let links = self
+            .snap
+            .links
+            .iter()
+            .map(|l| format!("{}:{}/{} {}ms", l.name, l.up, l.degraded, l.rtt_us / 1000))
+            .collect::<Vec<_>>()
+            .join(",");
+        vec![
+            format!(
+                "overlay stall_p99={stall}ms failover_p99={fail}ms resets={} closed={} opened={}",
+                self.snap.stream_resets, self.snap.streams_closed, self.snap.streams_opened
+            ),
+            format!(
+                "links={links} mig spec={} down={} ens={} blk={} retransmit={} hedge={} probe_miss={} unk_pick={}/{}",
+                self.snap.migrates_speculative,
+                self.snap.migrates_path_down,
+                self.snap.migrates_ensure_sticky,
+                self.snap.migrates_send_blocked,
+                self.snap.data_retransmit,
+                self.snap.data_hedge,
+                self.snap.probe_miss,
+                self.snap.picks_unknown_over_known,
+                self.snap.picks_unknown_rtt,
+            ),
+        ]
+    }
 }
 
 impl fmt::Display for ScenarioReport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.line())?;
+        for n in self.overlay_notes() {
+            write!(f, "\n    note: {n}")?;
+        }
         for n in &self.notes {
             write!(f, "\n    note: {n}")?;
         }
@@ -143,6 +180,9 @@ pub fn print_suite(reports: &[ScenarioReport]) {
     println!("{:<28} {:<5} {}", "SCENARIO", "SLA", "DETAIL");
     for r in reports {
         println!("{}", r.line());
+        for n in r.overlay_notes() {
+            println!("    note: {n}");
+        }
         if !r.pass() {
             for n in r.notes.iter().filter(|n| {
                 n.starts_with("FAIL")

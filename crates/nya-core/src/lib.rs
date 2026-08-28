@@ -20,6 +20,7 @@
 
 mod auth;
 mod cfg;
+mod export;
 mod handshake;
 mod health;
 mod metrics;
@@ -30,12 +31,17 @@ mod stream;
 pub mod tls;
 mod tuning;
 
-pub use cfg::{SessionConfig, SessionOpts};
+pub use cfg::{ObsOpts, SessionConfig, SessionOpts};
+pub use export::{parse_metrics_listen, spawn_obs_session, spawn_obs_table};
 pub use handshake::{
     client_create_session, client_join_session, server_accept_handshake, HandshakeError,
     HandshakeResult,
 };
-pub use metrics::{PathSnap, Snapshot as SessionSnapshot};
+pub use metrics::{
+    percentile, rollup_links, HistSnap, Histogram, LinkSnap, PathSnap, ProcessCounters,
+    ProcessSnapshot, Snapshot as SessionSnapshot, FAILOVER_MS_BOUNDS, LIFETIME_MS_BOUNDS,
+    STALL_MS_BOUNDS,
+};
 pub use session::{IncomingStream, Session, SessionError, SessionTable};
 pub use stream::TunnelStream;
 pub use tls::{

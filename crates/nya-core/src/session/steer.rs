@@ -4,7 +4,9 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
+
+use crate::metrics::{mono_ms, path_state_label};
 
 use nya_proto::ResetReason;
 
@@ -46,6 +48,13 @@ impl Session {
             if !p.is_alive() {
                 continue;
             }
+            let miss = p.expire_stale_pings(health::loss_timeout(&self.inner.cfg, p.stable_rtt()));
+            if miss > 0 {
+                self.inner
+                    .metrics
+                    .probe_miss
+                    .fetch_add(miss, Ordering::Relaxed);
+            }
             let ago = p.last_rx_ago();
             if ago >= self.down_for(p) {
                 warn!(path = %p.name, ?ago, down = ?self.down_for(p), "path silent, marking down");
@@ -58,6 +67,10 @@ impl Session {
                 if p.is_up() && !ping_inflight {
                     info!(path = %p.name, ?ago, "path silent, marking degraded");
                     p.mark_degraded();
+                    self.inner
+                        .metrics
+                        .path_degraded
+                        .fetch_add(1, Ordering::Relaxed);
                 }
             }
         }
@@ -82,6 +95,17 @@ impl Session {
         for st in bulk.iter().chain(rest.iter()) {
             self.maybe_hol(st);
         }
+        let mut stalled = 0u64;
+        for st in bulk.iter().chain(rest.iter()) {
+            self.scan_stall(st);
+            if st.stalled.load(Ordering::Relaxed) {
+                stalled += 1;
+            }
+        }
+        self.inner
+            .metrics
+            .streams_stalled
+            .store(stalled, Ordering::Relaxed);
         for st in bulk.into_iter().chain(rest) {
             self.maybe_speculative(st.clone());
             self.maybe_failback(st);
@@ -103,6 +127,10 @@ impl Session {
                         count = ids.len(),
                         "all paths down past timeout, resetting streams"
                     );
+                    self.inner
+                        .metrics
+                        .session_all_down_resets
+                        .fetch_add(1, Ordering::Relaxed);
                     for id in ids {
                         self.reset_stream(id, ResetReason::Timeout);
                     }
@@ -141,11 +169,23 @@ impl Session {
                     {
                         self.set_sticky(st.id, alt);
                         self.retransmit_all_on(&st, alt);
-                        self.inner.metrics.migrates.fetch_add(1, Ordering::Relaxed);
-                        info!(
+                        self.note_migrate("speculative");
+                        if let Some(p) = cur_path.as_ref() {
+                            if !p.is_up() {
+                                self.observe_failover(p);
+                            }
+                        }
+                        let from_state = cur_path
+                            .as_ref()
+                            .map(|p| path_state_label(p.state.load(Ordering::Relaxed)))
+                            .unwrap_or("gone");
+                        debug!(
                             stream_id = st.id,
                             from = sticky,
                             to = alt,
+                            same_link,
+                            from_state,
+                            reason = "speculative",
                             "speculative migrate"
                         );
                         return;
@@ -167,10 +207,18 @@ impl Session {
                 // live path — never fan-out to every connection.
                 u.last_sent = Instant::now();
                 self.send_data_frame(st.id, *offset, u.data.clone(), u.path_id);
+                self.inner
+                    .metrics
+                    .data_retransmit
+                    .fetch_add(1, Ordering::Relaxed);
                 if let Some(alt) =
                     backup_prefer_class(&self.path_list(), u.path_id, &self.inner.cfg)
                 {
                     self.send_data_frame(st.id, *offset, u.data.clone(), alt);
+                    self.inner
+                        .metrics
+                        .data_hedge
+                        .fetch_add(1, Ordering::Relaxed);
                 }
             }
         }
@@ -227,12 +275,33 @@ impl Session {
         if dest == cur_id {
             return;
         }
+        let to_path = self.get_path(dest);
+        let from_inflight = cur.inflight_bytes();
+        let to_inflight = to_path.as_ref().map(|p| p.inflight_bytes()).unwrap_or(0);
+        let from_sticky = cur.sticky_count();
+        let to_sticky = to_path.as_ref().map(|p| p.sticky_count()).unwrap_or(0);
         self.set_sticky(st.id, dest);
         self.retransmit_all_on(st, dest);
         self.inner
             .metrics
             .hol_rebalances
             .fetch_add(1, Ordering::Relaxed);
+        let reason = if st.bulk.load(Ordering::Relaxed) {
+            "hol_bulk"
+        } else {
+            "hol_rebalance"
+        };
+        debug!(
+            stream_id = st.id,
+            from = cur_id,
+            to = dest,
+            from_inflight,
+            to_inflight,
+            from_sticky,
+            to_sticky,
+            reason,
+            "hol"
+        );
     }
 
     fn maybe_failback(&self, st: Arc<StreamState>) {
@@ -267,7 +336,8 @@ impl Session {
         };
         self.set_sticky(st.id, best_id);
         self.retransmit_all_on(&st, best_id);
-        if cur.link() != best.link() {
+        let cross_link = cur.link() != best.link();
+        if cross_link {
             self.inner.metrics.failbacks.fetch_add(1, Ordering::Relaxed);
             match reason {
                 FailbackReason::Upgrade => {
@@ -283,22 +353,28 @@ impl Session {
                         .fetch_add(1, Ordering::Relaxed);
                 }
             }
+        } else {
+            self.inner
+                .metrics
+                .failbacks_same_link
+                .fetch_add(1, Ordering::Relaxed);
         }
         let why = match reason {
             FailbackReason::Upgrade => "upgrade",
             FailbackReason::ClassEmpty => "class_empty",
         };
-        info!(
+        debug!(
             stream_id = st.id,
             from = sticky,
             to = best_id,
-            from_rtt_us = cur.rtt().as_micros(),
-            to_rtt_us = best.rtt().as_micros(),
-            from_stable_us = cur.stable_rtt().as_micros(),
-            from_class_us = cur.class_rtt().as_micros(),
-            to_stable_us = best.stable_rtt().as_micros(),
-            to_class_us = best.class_rtt().as_micros(),
+            from_rtt_us = cur.rtt().as_micros() as u64,
+            to_rtt_us = best.rtt().as_micros() as u64,
+            from_stable_us = cur.stable_rtt().as_micros() as u64,
+            from_class_us = cur.class_rtt().as_micros() as u64,
+            to_stable_us = best.stable_rtt().as_micros() as u64,
+            to_class_us = best.class_rtt().as_micros() as u64,
             reason = why,
+            cross_link,
             "failback"
         );
     }
@@ -323,13 +399,105 @@ impl Session {
             }
             self.set_sticky(st.id, backup);
             self.retransmit_from_on(&st, dead_path, backup);
-            info!(
+            debug!(
                 stream_id = st.id,
                 from = dead_path,
                 to = backup,
+                reason = "path_down",
                 "stream migrated"
             );
-            self.inner.metrics.migrates.fetch_add(1, Ordering::Relaxed);
+            self.note_migrate("path_down");
+        }
+    }
+
+    fn scan_stall(&self, st: &StreamState) {
+        if st.reset.load(Ordering::Relaxed) || st.counted_close.load(Ordering::Relaxed) {
+            return;
+        }
+        let now = mono_ms();
+        let thresh = match self.get_path(st.sticky.load(Ordering::Relaxed)) {
+            Some(p) => self.degrade_for(&p),
+            None => self.inner.cfg.tuning.loss_timeout_floor,
+        };
+        let thresh_ms = thresh.as_millis() as u64;
+
+        let send_origin = {
+            let unacked = st.unacked.lock().unwrap();
+            if unacked.is_empty() {
+                None
+            } else {
+                let last_ack = st.last_ack_ms.load(Ordering::Relaxed);
+                let origin = if last_ack != 0 {
+                    last_ack
+                } else {
+                    let oldest = unacked
+                        .values()
+                        .map(|u| u.last_sent)
+                        .min()
+                        .unwrap_or_else(std::time::Instant::now);
+                    now.saturating_sub(oldest.elapsed().as_millis() as u64)
+                        .max(1)
+                };
+                if now.saturating_sub(origin) >= thresh_ms {
+                    Some(origin)
+                } else {
+                    None
+                }
+            }
+        };
+
+        let recv_origin = {
+            let buf = st.recv_buf.lock().unwrap();
+            let recv_next = st.recv_next.load(Ordering::Relaxed);
+            let hole = !buf.is_empty() && !buf.contains_key(&recv_next);
+            if !hole {
+                drop(buf);
+                st.recv_hole_since_ms.store(0, Ordering::Relaxed);
+                None
+            } else {
+                drop(buf);
+                let last_recv = st.last_recv_ms.load(Ordering::Relaxed);
+                let origin = if last_recv != 0 {
+                    last_recv
+                } else {
+                    let since = st.recv_hole_since_ms.load(Ordering::Relaxed);
+                    if since == 0 {
+                        let v = now.max(1);
+                        st.recv_hole_since_ms.store(v, Ordering::Relaxed);
+                        v
+                    } else {
+                        since
+                    }
+                };
+                if now.saturating_sub(origin) >= thresh_ms {
+                    Some(origin)
+                } else {
+                    None
+                }
+            }
+        };
+
+        let origin = match (send_origin, recv_origin) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) | (None, Some(a)) => Some(a),
+            (None, None) => None,
+        };
+        let predicate = origin.is_some();
+        let was = st.stalled.load(Ordering::Relaxed);
+        if predicate && !was {
+            st.stall_from_ms
+                .store(origin.unwrap_or(now), Ordering::Relaxed);
+            st.stalled.store(true, Ordering::Relaxed);
+        } else if !predicate && was {
+            let from = st.stall_from_ms.load(Ordering::Relaxed);
+            if from != 0 {
+                self.inner
+                    .metrics
+                    .stall_ms
+                    .observe(now.saturating_sub(from));
+            }
+            st.stalled.store(false, Ordering::Relaxed);
+            st.stall_from_ms.store(0, Ordering::Relaxed);
         }
     }
 

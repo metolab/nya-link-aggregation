@@ -3,7 +3,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
-use nya_core::{SessionConfig, SessionOpts};
+use nya_core::{ObsOpts, SessionConfig, SessionOpts};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ClientConfig {
@@ -11,6 +11,8 @@ pub struct ClientConfig {
     pub pinned_spki_sha256: String,
     #[serde(default)]
     pub session: SessionOpts,
+    #[serde(default)]
+    pub obs: ObsOpts,
     pub links: Vec<Link>,
     pub inbounds: Vec<Inbound>,
 }

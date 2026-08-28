@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use nya_core::{SessionConfig, SessionOpts};
+use nya_core::{ObsOpts, SessionConfig, SessionOpts};
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -12,6 +12,8 @@ pub struct ServerConfig {
     pub key: PathBuf,
     #[serde(default)]
     pub session: SessionOpts,
+    #[serde(default)]
+    pub obs: ObsOpts,
 }
 
 impl ServerConfig {

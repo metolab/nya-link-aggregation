@@ -188,6 +188,58 @@ pub(crate) fn pick_from(
     Some(best_id)
 }
 
+/// Frozen candidate dump for debug logs. Same score as [`pick_from`].
+///
+/// Grammar per candidate (id ascending, space-separated):
+/// `{name}{id={id} {state} rtt={rtt_us} class={class_us} load={load} score={score}{*}?}`
+/// Optional ` backup={name},...` for alive paths filtered out of the class set.
+pub fn format_candidates(
+    paths: &[Arc<PathState>],
+    cfg: &SessionConfig,
+    pref: PickPref,
+    chosen: Option<u32>,
+) -> String {
+    use crate::metrics::path_state_label;
+    let class = fastest_class_set(paths, cfg);
+    let class_ids: std::collections::HashSet<u32> = class.iter().map(|p| p.id).collect();
+    let mut cands: Vec<&Arc<PathState>> = class;
+    cands.sort_by_key(|p| p.id);
+    let mut parts = Vec::with_capacity(cands.len());
+    for p in &cands {
+        let load = load_term(p, cfg, pref);
+        let class_us = p.class_rtt().as_micros() as u64;
+        let fast = rtt_score_us(p, cfg);
+        let score = class_us
+            .saturating_mul(load)
+            .saturating_mul(1024)
+            .saturating_add(fast.saturating_mul(load));
+        let star = if Some(p.id) == chosen { "*" } else { "" };
+        parts.push(format!(
+            "{}{{id={} {} rtt={} class={} load={} score={}{}}}",
+            p.name,
+            p.id,
+            path_state_label(p.state.load(std::sync::atomic::Ordering::Relaxed)),
+            p.rtt_us(),
+            class_us,
+            load,
+            score,
+            star
+        ));
+    }
+    let mut out = parts.join(" ");
+    let mut backups: Vec<&str> = paths
+        .iter()
+        .filter(|p| p.is_alive() && !class_ids.contains(&p.id))
+        .map(|p| p.name.as_str())
+        .collect();
+    if !backups.is_empty() {
+        backups.sort();
+        out.push_str(" backup=");
+        out.push_str(&backups.join(","));
+    }
+    out
+}
+
 /// HOL bulk fallback after same-link sibling: fastest class, no interactive,
 /// `class_rtt <= cur`. Never moves bulk onto a higher class_rtt.
 pub(crate) fn hol_place_bulk_fallback(
@@ -528,6 +580,39 @@ mod tests {
         a.sticky_streams.store(3, Ordering::Relaxed);
         let picked = pick_path(&[a, b.clone()], &cfg).unwrap();
         assert_eq!(picked, 2, "empty sibling should win");
+    }
+
+    #[test]
+    fn format_candidates_score_monotonic_star_on_winner() {
+        let cfg = SessionConfig::default();
+        let a = mk_named(1, "a#0".into(), 10);
+        let b = mk_named(2, "a#1".into(), 10);
+        a.sticky_streams.store(3, Ordering::Relaxed);
+        let paths = vec![a, b];
+        let picked = pick_path(&paths, &cfg).unwrap();
+        let s = format_candidates(&paths, &cfg, PickPref::Any, Some(picked));
+        assert!(s.contains("a#0{id=1 up rtt="), "{s}");
+        assert!(s.contains("a#1{id=2 up rtt="), "{s}");
+        assert!(s.contains(&format!("id={picked}")), "{s}");
+        assert!(s.contains("score="), "{s}");
+        // Winner marked with * inside the braces.
+        let star_at = s.find('*').expect("star");
+        let id2 = s.find("id=2").expect("id=2");
+        assert!(star_at > id2, "lower-load id=2 should be starred, got {s}");
+        let score = |name: &str| -> u64 {
+            let start = s.find(name).unwrap();
+            let frag = &s[start..];
+            let k = frag.find("score=").unwrap();
+            let rest = &frag[k + 6..];
+            let end = rest
+                .find(|c: char| !c.is_ascii_digit())
+                .unwrap_or(rest.len());
+            rest[..end].parse().unwrap()
+        };
+        assert!(
+            score("a#0") > score("a#1"),
+            "higher sticky must score worse: {s}"
+        );
     }
 
     #[test]

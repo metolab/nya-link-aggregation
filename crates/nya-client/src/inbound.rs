@@ -1,4 +1,5 @@
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::sync::atomic::Ordering;
 
 use anyhow::{bail, Context, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -78,9 +79,17 @@ pub async fn serve_forward_listener(
                 tokio::spawn(async move {
                     match session.open_stream(dest).await {
                         Ok(mut tun) => {
+                            session
+                                .process()
+                                .inbound_accept
+                                .fetch_add(1, Ordering::Relaxed);
                             let _ = tokio::io::copy_bidirectional(&mut tcp, &mut tun).await;
                         }
                         Err(e) => {
+                            session
+                                .process()
+                                .inbound_open_fail
+                                .fetch_add(1, Ordering::Relaxed);
                             warn!(%peer, error = %e, "open forward stream");
                         }
                     }
@@ -95,6 +104,10 @@ async fn serve_socks5(mut tcp: TcpStream, session: Session) -> Result<()> {
     let mut hdr = [0u8; 2];
     tcp.read_exact(&mut hdr).await?;
     if hdr[0] != 0x05 {
+        session
+            .process()
+            .inbound_reject
+            .fetch_add(1, Ordering::Relaxed);
         bail!("not socks5");
     }
     let n = hdr[1] as usize;
@@ -105,9 +118,17 @@ async fn serve_socks5(mut tcp: TcpStream, session: Session) -> Result<()> {
     let mut req = [0u8; 4];
     tcp.read_exact(&mut req).await?;
     if req[0] != 0x05 {
+        session
+            .process()
+            .inbound_reject
+            .fetch_add(1, Ordering::Relaxed);
         bail!("bad socks ver");
     }
     if req[1] != 0x01 {
+        session
+            .process()
+            .inbound_reject
+            .fetch_add(1, Ordering::Relaxed);
         reply(&mut tcp, 0x07).await?;
         bail!("only CONNECT supported");
     }
@@ -130,6 +151,10 @@ async fn serve_socks5(mut tcp: TcpStream, session: Session) -> Result<()> {
             Ipv6Addr::from(a).to_string()
         }
         _ => {
+            session
+                .process()
+                .inbound_reject
+                .fetch_add(1, Ordering::Relaxed);
             reply(&mut tcp, 0x08).await?;
             bail!("bad atyp");
         }
@@ -146,10 +171,18 @@ async fn serve_socks5(mut tcp: TcpStream, session: Session) -> Result<()> {
         .await
     {
         Ok(mut tun) => {
+            session
+                .process()
+                .inbound_accept
+                .fetch_add(1, Ordering::Relaxed);
             reply(&mut tcp, 0x00).await?;
             let _ = tokio::io::copy_bidirectional(&mut tcp, &mut tun).await;
         }
         Err(e) => {
+            session
+                .process()
+                .inbound_open_fail
+                .fetch_add(1, Ordering::Relaxed);
             reply(&mut tcp, 0x04).await?;
             warn!(%host, port, error = %e, "socks connect failed");
         }

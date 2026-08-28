@@ -14,8 +14,8 @@ use tokio_rustls::TlsAcceptor;
 use tracing::{error, info, warn};
 
 use nya_core::{
-    export_from_server, load_server_config, server_accept_handshake, spki_sha256, HandshakeResult,
-    SessionTable,
+    export_from_server, load_server_config, server_accept_handshake, spawn_obs_table, spki_sha256,
+    HandshakeResult, SessionTable,
 };
 
 pub use config::ServerConfig;
@@ -63,6 +63,7 @@ pub async fn run_on_until(
     let tls = load_server_config(&cfg.cert, &cfg.key).map_err(|e| anyhow::anyhow!("{e}"))?;
     let acceptor = TlsAcceptor::from(Arc::new(tls));
     let table = Arc::new(SessionTable::new(cfg.session_config()));
+    spawn_obs_table(table.clone(), cfg.obs.clone(), stop.clone());
     let psk = Arc::new(cfg.psk.clone().into_bytes());
     info!("listening on {}", listener.local_addr()?);
 
@@ -113,6 +114,10 @@ async fn serve_one(
             path_name,
             session_id,
         }) => {
+            session
+                .process()
+                .handshake_create_ok
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             info!(%peer, session = %hex_encode(&session_id), "session created");
             if table.is_closed() {
                 session.shutdown();
@@ -122,6 +127,10 @@ async fn serve_one(
             session.add_path(path_name, tls).await;
         }
         Ok(HandshakeResult::Joined { session, path_name }) => {
+            session
+                .process()
+                .handshake_join_ok
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             info!(%peer, path = %path_name, "path joined");
             if table.is_closed() {
                 return Ok(());
@@ -129,6 +138,7 @@ async fn serve_one(
             session.add_path(path_name, tls).await;
         }
         Err(e) => {
+            table.process().inc_handshake_fail(&e);
             error!(%peer, error = %e, "handshake failed");
         }
     }

@@ -18,9 +18,11 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("nya_client=info".parse()?)
-                .add_directive("nya_core=info".parse()?),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                "nya_client=info,nya_core=info"
+                    .parse()
+                    .expect("static filter")
+            }),
         )
         .init();
     install_crypto();

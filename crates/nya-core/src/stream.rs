@@ -13,6 +13,8 @@ use tokio::sync::Notify;
 
 use nya_proto::ResetReason;
 
+use crate::metrics::mono_ms;
+
 pub enum Inbound {
     Data(Bytes),
     Close,
@@ -44,6 +46,19 @@ pub struct StreamState {
     pub buffered_in: AtomicU64,
     pub initial_window: u32,
     last_stick_change: Mutex<Instant>,
+    /// 0 = never. Written when `send_acked` advances.
+    pub last_ack_ms: AtomicU64,
+    /// 0 = never. Written on successful inbound `try_send`.
+    pub last_recv_ms: AtomicU64,
+    /// 0 = no hole. First-seen hole clock when `last_recv_ms == 0`.
+    pub recv_hole_since_ms: AtomicU64,
+    pub stalled: AtomicBool,
+    /// 0 = not in stall. Frozen origin on enter; read on leave.
+    pub stall_from_ms: AtomicU64,
+    /// Lifetime only. Never used as a stall origin.
+    pub opened_ms: AtomicU64,
+    /// CAS winner owns closed-vs-reset accounting.
+    pub counted_close: AtomicBool,
 }
 
 impl StreamState {
@@ -66,6 +81,13 @@ impl StreamState {
             buffered_in: AtomicU64::new(0),
             initial_window,
             last_stick_change: Mutex::new(Instant::now()),
+            last_ack_ms: AtomicU64::new(0),
+            last_recv_ms: AtomicU64::new(0),
+            recv_hole_since_ms: AtomicU64::new(0),
+            stalled: AtomicBool::new(false),
+            stall_from_ms: AtomicU64::new(0),
+            opened_ms: AtomicU64::new(mono_ms().max(1)),
+            counted_close: AtomicBool::new(false),
         })
     }
 

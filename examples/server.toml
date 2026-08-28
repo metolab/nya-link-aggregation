@@ -8,3 +8,7 @@ key = "certs/server.key"
 # Unknown keys under [session] are a parse error (no aliases).
 [session]
 all_down_timeout_ms = 8000
+
+# [obs]
+# snapshot_interval_ms = 10000
+# metrics_listen = "127.0.0.1:9100"

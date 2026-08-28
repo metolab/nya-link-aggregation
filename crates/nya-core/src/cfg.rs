@@ -4,6 +4,36 @@ use serde::Deserialize;
 
 use crate::tuning::Tuning;
 
+/// Operator-facing observability. Log verbosity stays on `RUST_LOG`.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ObsOpts {
+    /// `None` → 10s. `Some(0)` → disable the periodic snapshot.
+    pub snapshot_interval_ms: Option<u64>,
+    /// Empty / `None` → do not listen. Must be a numeric loopback `SocketAddr`.
+    pub metrics_listen: Option<String>,
+}
+
+impl ObsOpts {
+    /// `None` → 10s. `Some(0)` → disabled.
+    pub fn snapshot_interval(&self) -> Option<Duration> {
+        match self.snapshot_interval_ms {
+            None => Some(Duration::from_millis(10_000)),
+            Some(0) => None,
+            Some(ms) => Some(Duration::from_millis(ms)),
+        }
+    }
+
+    /// `None` / `""` → None. Other values are passed to bind (numeric
+    /// `SocketAddr` + loopback check happens at spawn).
+    pub fn metrics_listen(&self) -> Option<&str> {
+        match self.metrics_listen.as_deref() {
+            None | Some("") => None,
+            Some(s) => Some(s),
+        }
+    }
+}
+
 /// Operator-facing probe budget, path cap, and give-up timer.
 ///
 /// Algorithm / health / failback formula live in [`Tuning`]
@@ -100,6 +130,29 @@ mod tests {
         assert_eq!(c.all_down_timeout, Duration::from_millis(4000));
         assert_eq!(c.max_paths, 1);
         assert_eq!(c.tuning, Tuning::STANDARD);
+    }
+
+    #[test]
+    fn obs_opts_unknown_key_is_error() {
+        let err = toml::from_str::<ObsOpts>("json = true").expect_err("unknown");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unknown field") || msg.contains("did you mean"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn obs_opts_interval_none_is_10s_zero_disables() {
+        let d = ObsOpts::default();
+        assert_eq!(d.snapshot_interval(), Some(Duration::from_millis(10_000)));
+        assert!(d.metrics_listen().is_none());
+        let off = ObsOpts {
+            snapshot_interval_ms: Some(0),
+            metrics_listen: Some(String::new()),
+        };
+        assert!(off.snapshot_interval().is_none());
+        assert!(off.metrics_listen().is_none());
     }
 
     #[test]

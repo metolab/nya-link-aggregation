@@ -58,11 +58,11 @@ pub fn init_tracing() {
         let _ = tracing_subscriber::fmt()
             .with_writer(std::io::stderr)
             .with_env_filter(
-                tracing_subscriber::EnvFilter::from_default_env()
-                    .add_directive("nya_e2e=info".parse().unwrap())
-                    .add_directive("nya_client=warn".parse().unwrap())
-                    .add_directive("nya_server=warn".parse().unwrap())
-                    .add_directive("nya_core=warn".parse().unwrap()),
+                tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                    "nya_e2e=info,nya_client=warn,nya_server=warn,nya_core=warn"
+                        .parse()
+                        .expect("static filter")
+                }),
             )
             .try_init();
     });

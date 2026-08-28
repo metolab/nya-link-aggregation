@@ -6,11 +6,11 @@ use std::sync::Arc;
 use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
-use tracing::warn;
+use tracing::Level;
+use tracing::{debug, warn};
 
 use nya_proto::{
-    Frame, ResetReason, StreamAck, StreamClose, StreamData, StreamOpen, StreamReset, Target,
-    MAX_STREAM_PAYLOAD,
+    Frame, ResetReason, StreamAck, StreamClose, StreamData, StreamOpen, Target, MAX_STREAM_PAYLOAD,
 };
 
 use crate::scheduler::backup_path;
@@ -24,12 +24,32 @@ impl Session {
             return Err(SessionError::ServerCannotOpen);
         }
         self.wait_ready(self.inner.cfg.all_down_timeout).await?;
-        let id = self.inner.next_stream_id.fetch_add(1, Ordering::Relaxed);
-        let (tun, _st) = self.alloc_local_stream(id);
         let path_id = self
             .pick_pref(crate::scheduler::PickPref::Interactive)
             .ok_or(SessionError::NoPath)?;
+        let id = self.inner.next_stream_id.fetch_add(1, Ordering::Relaxed);
+        let (tun, _st) = self.alloc_local_stream(id);
         self.set_sticky(id, path_id);
+        self.inner
+            .metrics
+            .streams_opened
+            .fetch_add(1, Ordering::Relaxed);
+        self.note_unknown_pick(path_id);
+        if tracing::enabled!(Level::DEBUG) {
+            let cands = crate::scheduler::format_candidates(
+                &self.path_list(),
+                &self.inner.cfg,
+                crate::scheduler::PickPref::Interactive,
+                Some(path_id),
+            );
+            debug!(
+                stream_id = id,
+                path_id,
+                pref = "pick",
+                candidates = %cands,
+                "pick"
+            );
+        }
         self.send_on_path(
             path_id,
             Frame::StreamOpen(StreamOpen {
@@ -61,6 +81,10 @@ impl Session {
         }
         let (tun, _st) = self.alloc_local_stream(id);
         self.set_sticky(id, path_id);
+        self.inner
+            .metrics
+            .streams_opened
+            .fetch_add(1, Ordering::Relaxed);
         let incoming = self.inner.incoming.lock().unwrap().clone();
         if let Some(tx) = incoming {
             let msg = IncomingStream {
@@ -133,7 +157,15 @@ impl Session {
         }
         let mut offset_cursor = 0;
         while offset_cursor < data.len() {
+            let mut window_waited = false;
             while !st.window_ok(1) {
+                if !window_waited {
+                    self.inner
+                        .metrics
+                        .window_blocks
+                        .fetch_add(1, Ordering::Relaxed);
+                    window_waited = true;
+                }
                 if self.is_dead() || st.reset.load(Ordering::Relaxed) {
                     return Err(SessionError::Reset);
                 }
@@ -172,9 +204,20 @@ impl Session {
             let becoming_bulk =
                 n > self.inner.cfg.tuning.interactive_max && !st.bulk.swap(true, Ordering::Relaxed);
             if becoming_bulk {
-                if let Some(id) = self.hol_place_bulk(path_id) {
-                    path_id = id;
-                    self.set_sticky(st.id, id);
+                if let Some(dest) = self.hol_place_bulk(path_id) {
+                    debug!(
+                        stream_id = st.id,
+                        from = path_id,
+                        to = dest,
+                        reason = "hol_initial",
+                        "hol"
+                    );
+                    path_id = dest;
+                    self.set_sticky(st.id, dest);
+                    self.inner
+                        .metrics
+                        .hol_rebalances
+                        .fetch_add(1, Ordering::Relaxed);
                 }
             }
             {
@@ -191,10 +234,6 @@ impl Session {
             if let Some(p) = self.get_path(path_id) {
                 p.add_inflight(n as u64);
             }
-            self.inner
-                .metrics
-                .bytes_data_tx
-                .fetch_add(n as u64, Ordering::Relaxed);
             let frame = Frame::StreamData(StreamData {
                 stream_id: id,
                 offset,
@@ -213,7 +252,14 @@ impl Session {
                     }
                     self.xfer_inflight(path_id, alt, n as u64);
                     self.send_on_path(alt, frame);
-                    self.inner.metrics.migrates.fetch_add(1, Ordering::Relaxed);
+                    self.note_migrate("send_blocked");
+                    debug!(
+                        stream_id = id,
+                        from = path_id,
+                        to = alt,
+                        reason = "send_blocked",
+                        "migrate"
+                    );
                 }
             }
         }
@@ -234,33 +280,26 @@ impl Session {
         if let Some(path_id) = self.ensure_sticky(id) {
             self.send_on_path(path_id, Frame::StreamClose(StreamClose { stream_id: id }));
         }
+        self.maybe_count_graceful(&st);
         Ok(())
     }
 
     pub(crate) fn reset_stream(&self, id: u32, reason: ResetReason) {
-        let Some(st) = self.get_stream(id) else {
-            return;
-        };
-        if st.reset.swap(true, Ordering::SeqCst) {
+        self.finish_stream(id, Some(reason), true);
+    }
+
+    pub(super) fn maybe_count_graceful(&self, st: &StreamState) {
+        if !st.send_fin_sent.load(Ordering::Relaxed) || !st.recv_fin.load(Ordering::Relaxed) {
             return;
         }
-        self.inner
-            .metrics
-            .stream_resets
-            .fetch_add(1, Ordering::Relaxed);
-        let _ = st.inbound_tx.try_send(Inbound::Reset(reason));
-        st.send_wait.notify_waiters();
-        if let Some(path_id) = self.ensure_sticky(id) {
-            self.send_on_path(
-                path_id,
-                Frame::StreamReset(StreamReset {
-                    stream_id: id,
-                    reason,
-                }),
-            );
+        if st
+            .counted_close
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed)
+            .is_ok()
+        {
+            self.observe_stream_end(st, None);
+            self.unstick(st);
         }
-        self.unstick(&st);
-        self.inner.streams.lock().unwrap().remove(&id);
     }
 
     pub fn note_app_read(&self, id: u32, n: usize) {
@@ -312,10 +351,6 @@ impl Session {
             let len = chunk.len() as u64;
             st.recv_next.store(next + len, Ordering::Relaxed);
             st.buffered_in.fetch_add(len, Ordering::Relaxed);
-            self.inner
-                .metrics
-                .bytes_data_rx
-                .fetch_add(len, Ordering::Relaxed);
             drop(buf);
             if st
                 .inbound_tx
@@ -327,6 +362,8 @@ impl Session {
                 st.recv_buf.lock().unwrap().insert(next, chunk);
                 break;
             }
+            st.last_recv_ms
+                .store(crate::metrics::mono_ms().max(1), Ordering::Relaxed);
         }
         self.send_ack(st, ack_path);
     }
@@ -354,6 +391,8 @@ impl Session {
         let prev = st.send_acked.load(Ordering::Relaxed);
         if ack.acked_offset > prev {
             st.send_acked.store(ack.acked_offset, Ordering::Relaxed);
+            st.last_ack_ms
+                .store(crate::metrics::mono_ms().max(1), Ordering::Relaxed);
             let mut unacked = st.unacked.lock().unwrap();
             let drop_keys: Vec<u64> = unacked
                 .iter()
@@ -391,22 +430,10 @@ impl Session {
         if !st.recv_fin.swap(true, Ordering::SeqCst) {
             let _ = st.inbound_tx.try_send(Inbound::Close);
         }
+        self.maybe_count_graceful(&st);
     }
 
     pub(super) fn on_peer_reset(&self, id: u32, reason: ResetReason) {
-        let Some(st) = self.get_stream(id) else {
-            return;
-        };
-        if st.reset.swap(true, Ordering::SeqCst) {
-            return;
-        }
-        self.inner
-            .metrics
-            .stream_resets
-            .fetch_add(1, Ordering::Relaxed);
-        let _ = st.inbound_tx.try_send(Inbound::Reset(reason));
-        st.send_wait.notify_waiters();
-        self.unstick(&st);
-        self.inner.streams.lock().unwrap().remove(&id);
+        self.finish_stream(id, Some(reason), false);
     }
 }
