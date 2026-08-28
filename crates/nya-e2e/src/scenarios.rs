@@ -1,0 +1,1016 @@
+use std::time::{Duration, Instant};
+
+use anyhow::Result;
+use tokio::io::AsyncWriteExt;
+use tracing::info;
+
+use crate::harness::{start, Harness, HarnessSpec};
+use crate::impair::ImpairConfig;
+use crate::report::{ScenarioReport, Sla};
+use crate::workload::{bulk_echo, ping_for, WorkloadStats};
+
+const PING: Duration = Duration::from_millis(40);
+const PING_TO: Duration = Duration::from_millis(1500);
+
+fn three_paths(rtts: [u64; 3]) -> HarnessSpec {
+    HarnessSpec {
+        link_cfgs: vec![
+            (
+                "a".into(),
+                ImpairConfig {
+                    rtt: Duration::from_millis(rtts[0]),
+                    ..Default::default()
+                },
+            ),
+            (
+                "b".into(),
+                ImpairConfig {
+                    rtt: Duration::from_millis(rtts[1]),
+                    ..Default::default()
+                },
+            ),
+            (
+                "c".into(),
+                ImpairConfig {
+                    rtt: Duration::from_millis(rtts[2]),
+                    ..Default::default()
+                },
+            ),
+        ],
+        psk: "e2e-psk".into(),
+        ..Default::default()
+    }
+}
+
+async fn ping_stream(h: &Harness, dur: Duration) -> Result<WorkloadStats> {
+    let mut tcp = h.connect_forward().await?;
+    Ok(ping_for(&mut tcp, dur, PING, PING_TO).await)
+}
+
+fn finish(
+    name: &str,
+    h: &Harness,
+    stats: WorkloadStats,
+    sla: Sla,
+    failover_ms: Option<u64>,
+) -> ScenarioReport {
+    ScenarioReport {
+        name: name.to_string(),
+        stats,
+        snap: h.session.snapshot(),
+        sla,
+        failover_observed_ms: failover_ms,
+        notes: Vec::new(),
+    }
+}
+
+pub async fn baseline_10ms() -> Result<ScenarioReport> {
+    let h = start(three_paths([10, 10, 10])).await?;
+    let stats = ping_stream(&h, Duration::from_secs(2)).await?;
+    Ok(finish("baseline_10ms", &h, stats, Sla::healthy(80), None))
+}
+
+pub async fn delay_matrix(ms: u64) -> Result<ScenarioReport> {
+    let h = start(three_paths([ms, ms, ms])).await?;
+    let stats = ping_stream(&h, Duration::from_secs(2)).await?;
+    // budget: path RTT + overlay (scheduler/ping) + local. 4x RTT + 80ms floor.
+    let budget = (ms * 4 + 80).max(ms + 80);
+    Ok(finish(
+        &format!("delay_{ms}ms"),
+        &h,
+        stats,
+        Sla::healthy(budget),
+        None,
+    ))
+}
+
+pub async fn hetero_delay() -> Result<ScenarioReport> {
+    let h = start(three_paths([10, 60, 150])).await?;
+    let stats = ping_stream(&h, Duration::from_secs(3)).await?;
+    // sticky to fastest (~10ms); p99 should stay near that, not 150.
+    Ok(finish(
+        "hetero_10_60_150",
+        &h,
+        stats,
+        Sla::healthy(100),
+        None,
+    ))
+}
+
+pub async fn jitter_on_fast() -> Result<ScenarioReport> {
+    let mut spec = three_paths([10, 60, 150]);
+    spec.link_cfgs[0].1.jitter = Duration::from_millis(15);
+    let h = start(spec).await?;
+    let stats = ping_stream(&h, Duration::from_secs(3)).await?;
+    Ok(finish(
+        "jitter_15ms_on_a",
+        &h,
+        stats,
+        Sla::healthy(120),
+        None,
+    ))
+}
+
+pub async fn loss_on_one(pct: f64) -> Result<ScenarioReport> {
+    let mut spec = three_paths([10, 60, 150]);
+    spec.link_cfgs[0].1.loss = pct;
+    let h = start(spec).await?;
+    let stats = ping_stream(&h, Duration::from_secs(4)).await?;
+    let name = if (pct * 1000.0).round() as u32 == 1 {
+        "loss_a_0p1pct".into()
+    } else {
+        format!("loss_a_{}pct", (pct * 100.0).round() as u32)
+    };
+    // 1–3% stall-loss may add a single ~400ms sample before migrate.
+    let budget = if pct >= 0.01 { 500 } else { 200 };
+    Ok(finish(&name, &h, stats, Sla::healthy(budget), None))
+}
+
+pub async fn timed_spike() -> Result<ScenarioReport> {
+    let h = start(three_paths([10, 60, 150])).await?;
+    let mut tcp = h.connect_forward().await?;
+    let warm = ping_for(&mut tcp, Duration::from_millis(400), PING, PING_TO).await;
+    let t0 = Instant::now();
+    h.link("a")
+        .spike(Duration::from_millis(400), Duration::from_millis(800));
+    let rest = ping_for(&mut tcp, Duration::from_secs(3), PING, PING_TO).await;
+    let mut stats = warm;
+    stats.samples.extend(rest.samples);
+    stats.timeouts += rest.timeouts;
+    stats.io_errors += rest.io_errors;
+    stats.bytes_ok += rest.bytes_ok;
+    stats.disconnect |= rest.disconnect;
+    let gap = stats.gap_around(t0).as_millis() as u64;
+    Ok(finish(
+        "timed_spike_a",
+        &h,
+        stats,
+        Sla::failover(500, 1200),
+        Some(gap),
+    ))
+}
+
+pub async fn random_spikes() -> Result<ScenarioReport> {
+    let h = start(three_paths([10, 60, 150])).await?;
+    let mut tcp = h.connect_forward().await?;
+    let h2 = h.link("a").clone();
+    tokio::spawn(async move {
+        for _ in 0..4 {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            h2.spike(Duration::from_millis(250), Duration::from_millis(200));
+        }
+    });
+    let stats = ping_for(&mut tcp, Duration::from_secs(4), PING, PING_TO).await;
+    Ok(finish(
+        "random_spikes_a",
+        &h,
+        stats,
+        Sla::failover(500, 1500),
+        None,
+    ))
+}
+
+pub async fn blackhole_one(dur: Duration) -> Result<ScenarioReport> {
+    let h = start(three_paths([10, 60, 150])).await?;
+    let mut tcp = h.connect_forward().await?;
+    let _warm = ping_for(&mut tcp, Duration::from_millis(500), PING, PING_TO).await;
+    let t0 = Instant::now();
+    h.link("a").set_blackhole(true);
+    info!(?dur, "blackhole a start");
+    let during = ping_for(&mut tcp, dur, PING, PING_TO).await;
+    h.link("a").set_blackhole(false);
+    let after = ping_for(&mut tcp, Duration::from_secs(2), PING, PING_TO).await;
+    let mut stats = during;
+    stats.samples.extend(after.samples.clone());
+    stats.timeouts += after.timeouts;
+    stats.io_errors += after.io_errors;
+    stats.bytes_ok += after.bytes_ok;
+    stats.disconnect |= after.disconnect;
+    let gap = stats.gap_around(t0).as_millis() as u64;
+    let name = format!("blackhole_a_{}s", dur.as_secs());
+    // other two paths remain; must survive, failover < 1s
+    Ok(finish(
+        &name,
+        &h,
+        stats,
+        Sla::failover(400, 1000),
+        Some(gap),
+    ))
+}
+
+pub async fn blackhole_all(dur: Duration) -> Result<ScenarioReport> {
+    let h = start(three_paths([10, 10, 10])).await?;
+    let mut tcp = h.connect_forward().await?;
+    let _warm = ping_for(&mut tcp, Duration::from_millis(400), PING, PING_TO).await;
+    for l in &h.links {
+        l.set_blackhole(true);
+    }
+    let during = ping_for(&mut tcp, dur, PING, Duration::from_millis(400)).await;
+    for l in &h.links {
+        l.set_blackhole(false);
+    }
+    // Give reconnect a moment once the hole lifts.
+    let _ = h.session.wait_ready(Duration::from_secs(4)).await;
+    let after = ping_for(&mut tcp, Duration::from_secs(2), PING, PING_TO).await;
+    let name = format!("blackhole_all_{}s", dur.as_secs());
+    if dur < Duration::from_secs(8) {
+        // Application TCP must survive; recovery window must actually ping.
+        let sla = Sla {
+            must_survive: true,
+            p99_ms: Some(200),
+            failover_ms: None,
+            min_success: 0.8,
+        };
+        let mut r = finish(&name, &h, after, sla, None);
+        r.stats.disconnect |= during.disconnect;
+        r.notes.push(format!(
+            "during_hole timeouts={} survive={}",
+            during.timeouts, !during.disconnect
+        ));
+        Ok(r)
+    } else {
+        let sla = Sla {
+            must_survive: false,
+            p99_ms: None,
+            failover_ms: None,
+            min_success: 0.0,
+        };
+        let mut r = finish(&name, &h, after, sla, None);
+        r.stats.disconnect |= during.disconnect;
+        r.notes
+            .push("RST after all-down timeout is expected".into());
+        Ok(r)
+    }
+}
+
+fn fleet_3x10_2x60() -> HarnessSpec {
+    HarnessSpec {
+        link_cfgs: vec![
+            (
+                "f1".into(),
+                ImpairConfig {
+                    rtt: Duration::from_millis(10),
+                    ..Default::default()
+                },
+            ),
+            (
+                "f2".into(),
+                ImpairConfig {
+                    rtt: Duration::from_millis(12),
+                    ..Default::default()
+                },
+            ),
+            (
+                "f3".into(),
+                ImpairConfig {
+                    rtt: Duration::from_millis(11),
+                    ..Default::default()
+                },
+            ),
+            (
+                "b1".into(),
+                ImpairConfig {
+                    rtt: Duration::from_millis(60),
+                    ..Default::default()
+                },
+            ),
+            (
+                "b2".into(),
+                ImpairConfig {
+                    rtt: Duration::from_millis(65),
+                    ..Default::default()
+                },
+            ),
+        ],
+        psk: "e2e-psk".into(),
+        ..Default::default()
+    }
+}
+
+pub async fn fleet_baseline() -> Result<ScenarioReport> {
+    let h = start(fleet_3x10_2x60()).await?;
+    let stats = ping_stream(&h, Duration::from_secs(3)).await?;
+    Ok(finish("fleet_3x10_2x60", &h, stats, Sla::healthy(50), None))
+}
+
+pub async fn failback_after_fast_blackhole() -> Result<ScenarioReport> {
+    let h = start(fleet_3x10_2x60()).await?;
+    let mut tcp = h.connect_forward().await?;
+    let warm = ping_for(&mut tcp, Duration::from_secs(1), PING, PING_TO).await;
+    let warm_p50 = warm.percentile_us(50.0).unwrap_or(u64::MAX);
+    for name in ["f1", "f2", "f3"] {
+        h.link(name).set_blackhole(true);
+    }
+    let mid = ping_for(&mut tcp, Duration::from_secs(2), PING, PING_TO).await;
+    let mid_p50 = mid.percentile_us(50.0).unwrap_or(0);
+    let mid_ok = mid.success_rate();
+    for name in ["f1", "f2", "f3"] {
+        h.link(name).set_blackhole(false);
+    }
+    // wait for failback_stable (~800ms) plus probes
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let after = ping_for(&mut tcp, Duration::from_secs(2), PING, PING_TO).await;
+    let after_p50 = after.percentile_us(50.0).unwrap_or(u64::MAX);
+    let mut stats = warm;
+    stats.samples.extend(mid.samples);
+    stats.samples.extend(after.samples.clone());
+    stats.disconnect |= mid.disconnect || after.disconnect;
+    stats.timeouts += mid.timeouts + after.timeouts;
+    stats.io_errors += mid.io_errors + after.io_errors;
+    stats.bytes_ok += mid.bytes_ok + after.bytes_ok;
+    let sla = Sla {
+        must_survive: true,
+        p99_ms: Some(120),
+        failover_ms: None,
+        min_success: 0.85,
+    };
+    let mut r = finish("failback_fast_paths", &h, stats, sla, None);
+    r.notes.push(format!(
+        "p50_warm={warm_p50}us p50_backup={mid_p50}us p50_after={after_p50}us failbacks={}",
+        r.snap.failbacks
+    ));
+    // After restore, p50 should return near the 10ms class, not stay on 60ms.
+    if after_p50 > 35_000 {
+        r.notes
+            .push("FAILBACK_INCOMPLETE: still on high-rtt path".into());
+        r.sla.min_success = 2.0; // force fail
+    }
+    if mid_p50 < 40_000 && mid_ok > 0.5 {
+        // backup was used; good
+    }
+    Ok(r)
+}
+
+pub async fn chaos_independent() -> Result<ScenarioReport> {
+    let h = start(fleet_3x10_2x60()).await?;
+    let mut tcp = h.connect_forward().await?;
+    let links: Vec<_> = h.links.clone();
+    tokio::spawn(async move {
+        // overlapping, independent faults
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        links[0].set_loss(0.03);
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        links[1].spike(Duration::from_millis(200), Duration::from_millis(500));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        links[2].set_blackhole(true);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        links[2].set_blackhole(false);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        links[0].set_loss(0.0);
+        links[3].disconnect_all();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        links[1].set_rtt(Duration::from_millis(80));
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        links[1].set_rtt(Duration::from_millis(12));
+    });
+    let stats = ping_for(&mut tcp, Duration::from_secs(5), PING, PING_TO).await;
+    Ok(finish(
+        "chaos_independent",
+        &h,
+        stats,
+        Sla {
+            must_survive: true,
+            p99_ms: Some(800),
+            failover_ms: None,
+            min_success: 0.75,
+        },
+        None,
+    ))
+}
+
+pub async fn ip_loss_retransmit() -> Result<ScenarioReport> {
+    let spec = fleet_3x10_2x60();
+    let h = start(spec).await?;
+    h.link("f1").set_loss(0.03);
+    h.link("f2").set_loss(0.01);
+    let stats = ping_stream(&h, Duration::from_secs(4)).await?;
+    let retrans: u64 = h.links.iter().map(|l| l.stats().retrans).sum();
+    let drops: u64 = h.links.iter().map(|l| l.stats().drops).sum();
+    let mut r = finish("ip_loss_retransmit", &h, stats, Sla::healthy(250), None);
+    r.notes
+        .push(format!("wan_drops={drops} wan_retrans={retrans}"));
+    if drops > 0 && retrans == 0 {
+        r.notes.push("no WAN retransmit observed".into());
+        r.sla.min_success = 2.0;
+    }
+    Ok(r)
+}
+
+pub async fn flash_and_return() -> Result<ScenarioReport> {
+    let h = start(fleet_3x10_2x60()).await?;
+    let mut tcp = h.connect_forward().await?;
+    let _ = ping_for(&mut tcp, Duration::from_millis(400), PING, PING_TO).await;
+    h.link("f1").disconnect_all();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    // f1 will reconnect via client supervisor; keep pinging
+    let stats = ping_for(&mut tcp, Duration::from_secs(3), PING, PING_TO).await;
+    Ok(finish(
+        "flash_disconnect_f1",
+        &h,
+        stats,
+        Sla::failover(80, 1000),
+        None,
+    ))
+}
+
+fn merge_stats(into: &mut WorkloadStats, add: &WorkloadStats) {
+    into.samples.extend(add.samples.clone());
+    into.timeouts += add.timeouts;
+    into.io_errors += add.io_errors;
+    into.bytes_ok += add.bytes_ok;
+    into.disconnect |= add.disconnect;
+}
+
+/// All 10ms-class paths take a delay spike; traffic should sit on 60ms
+/// backups, then fail back to the 10ms class once the spike lifts.
+pub async fn failback_after_spike() -> Result<ScenarioReport> {
+    let h = start(fleet_3x10_2x60()).await?;
+    let mut tcp = h.connect_forward().await?;
+    let warm = ping_for(&mut tcp, Duration::from_secs(1), PING, PING_TO).await;
+    for name in ["f1", "f2", "f3"] {
+        h.link(name)
+            .spike(Duration::from_millis(400), Duration::from_millis(800));
+    }
+    let mid = ping_for(&mut tcp, Duration::from_millis(1200), PING, PING_TO).await;
+    let mid_p50 = mid.percentile_us(50.0).unwrap_or(0);
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let after = ping_for(&mut tcp, Duration::from_secs(2), PING, PING_TO).await;
+    let after_p50 = after.percentile_us(50.0).unwrap_or(u64::MAX);
+    let mut stats = warm;
+    merge_stats(&mut stats, &mid);
+    merge_stats(&mut stats, &after);
+    let sla = Sla {
+        must_survive: true,
+        p99_ms: Some(500),
+        failover_ms: None,
+        min_success: 0.85,
+    };
+    let mut r = finish("failback_after_spike", &h, stats, sla, None);
+    r.notes.push(format!(
+        "p50_backup={mid_p50}us p50_after={after_p50}us failbacks={}",
+        r.snap.failbacks
+    ));
+    if after_p50 > 35_000 {
+        r.notes
+            .push("FAILBACK_INCOMPLETE: still on high-rtt path".into());
+        r.sla.min_success = 2.0;
+    }
+    Ok(r)
+}
+
+/// Mutate all fast-path RTTs up into the backup class, then restore.
+pub async fn delay_shift_and_restore() -> Result<ScenarioReport> {
+    let h = start(fleet_3x10_2x60()).await?;
+    let mut tcp = h.connect_forward().await?;
+    let warm = ping_for(&mut tcp, Duration::from_secs(1), PING, PING_TO).await;
+    for name in ["f1", "f2", "f3"] {
+        h.link(name).set_rtt(Duration::from_millis(80));
+    }
+    let mid = ping_for(&mut tcp, Duration::from_secs(2), PING, PING_TO).await;
+    let mid_p50 = mid.percentile_us(50.0).unwrap_or(0);
+    h.link("f1").set_rtt(Duration::from_millis(10));
+    h.link("f2").set_rtt(Duration::from_millis(12));
+    h.link("f3").set_rtt(Duration::from_millis(11));
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let after = ping_for(&mut tcp, Duration::from_secs(2), PING, PING_TO).await;
+    let after_p50 = after.percentile_us(50.0).unwrap_or(u64::MAX);
+    let mut stats = warm;
+    merge_stats(&mut stats, &mid);
+    merge_stats(&mut stats, &after);
+    let sla = Sla {
+        must_survive: true,
+        p99_ms: Some(200),
+        failover_ms: None,
+        min_success: 0.90,
+    };
+    let mut r = finish("delay_shift_restore", &h, stats, sla, None);
+    r.notes.push(format!(
+        "p50_shifted={mid_p50}us p50_after={after_p50}us failbacks={}",
+        r.snap.failbacks
+    ));
+    if after_p50 > 35_000 {
+        r.notes
+            .push("FAILBACK_INCOMPLETE: still on high-rtt path".into());
+        r.sla.min_success = 2.0;
+    }
+    Ok(r)
+}
+
+/// One fast path is RST'd for a couple of seconds; the other 10ms links
+/// must keep the stream in the 10ms class, and the dead link returns.
+pub async fn offline_then_return() -> Result<ScenarioReport> {
+    let h = start(fleet_3x10_2x60()).await?;
+    let mut tcp = h.connect_forward().await?;
+    let warm = ping_for(&mut tcp, Duration::from_millis(400), PING, PING_TO).await;
+    h.link("f1").disconnect_all();
+    let mid = ping_for(&mut tcp, Duration::from_secs(2), PING, PING_TO).await;
+    let after = ping_for(&mut tcp, Duration::from_secs(2), PING, PING_TO).await;
+    let after_p50 = after.percentile_us(50.0).unwrap_or(u64::MAX);
+    let mut stats = warm;
+    merge_stats(&mut stats, &mid);
+    merge_stats(&mut stats, &after);
+    let sla = Sla {
+        must_survive: true,
+        p99_ms: Some(80),
+        failover_ms: None,
+        min_success: 0.90,
+    };
+    let mut r = finish("offline_then_return", &h, stats, sla, None);
+    r.notes.push(format!(
+        "p50_after={after_p50}us path_down={} migrates={}",
+        r.snap.path_down, r.snap.migrates
+    ));
+    if after_p50 > 35_000 {
+        r.notes
+            .push("stayed on backup after other fast paths were up".into());
+        r.sla.min_success = 2.0;
+    }
+    Ok(r)
+}
+
+pub async fn disconnect_one() -> Result<ScenarioReport> {
+    let h = start(three_paths([10, 60, 150])).await?;
+    let mut tcp = h.connect_forward().await?;
+    let _warm = ping_for(&mut tcp, Duration::from_millis(400), PING, PING_TO).await;
+    let t0 = Instant::now();
+    h.link("a").disconnect_all();
+    let rest = ping_for(&mut tcp, Duration::from_secs(3), PING, PING_TO).await;
+    let gap = rest.gap_around(t0).as_millis() as u64;
+    Ok(finish(
+        "disconnect_a",
+        &h,
+        rest,
+        Sla::failover(200, 1000),
+        Some(gap),
+    ))
+}
+
+fn one_link(ms: u64, connections: u32) -> HarnessSpec {
+    HarnessSpec {
+        link_cfgs: vec![(
+            "a".into(),
+            ImpairConfig {
+                rtt: Duration::from_millis(ms),
+                ..Default::default()
+            },
+        )],
+        connections,
+        psk: "e2e-psk".into(),
+    }
+}
+
+/// One 10ms link with 3 TCP connections; traffic stays in the 10ms class.
+pub async fn multi_conn_baseline() -> Result<ScenarioReport> {
+    let h = start(one_link(10, 3)).await?;
+    let stats = ping_stream(&h, Duration::from_secs(2)).await?;
+    let n = h.session.alive_path_count();
+    let mut r = finish("multi_conn_baseline", &h, stats, Sla::healthy(50), None);
+    r.notes.push(format!(
+        "alive_paths={n} impair_conns={}",
+        h.link("a").live_conn_count()
+    ));
+    if n < 3 {
+        r.notes
+            .push("expected 3 overlay TCP connections on the link".into());
+        r.sla.min_success = 2.0;
+    }
+    Ok(r)
+}
+
+/// Blackhole 2 of 3 connections on a single link. The remaining conn
+/// must keep the application TCP alive at ~10ms — not crash or hang.
+pub async fn one_conn_blackhole() -> Result<ScenarioReport> {
+    let h = start(one_link(10, 3)).await?;
+    let mut tcp = h.connect_forward().await?;
+    let _warm = ping_for(&mut tcp, Duration::from_millis(400), PING, PING_TO).await;
+    let t0 = Instant::now();
+    h.link("a").set_conn_blackhole(0, true);
+    h.link("a").set_conn_blackhole(1, true);
+    let rest = ping_for(&mut tcp, Duration::from_secs(3), PING, PING_TO).await;
+    let gap = rest.gap_around(t0).as_millis() as u64;
+    let p50 = rest.percentile_us(50.0).unwrap_or(u64::MAX);
+    let mut r = finish(
+        "one_conn_blackhole",
+        &h,
+        rest,
+        Sla::failover(80, 1000),
+        Some(gap),
+    );
+    r.notes.push(format!(
+        "p50={p50}us migrates={} drops={} paths={}",
+        r.snap.migrates,
+        r.snap.frame_send_drop,
+        h.session.alive_path_count()
+    ));
+    Ok(r)
+}
+
+/// Stall client→server on 2 of 3 connections (TCP send buffer / HOL).
+/// Sibling connections must pick up the stream.
+pub async fn one_conn_stall() -> Result<ScenarioReport> {
+    let h = start(one_link(10, 3)).await?;
+    let mut tcp = h.connect_forward().await?;
+    let _warm = ping_for(&mut tcp, Duration::from_millis(400), PING, PING_TO).await;
+    let t0 = Instant::now();
+    h.link("a").set_conn_stall(0, true);
+    h.link("a").set_conn_stall(1, true);
+    let rest = ping_for(&mut tcp, Duration::from_secs(3), PING, PING_TO).await;
+    h.link("a").set_conn_stall(0, false);
+    h.link("a").set_conn_stall(1, false);
+    let gap = rest.gap_around(t0).as_millis() as u64;
+    let mut r = finish(
+        "one_conn_stall",
+        &h,
+        rest,
+        Sla::failover(120, 1500),
+        Some(gap),
+    );
+    r.notes.push(format!(
+        "migrates={} send_drops={} alive={}",
+        r.snap.migrates,
+        r.snap.frame_send_drop,
+        h.session.alive_path_count()
+    ));
+    Ok(r)
+}
+
+/// RST 2 of 3 overlay TCP connections; session and app TCP stay up.
+pub async fn one_conn_disconnect() -> Result<ScenarioReport> {
+    let h = start(one_link(10, 3)).await?;
+    let mut tcp = h.connect_forward().await?;
+    let _warm = ping_for(&mut tcp, Duration::from_millis(400), PING, PING_TO).await;
+    let t0 = Instant::now();
+    h.link("a").disconnect_conn(0);
+    h.link("a").disconnect_conn(0);
+    let rest = ping_for(&mut tcp, Duration::from_secs(3), PING, PING_TO).await;
+    let gap = rest.gap_around(t0).as_millis() as u64;
+    Ok(finish(
+        "one_conn_disconnect",
+        &h,
+        rest,
+        Sla::failover(80, 1000),
+        Some(gap),
+    ))
+}
+
+/// Repeatedly kill a connection; reconnect must not take the session down.
+pub async fn conn_churn() -> Result<ScenarioReport> {
+    let h = start(one_link(10, 3)).await?;
+    let mut tcp = h.connect_forward().await?;
+    let link = h.link("a").clone();
+    tokio::spawn(async move {
+        for _ in 0..5 {
+            tokio::time::sleep(Duration::from_millis(350)).await;
+            link.disconnect_conn(0);
+        }
+    });
+    let stats = ping_for(&mut tcp, Duration::from_secs(3), PING, PING_TO).await;
+    let mut r = finish(
+        "conn_churn",
+        &h,
+        stats,
+        Sla {
+            must_survive: true,
+            p99_ms: Some(200),
+            failover_ms: None,
+            min_success: 0.80,
+        },
+        None,
+    );
+    r.notes.push(format!(
+        "path_down={} path_added={} resets={}",
+        r.snap.path_down, r.snap.path_added, r.snap.stream_resets
+    ));
+    Ok(r)
+}
+
+/// A stream that never reads must not stall other streams or the session.
+pub async fn slow_consumer() -> Result<ScenarioReport> {
+    let h = start(three_paths([10, 10, 10])).await?;
+    let mut hog = h.connect_forward().await?;
+    tokio::spawn(async move {
+        let buf = vec![0x5au8; 32 * 1024];
+        for _ in 0..64 {
+            if hog.write_all(&buf).await.is_err() {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(4)).await;
+    });
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    let stats = ping_stream(&h, Duration::from_secs(2)).await?;
+    let mut r = finish("slow_consumer", &h, stats, Sla::healthy(120), None);
+    r.notes.push(format!(
+        "resets={} alive={}",
+        r.snap.stream_resets,
+        h.session.alive_path_count()
+    ));
+    Ok(r)
+}
+
+/// Many concurrent application TCPs: no crash, high success, session stays up.
+pub async fn many_concurrent_streams() -> Result<ScenarioReport> {
+    let h = start(three_paths([10, 10, 10])).await?;
+    let mut joins = Vec::new();
+    for _ in 0..24 {
+        let mut tcp = h.connect_forward().await?;
+        joins.push(tokio::spawn(async move {
+            ping_for(&mut tcp, Duration::from_secs(2), PING, PING_TO).await
+        }));
+    }
+    let mut stats = WorkloadStats::default();
+    let mut failed = 0u64;
+    for j in joins {
+        match j.await {
+            Ok(s) => merge_stats(&mut stats, &s),
+            Err(_) => failed += 1,
+        }
+    }
+    let mut r = finish(
+        "many_concurrent_streams",
+        &h,
+        stats,
+        Sla {
+            must_survive: true,
+            p99_ms: Some(150),
+            failover_ms: None,
+            min_success: 0.90,
+        },
+        None,
+    );
+    r.notes.push(format!(
+        "join_fail={failed} resets={} paths={}",
+        r.snap.stream_resets,
+        h.session.alive_path_count()
+    ));
+    if failed > 0 {
+        r.notes.push("a ping task panicked".into());
+        r.sla.min_success = 2.0;
+    }
+    Ok(r)
+}
+
+/// Bulk transfer on one stream must not kill a latency-sensitive neighbour.
+pub async fn bulk_plus_ping() -> Result<ScenarioReport> {
+    let h = start(three_paths([10, 10, 10])).await?;
+    let mut bulk = h.connect_forward().await?;
+    let bulk_task = tokio::spawn(async move { bulk_echo(&mut bulk, 256 * 1024).await });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let stats = ping_stream(&h, Duration::from_secs(2)).await?;
+    let bulk_ok = match bulk_task.await {
+        Ok(Ok((_, intact))) => intact,
+        _ => false,
+    };
+    let mut r = finish("bulk_plus_ping", &h, stats, Sla::healthy(150), None);
+    r.notes.push(format!("bulk_ok={bulk_ok}"));
+    if !bulk_ok {
+        r.notes.push("bulk transfer corrupted or failed".into());
+        r.sla.min_success = 2.0;
+    }
+    Ok(r)
+}
+
+fn link_key(name: &str) -> &str {
+    name.rsplit_once('#').map(|(l, _)| l).unwrap_or(name)
+}
+
+/// 200ms extra on a 12ms path must migrate, not tear TCP.
+pub async fn delay_spike_keeps_tcp() -> Result<ScenarioReport> {
+    let h = start(three_paths([12, 12, 12])).await?;
+    let mut tcp = h.connect_forward().await?;
+    let warm = ping_for(&mut tcp, Duration::from_millis(500), PING, PING_TO).await;
+    let snap0 = h.session.snapshot();
+    h.link("a").set_extra(Duration::from_millis(200));
+    let mid = ping_for(&mut tcp, Duration::from_millis(1200), PING, PING_TO).await;
+    h.link("a").set_extra(Duration::ZERO);
+    let after = ping_for(&mut tcp, Duration::from_millis(500), PING, PING_TO).await;
+    let mut stats = warm;
+    merge_stats(&mut stats, &mid);
+    merge_stats(&mut stats, &after);
+    let snap = h.session.snapshot();
+    let after_p50 = after.percentile_us(50.0).unwrap_or(u64::MAX);
+    let mut r = finish(
+        "delay_spike_keeps_tcp",
+        &h,
+        stats,
+        Sla {
+            must_survive: true,
+            p99_ms: Some(800),
+            failover_ms: None,
+            min_success: 0.90,
+        },
+        None,
+    );
+    r.notes.push(format!(
+        "path_down {}→{} path_added {}→{} p50_after={after_p50}us",
+        snap0.path_down, snap.path_down, snap0.path_added, snap.path_added
+    ));
+    if snap.path_down > snap0.path_down || snap.path_added > snap0.path_added {
+        r.notes
+            .push("delay spike tore TCP (path_down/path_added grew)".into());
+        r.sla.min_success = 2.0;
+    }
+    if after_p50 / 1000 > 40 {
+        r.notes.push("p50 after spike left 12ms class".into());
+        r.sla.min_success = 2.0;
+    }
+    Ok(r)
+}
+
+/// Three same-class links must hold stickies on ≥2 named links while streams are open.
+pub async fn same_class_mix_warm() -> Result<ScenarioReport> {
+    let h = start(three_paths([12, 14, 16])).await?;
+    let mut joins = Vec::new();
+    for _ in 0..3 {
+        let mut tcp = h.connect_forward().await?;
+        joins.push(tokio::spawn(async move {
+            ping_for(&mut tcp, Duration::from_secs(3), PING, PING_TO).await
+        }));
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let snap = h.session.snapshot();
+    let mut stats = WorkloadStats::default();
+    for j in joins {
+        if let Ok(s) = j.await {
+            merge_stats(&mut stats, &s);
+        }
+    }
+    let mut by_link: std::collections::BTreeMap<String, u64> = Default::default();
+    for p in &snap.paths {
+        *by_link.entry(link_key(&p.name).to_string()).or_insert(0) += p.sticky;
+    }
+    let used: Vec<_> = by_link
+        .iter()
+        .filter(|(_, n)| **n > 0)
+        .map(|(k, n)| format!("{k}={n}"))
+        .collect();
+    let mut r = finish("same_class_mix_warm", &h, stats, Sla::healthy(80), None);
+    r.notes.push(format!("sticky_by_link {}", used.join(" ")));
+    if snap.path_down != 0 {
+        r.notes.push("unexpected path_down on quiet mix".into());
+        r.sla.min_success = 2.0;
+    }
+    let n_links = by_link.values().filter(|n| **n > 0).count();
+    let only_a = by_link.get("a").copied().unwrap_or(0) > 0
+        && by_link.iter().all(|(k, n)| k == "a" || *n == 0);
+    if n_links < 2 || only_a {
+        r.notes
+            .push("stickies did not mix across named links".into());
+        r.sla.min_success = 2.0;
+    }
+    Ok(r)
+}
+
+pub struct Scenario {
+    pub name: &'static str,
+    pub long: bool,
+    pub run:
+        fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ScenarioReport>> + Send>>,
+}
+
+macro_rules! sc {
+    ($name:expr, $long:expr, $f:expr) => {
+        Scenario {
+            name: $name,
+            long: $long,
+            run: || Box::pin($f),
+        }
+    };
+}
+
+pub fn catalog() -> Vec<Scenario> {
+    vec![
+        sc!("baseline_10ms", false, baseline_10ms()),
+        sc!("delay_10ms", false, delay_matrix(10)),
+        sc!("delay_60ms", false, delay_matrix(60)),
+        sc!("delay_150ms", false, delay_matrix(150)),
+        sc!("delay_200ms", false, delay_matrix(200)),
+        sc!("hetero_10_60_150", false, hetero_delay()),
+        sc!("jitter_15ms_on_a", false, jitter_on_fast()),
+        sc!("loss_a_0pct", false, loss_on_one(0.0)),
+        sc!("loss_a_0p1pct", false, loss_on_one(0.001)),
+        sc!("loss_a_1pct", false, loss_on_one(0.01)),
+        sc!("loss_a_3pct", false, loss_on_one(0.03)),
+        sc!("timed_spike_a", false, timed_spike()),
+        sc!("random_spikes_a", false, random_spikes()),
+        sc!(
+            "blackhole_a_5s",
+            false,
+            blackhole_one(Duration::from_secs(5))
+        ),
+        sc!(
+            "blackhole_a_15s",
+            false,
+            blackhole_one(Duration::from_secs(15))
+        ),
+        sc!(
+            "blackhole_a_30s",
+            true,
+            blackhole_one(Duration::from_secs(30))
+        ),
+        sc!(
+            "blackhole_a_60s",
+            true,
+            blackhole_one(Duration::from_secs(60))
+        ),
+        sc!(
+            "blackhole_a_300s",
+            true,
+            blackhole_one(Duration::from_secs(300))
+        ),
+        sc!(
+            "blackhole_all_5s",
+            false,
+            blackhole_all(Duration::from_secs(5))
+        ),
+        sc!("disconnect_a", false, disconnect_one()),
+        sc!("fleet_3x10_2x60", false, fleet_baseline()),
+        sc!(
+            "failback_fast_paths",
+            false,
+            failback_after_fast_blackhole()
+        ),
+        sc!("failback_after_spike", false, failback_after_spike()),
+        sc!("delay_shift_restore", false, delay_shift_and_restore()),
+        sc!("chaos_independent", false, chaos_independent()),
+        sc!("ip_loss_retransmit", false, ip_loss_retransmit()),
+        sc!("flash_disconnect_f1", false, flash_and_return()),
+        sc!("offline_then_return", false, offline_then_return()),
+        sc!("multi_conn_baseline", false, multi_conn_baseline()),
+        sc!("one_conn_blackhole", false, one_conn_blackhole()),
+        sc!("one_conn_stall", false, one_conn_stall()),
+        sc!("one_conn_disconnect", false, one_conn_disconnect()),
+        sc!("conn_churn", false, conn_churn()),
+        sc!("slow_consumer", false, slow_consumer()),
+        sc!("many_concurrent_streams", false, many_concurrent_streams()),
+        sc!("bulk_plus_ping", false, bulk_plus_ping()),
+        sc!("delay_spike_keeps_tcp", false, delay_spike_keeps_tcp()),
+        sc!("same_class_mix_warm", false, same_class_mix_warm()),
+    ]
+}
+
+fn error_report(name: &str, e: anyhow::Error) -> ScenarioReport {
+    ScenarioReport {
+        name: format!("{name} (error)"),
+        stats: WorkloadStats::default(),
+        snap: nya_core::SessionSnapshot {
+            path_added: 0,
+            path_down: 0,
+            migrates: 0,
+            failbacks: 0,
+            failbacks_upgrade: 0,
+            failbacks_class_empty: 0,
+            hol_rebalances: 0,
+            stream_resets: 0,
+            bytes_data_tx: 0,
+            bytes_data_rx: 0,
+            frame_send_drop: 0,
+            paths: vec![],
+        },
+        sla: Sla::healthy(1),
+        failover_observed_ms: None,
+        notes: vec![e.to_string()],
+    }
+}
+
+/// Run matching catalog entries concurrently. `jobs` is the max number of
+/// independent harnesses in flight (each scenario is isolated).
+pub async fn run_catalog(filter: Option<&str>, long: bool, jobs: usize) -> Vec<ScenarioReport> {
+    let selected: Vec<Scenario> = catalog()
+        .into_iter()
+        .filter(|s| long || !s.long)
+        .filter(|s| filter.map(|f| s.name.contains(f)).unwrap_or(true))
+        .collect();
+    let jobs = jobs.max(1);
+    info!(n = selected.len(), jobs, "catalog start");
+    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(jobs));
+    let mut joins = tokio::task::JoinSet::new();
+    for (idx, s) in selected.into_iter().enumerate() {
+        let sem = sem.clone();
+        joins.spawn(async move {
+            let _permit = sem.acquire_owned().await.expect("semaphore");
+            info!(name = s.name, "scenario start");
+            let r = match (s.run)().await {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::error!(name = s.name, error = %e, "scenario error");
+                    error_report(s.name, e)
+                }
+            };
+            info!(name = %r.name, pass = r.pass(), "scenario done");
+            (idx, r)
+        });
+    }
+    let mut indexed = Vec::new();
+    while let Some(joined) = joins.join_next().await {
+        match joined {
+            Ok(pair) => indexed.push(pair),
+            Err(e) => indexed.push((
+                usize::MAX,
+                error_report("join", anyhow::anyhow!("task panicked: {e}")),
+            )),
+        }
+    }
+    indexed.sort_by_key(|(i, _)| *i);
+    indexed.into_iter().map(|(_, r)| r).collect()
+}

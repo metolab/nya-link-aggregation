@@ -1,0 +1,37 @@
+psk = "change-me"
+pinned_spki_sha256 = "replace-with-output-of-nya-server-gen-cert"
+
+# Topology, probe budget, give-up. Health / failback / class formula live
+# in nya_core::Tuning and are not set here.
+# Unknown keys under [session] are a parse error (no aliases).
+[session]
+ping_interval_min_ms = 10
+ping_interval_max_ms = 50
+all_down_timeout_ms = 8000
+max_paths = 32
+
+# Independent TCP+TLS connections per link (default 2). Isolates HOL
+# on one connection from the rest of the traffic on the same link.
+[[links]]
+name = "a"
+addr = "203.0.113.1:443"
+connections = 2
+
+[[links]]
+name = "b"
+addr = "203.0.113.2:443"
+connections = 2
+
+[[links]]
+name = "c"
+addr = "203.0.113.3:443"
+connections = 2
+
+[[inbounds]]
+type = "socks5"
+listen = "127.0.0.1:1080"
+
+[[inbounds]]
+type = "forward"
+listen = "127.0.0.1:2222"
+target = "127.0.0.1:22"

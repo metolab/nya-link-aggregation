@@ -1,0 +1,10 @@
+listen = "0.0.0.0:443"
+psk = "change-me"
+cert = "certs/server.crt"
+key = "certs/server.key"
+
+# Topology / give-up only. Health / failback / class formula live in
+# nya_core::Tuning and are not set here.
+# Unknown keys under [session] are a parse error (no aliases).
+[session]
+all_down_timeout_ms = 8000

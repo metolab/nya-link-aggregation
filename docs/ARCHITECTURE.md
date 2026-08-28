@@ -1,0 +1,118 @@
+# 架构
+
+nya 是一条 overlay 会话：客户端把多条 TCP+TLS 路径接到同一个 session，上面再多路复用若干条应用流。每条应用流粘在一条路径上；路径变差时把流迁走，路径恢复后再迁回来。数据不在多条链路上做条带。
+
+## Crate
+
+```text
+nya-client ──┐
+             ├── nya-core ── nya-proto
+nya-server ──┘
+     ▲
+nya-e2e（测试，同时拉 client + server）
+```
+
+- **nya-proto**：`u32be length || u8 type || body`，最大 payload 16 KiB。ALPN `nya/1`。TLS exporter 标签 `nya-link-aggregation`。
+- **nya-core**：会话、路径 IO、健康时钟、调度、握手、SPKI pin。`Tuning` 不进 TOML。
+- **nya-client**：按 `[[links]]` 各开 `connections` 条 TCP+TLS；第一条 `CreateSession`，其余 `JoinSession`。入站是 SOCKS5 CONNECT 或固定目标 forward。
+- **nya-server**：TLS 接受 → 握手 → `SessionTable`。`CreateSession` 建会话并 spawn outbound；`JoinSession` 把路径挂到已有会话。
+- **nya-e2e**：每条路径前插用户态损伤代理；catalog 是短 SLA，`--mixed` 是分 RTT 带的 soak。
+
+## 数据路径
+
+```text
+应用 inbound
+    │  SOCKS5 / TCP forward
+    ▼
+Session::open_stream          选最快 class 里一条路径，sticky
+    │
+    ▼
+STREAM_OPEN / STREAM_DATA / ACK / CLOSE / RESET
+    │
+    ▼
+PathState 双写队列            ≤ interactive_max 走 urgent，其余 bulk
+    │
+    ▼
+TLS framed IO                 对端 session::handle_frame
+    │
+    ▼
+服务端 IncomingStream         TcpStream::connect(target) 后双向 copy
+```
+
+对端接受 `STREAM_OPEN` 后分配本地 `TunnelStream`（tokio duplex + 窗口 / 乱序缓冲）。应用读写 duplex；pump 把字节变成带 offset 的 `STREAM_DATA`，对端按 offset 重排。
+
+## 握手与认证
+
+每条路径都是独立 TLS。客户端用 SPKI SHA-256 pin 校验服务端证书，不走系统 CA。
+
+握手绑定 TLS exporter：
+
+1. **CreateSession**：`HMAC-SHA256(psk, "nya-create-v1" || exporter || nonce || user_id)`。服务端核验后发 16 字节 `session_id`。
+2. **JoinSession**：`HKDF-SHA256(psk, salt=session_id, info="nya-session-v1")` 得到 session key，再 `HMAC(session_key, "nya-join-v1" || exporter || path_name)`。
+
+PSK 证明「谁能加入这条会话」；pin 证明「TLS 对端是这张证书」。二者缺一不可。
+
+路径名在客户端是 `{link.name}#{i}`，例如 `a#0`、`a#1`。创建会话的那条路径在服务端记为 `init`。
+
+## 路径与健康
+
+每条路径维护：
+
+- **fast RTT**：近期 EWMA，用于打分和瞬时判断
+- **stable RTT**：更慢抬升，给 loss / down 时钟用，避免尖刺拆 TCP
+- **class RTT**：调度用的 class 成员资格；相对 fast 过时偏高时让位，尖刺时不跟着跳 class
+
+超时由 `Tuning` 从 stable RTT 推出来，再夹紧：
+
+| 时钟 | 大致公式 | 作用 |
+| --- | --- | --- |
+| probe | `clamp(rtt, ping_min, ping_max)` | Ping 间隔 |
+| loss | `clamp(2×rtt, 20ms, 2s)` | 一次探测 / 发送算丢 |
+| down | `max(5×rtt, 320ms) + probe`，上限 5s | 静默后标 down |
+| failback 同类 | `max(8ms, 0.45×更好路径 RTT)` | 同 class 内要差这么多才迁回 |
+| failback 跨 class | 当前 ≥ 更好 × 1.5 + 8ms | 明显更好的 class 才 Upgrade |
+
+路径还有 alive / degraded / down。全部 down 超过 `all_down_timeout` 则拆会话。客户端链路监督协程按指数退避重连（200ms–2s）。
+
+## 调度
+
+新流：
+
+1. 活着的路径里去掉 backup（class RTT > 最快 × 2 + 20ms）
+2. 限制在最快 class（`should_failback(候选, 最好)` 为假的那些）
+3. 打分 `class_rtt × load × 1024 + fast_rtt × load`，`load = 1 + inflight/bias + sticky`
+
+交互流用更重的 inflight 权重，避免和 bulk 抢同一条连接。
+
+粘滞流的维护（`session::steer`，5ms tick）：
+
+- **speculative migrate**：当前路径变差，先迁到 backup（优先同链路的另一条 TCP，隔离 HOL）
+- **failback**：更好路径稳定约 2 RTT 且过了 cooldown 再迁回
+- **same-link rebalance**：同一 `link.name` 下两条连接负载差过大时把 bulk 挪到姐妹连接；不会把 bulk 推到更高 class
+
+HOL 隔离靠「每链路多连接 + 姐妹优先 backup」，不是按 ISP 钉死。
+
+## 流控制
+
+- 初始窗口 `128 KiB`，对端用 `STREAM_ACK.window` 通告
+- `STREAM_DATA` 带 offset，接收端 `BTreeMap` 重排
+- 未确认数据记在发送路径的 inflight 上；ACK 时减去，并对小帧采样 RTT（bulk ACK 不当时延）
+- 服务端出站拨号失败会 `IncomingStream::reset(DialFailed)`，对端收到 `STREAM_RESET`
+
+## 配置分层
+
+运维 TOML（`SessionOpts`）只有四个键：探测预算、路径上限、全 down 放弃。`#[serde(deny_unknown_fields)]`。
+
+算法常数在 `Tuning::STANDARD`：loss/down 倍数、failback 阈值、队列深度、重连退避、交互帧上限。测试里可以 clone 再改；生产路径只有这一张表。
+
+## 测试分层
+
+| 层 | 位置 | 覆盖 |
+| --- | --- | --- |
+| 单元 | `nya-proto` / `nya-core` 模块内 | 帧编解码、Tuning、握手 duplex、单测调度 |
+| 会话 | `nya-core::session` tests | 单路径 echo、多路径 failover |
+| 短 matrix | `cargo test -p nya-e2e` | 时延、异构、blackhole、failback、多连接 HOL… |
+| 长 blackhole | `nya-e2e --long` | 30s / 60s / 5m |
+| 混合 soak | `nya-e2e --mixed` | near 11–16ms / mid 60–100 / high 120–150 / far 160–200 |
+
+e2e 损伤代理在 TLS 外侧做 stall，不丢 TLS 字节。CI 跑 fmt、clippy、`--exclude nya-e2e` 的单元测试，以及 `nya-e2e` 的 lib/bin 测试；完整 matrix 留给本地或夜间任务。

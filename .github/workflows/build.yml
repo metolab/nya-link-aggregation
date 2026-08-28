@@ -1,0 +1,86 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-latest
+            target: x86_64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --locked -p nya-client -p nya-server --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          dest="nya-${{ matrix.target }}"
+          mkdir -p "$dest"
+          ext=""
+          if [[ "${{ matrix.target }}" == *windows* ]]; then
+            ext=".exe"
+          fi
+          cp "target/${{ matrix.target }}/release/nya-client${ext}" "$dest/"
+          cp "target/${{ matrix.target }}/release/nya-server${ext}" "$dest/"
+          cp README.md LICENSE "$dest/"
+          if [[ "${{ matrix.target }}" == *windows* ]]; then
+            7z a "${dest}.zip" "$dest"
+          else
+            tar -czf "${dest}.tar.gz" "$dest"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nya-${{ matrix.target }}
+          path: |
+            nya-*.tar.gz
+            nya-*.zip
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

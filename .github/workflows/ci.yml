@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy (runtime crates)
+        run: cargo clippy -p nya-proto -p nya-core -p nya-client -p nya-server --all-targets -- -D warnings
+      - name: Clippy (e2e harness)
+        run: cargo clippy -p nya-e2e --all-targets
+      - name: Unit tests
+        env:
+          RUSTFLAGS: -D warnings
+        run: cargo test --workspace --exclude nya-e2e
+      - name: E2E crate unit tests
+        env:
+          RUSTFLAGS: -D warnings
+        run: cargo test -p nya-e2e --lib --bins

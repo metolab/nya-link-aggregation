@@ -1,0 +1,52 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/nya-proto",
+    "crates/nya-core",
+    "crates/nya-client",
+    "crates/nya-server",
+    "crates/nya-e2e",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+authors = ["Lyn <i@lyn.moe>"]
+repository = "https://github.com/metolab/nya-link-aggregation"
+homepage = "https://github.com/metolab/nya-link-aggregation"
+
+[workspace.dependencies]
+nya-proto = { path = "crates/nya-proto" }
+nya-core = { path = "crates/nya-core" }
+nya-client = { path = "crates/nya-client" }
+nya-server = { path = "crates/nya-server" }
+
+anyhow = "1"
+bytes = "1"
+clap = { version = "4", features = ["derive"] }
+hex = "0.4"
+hmac = "0.12"
+hkdf = "0.12"
+rand = "0.8"
+rcgen = "0.13"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2"
+rustls-pki-types = "1"
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+tokio-util = { version = "0.7", features = ["io", "codec"] }
+futures-util = { version = "0.3", features = ["sink"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+x509-parser = "0.16"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

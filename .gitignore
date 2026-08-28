@@ -1,0 +1,13 @@
+/target
+**/*.rs.bk
+.idea
+.vscode
+*.pem
+*.crt
+*.key
+certs/
+e2e-reports/
+mixed-report.txt
+*.log
+.DS_Store
+
