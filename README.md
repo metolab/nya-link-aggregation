@@ -87,7 +87,7 @@ PSK 两端必须一致。客户端 `pinned_spki_sha256` 填上一步打印的值
 ./target/release/nya-client --config client.toml
 ```
 
-默认客户端在 `127.0.0.1:1080` 提供 SOCKS5。日志级别只用 `RUST_LOG`：未设置时落到 `nya_client=info,nya_core=info`（服务端同理）。`RUST_LOG=nya_core=debug` 会打出调度决策（pick / migrate / failback / HOL）的结构化字段。每 10 秒一条 `target=nya_core::obs` 的质量 snapshot（流成功/reset、stall、failover 时延、goodput）。可选 `[obs].metrics_listen = "127.0.0.1:9100"` 提供 Prometheus text（必须是数值 loopback 地址，不要 `localhost` / `0.0.0.0`）。
+默认客户端在 `127.0.0.1:1080` 提供 SOCKS5。日志级别只用 `RUST_LOG`：未设置时落到 `nya_client=info,nya_core=info,nya_obs=info`（服务端同理；`RUST_LOG` 未点名 `nya_obs` 时仍注入 `nya_obs=info`）。`RUST_LOG=nya_core=debug` 会打出调度决策（pick / migrate / failback / HOL）的结构化字段。每 10 秒一条 `target=nya_core::obs` 的质量 snapshot（计分卡 + paths/links/streams；全量 catalog 在 debug / `/metrics`）。可选 `[obs].metrics_listen = "127.0.0.1:9100"` 提供 Prometheus text（必须是数值 loopback 地址，不要 `localhost` / `0.0.0.0`）。
 
 ## 配置
 
@@ -118,7 +118,7 @@ PSK 两端必须一致。客户端 `pinned_spki_sha256` 填上一步打印的值
 | 键 | 含义 | 默认 |
 | --- | --- | --- |
 | `enabled` | 总开关；`false` 时三信号全关 | `false` |
-| `endpoint` | OTLP 基址，如 `http://127.0.0.1:4318` | 空（开启时必填，或用 env） |
+| `endpoint` | HTTP **基址**，如 `http://127.0.0.1:4318`。**nya-obs** 拼接 `/v1/traces` `/v1/metrics` `/v1/logs` | 空（每路 enabled 信号须有父级、该信号 `endpoint`、或 env） |
 | `protocol` | `http/protobuf` 或 `grpc` | `http/protobuf` |
 | `gzip` | 压缩 | `true` |
 | `timeout_ms` | 每次导出超时；traces/logs shutdown flush | 5000 |

@@ -5,18 +5,20 @@ mod config;
 mod outbound;
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tokio_rustls::TlsAcceptor;
-use tracing::{error, info, warn, Instrument};
+use tracing::{info, warn};
 
 use nya_core::{
     export_from_server, load_server_config, server_accept_handshake, spawn_obs_table, spki_sha256,
-    HandshakeResult, SessionTable,
+    HandshakeError, HandshakeResult, SessionTable,
 };
+use nya_proto::ProtoError;
 
 pub use config::ServerConfig;
 use outbound::handle_incoming;
@@ -105,6 +107,83 @@ pub async fn run_on_table(
     }
 }
 
+// Same 60 s cap as nya-obs ExportErrorPulse, plus class-change. Process-wide;
+// never construct inside serve_one (per-TCP spawn would restore scanner floods).
+static TLS_ACCEPT_PULSE: OnceLock<Mutex<TlsPulseState>> = OnceLock::new();
+
+#[derive(Default)]
+struct TlsPulseState {
+    last_emit: Option<Instant>,
+    last_error: String,
+    #[allow(dead_code)]
+    last_peer: String,
+    suppressed: u64,
+}
+
+fn tls_pulse_should_emit(
+    st: &mut TlsPulseState,
+    now: Instant,
+    every: Duration,
+    error: &str,
+) -> Option<u64> {
+    match st.last_emit {
+        None => {
+            st.last_emit = Some(now);
+            st.last_error = error.to_string();
+            st.suppressed = 0;
+            Some(0)
+        }
+        Some(_) if error != st.last_error => {
+            let n = st.suppressed;
+            st.last_emit = Some(now);
+            st.last_error = error.to_string();
+            st.suppressed = 0;
+            Some(n)
+        }
+        Some(prev) if now.duration_since(prev) >= every => {
+            let n = st.suppressed;
+            st.last_emit = Some(now);
+            st.last_error = error.to_string();
+            st.suppressed = 0;
+            Some(n)
+        }
+        Some(_) => {
+            st.suppressed += 1;
+            None
+        }
+    }
+}
+
+fn tls_accept_warn(peer: std::net::SocketAddr, err: &impl std::fmt::Display) {
+    let slot = TLS_ACCEPT_PULSE.get_or_init(|| Mutex::new(TlsPulseState::default()));
+    let msg = err.to_string();
+    let n = {
+        let mut g = slot.lock().unwrap_or_else(|e| e.into_inner());
+        let out = tls_pulse_should_emit(&mut g, Instant::now(), Duration::from_secs(60), &msg);
+        if out.is_some() {
+            g.last_peer = peer.to_string();
+        }
+        out
+    };
+    if let Some(n) = n {
+        tracing::warn!(%peer, error = %msg, suppressed = n, "tls accept");
+    }
+}
+
+fn handshake_is_noise(e: &HandshakeError) -> bool {
+    match e {
+        HandshakeError::Unexpected => true,
+        HandshakeError::Proto(
+            ProtoError::BadLength(_)
+            | ProtoError::UnknownType(_)
+            | ProtoError::Truncated
+            | ProtoError::Invalid(_),
+        ) => true,
+        HandshakeError::Proto(ProtoError::Io(_) | ProtoError::Version(_)) => false,
+        HandshakeError::Rejected(_) | HandshakeError::UnknownSession => false,
+    }
+}
+
 async fn serve_one(
     acceptor: TlsAcceptor,
     tcp: tokio::net::TcpStream,
@@ -116,31 +195,30 @@ async fn serve_one(
     if table.is_closed() {
         return Ok(());
     }
-    let mut tls = acceptor
-        .accept(tcp)
-        .instrument(tracing::info_span!(
+    let t0 = Instant::now();
+    let mut tls = match acceptor.accept(tcp).await {
+        Ok(t) => t,
+        Err(e) => {
+            tls_accept_warn(peer, &e);
+            return Ok(());
+        }
+    };
+    if table.is_closed() {
+        return Ok(());
+    }
+    {
+        let _s = tracing::info_span!(
             target: "nya_otel",
             "nya.link.accept",
             otel.kind = "server",
             peer = %peer,
-        ))
-        .await
-        .context("tls accept")?;
-    if table.is_closed() {
-        return Ok(());
+            tls_ms = t0.elapsed().as_millis() as u64,
+        )
+        .entered();
     }
     let exporter = export_from_server(&tls).map_err(|e| anyhow::anyhow!("exporter: {e}"))?;
-    let hs_span = tracing::info_span!(
-        target: "nya_otel",
-        "nya.handshake",
-        otel.kind = "server",
-        peer = %peer,
-        nya.kind = tracing::field::Empty,
-        otel.status_code = tracing::field::Empty,
-    );
-    let result = server_accept_handshake(&mut tls, &psk, &exporter, &table)
-        .instrument(hs_span.clone())
-        .await;
+    let hs_t0 = Instant::now();
+    let result = server_accept_handshake(&mut tls, &psk, &exporter, &table).await;
     match result {
         Ok(HandshakeResult::Created {
             session,
@@ -148,13 +226,22 @@ async fn serve_one(
             path_name,
             session_id,
         }) => {
-            hs_span.record("nya.kind", "create");
-            drop(hs_span);
-            session
-                .process()
-                .handshake_create_ok
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            info!(%peer, session = %hex_encode(&session_id), "session created");
+            {
+                let _g = tracing::info_span!(
+                    target: "nya_otel",
+                    "nya.handshake",
+                    otel.kind = "server",
+                    peer = %peer,
+                    nya.kind = "create",
+                    hs_ms = hs_t0.elapsed().as_millis() as u64,
+                )
+                .entered();
+                session
+                    .process()
+                    .handshake_create_ok
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                info!(%peer, session = %hex_encode(&session_id), "session created");
+            }
             if table.is_closed() {
                 session.shutdown();
                 return Ok(());
@@ -171,13 +258,22 @@ async fn serve_one(
             session.add_path(path_name, tls).await;
         }
         Ok(HandshakeResult::Joined { session, path_name }) => {
-            hs_span.record("nya.kind", "join");
-            drop(hs_span);
-            session
-                .process()
-                .handshake_join_ok
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            info!(%peer, path = %path_name, "path joined");
+            {
+                let _g = tracing::info_span!(
+                    target: "nya_otel",
+                    "nya.handshake",
+                    otel.kind = "server",
+                    peer = %peer,
+                    nya.kind = "join",
+                    hs_ms = hs_t0.elapsed().as_millis() as u64,
+                )
+                .entered();
+                session
+                    .process()
+                    .handshake_join_ok
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                info!(%peer, path = %path_name, "path joined");
+            }
             if table.is_closed() {
                 return Ok(());
             }
@@ -191,13 +287,22 @@ async fn serve_one(
             }
             session.add_path(path_name, tls).await;
         }
-        Err(e) => {
-            hs_span.record("otel.status_code", "ERROR");
+        Err(e) if handshake_is_noise(&e) => {
             table.process().inc_handshake_fail(&e);
-            {
-                let _g = hs_span.enter();
-                error!(%peer, error = %e, "handshake failed");
-            }
+            tracing::debug!(%peer, error = %e, "handshake discarded");
+        }
+        Err(e) => {
+            table.process().inc_handshake_fail(&e);
+            let _g = tracing::info_span!(
+                target: "nya_otel",
+                "nya.handshake",
+                otel.kind = "server",
+                peer = %peer,
+                otel.status_code = "ERROR",
+                hs_ms = hs_t0.elapsed().as_millis() as u64,
+            )
+            .entered();
+            tracing::warn!(%peer, error = %e, "handshake failed");
         }
     }
     Ok(())
@@ -205,4 +310,67 @@ async fn serve_one(
 
 pub fn cert_paths(dir: &Path) -> (PathBuf, PathBuf) {
     (dir.join("server.crt"), dir.join("server.key"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn handshake_noise_is_codec_not_io() {
+        assert!(handshake_is_noise(&HandshakeError::Unexpected));
+        assert!(handshake_is_noise(&HandshakeError::Proto(
+            ProtoError::BadLength(1195725856)
+        )));
+        assert!(handshake_is_noise(&HandshakeError::Proto(
+            ProtoError::UnknownType(0x47)
+        )));
+        assert!(handshake_is_noise(&HandshakeError::Proto(
+            ProtoError::Truncated
+        )));
+        assert!(handshake_is_noise(&HandshakeError::Proto(
+            ProtoError::Invalid("x")
+        )));
+        assert!(!handshake_is_noise(&HandshakeError::Proto(ProtoError::Io(
+            std::io::Error::new(std::io::ErrorKind::ConnectionReset, "rst")
+        ))));
+        assert!(!handshake_is_noise(&HandshakeError::Proto(
+            ProtoError::Version(9)
+        )));
+        assert!(!handshake_is_noise(&HandshakeError::Rejected(
+            "auth".into()
+        )));
+        assert!(!handshake_is_noise(&HandshakeError::UnknownSession));
+    }
+
+    #[test]
+    fn tls_pulse_shared_state_and_class_change() {
+        let mut st = TlsPulseState::default();
+        let every = Duration::from_secs(60);
+        let t0 = Instant::now();
+        assert_eq!(tls_pulse_should_emit(&mut st, t0, every, "eof"), Some(0));
+        assert_eq!(
+            tls_pulse_should_emit(&mut st, t0 + Duration::from_secs(10), every, "eof"),
+            None
+        );
+        assert_eq!(st.suppressed, 1);
+        assert_eq!(
+            tls_pulse_should_emit(&mut st, t0 + Duration::from_secs(20), every, "expired cert"),
+            Some(1)
+        );
+        assert_eq!(st.last_error, "expired cert");
+        assert_eq!(
+            tls_pulse_should_emit(&mut st, t0 + Duration::from_secs(30), every, "expired cert"),
+            None
+        );
+        assert_eq!(
+            tls_pulse_should_emit(
+                &mut st,
+                t0 + Duration::from_secs(20) + Duration::from_secs(61),
+                every,
+                "expired cert"
+            ),
+            Some(1)
+        );
+    }
 }

@@ -7,7 +7,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::catalog::{format_snapshot_metrics, snapshot_p99};
 use crate::cfg::ObsOpts;
@@ -127,19 +127,35 @@ where
 }
 
 fn emit_snapshot(ps: &ProcessSnapshot) {
+    // Info must not attach `metrics=` (full catalog). That dump is debug-only.
     let s = &ps.session;
     let (stall_p99, failover_p99) = snapshot_p99(ps);
-    let metrics = format_snapshot_metrics(ps);
     info!(
         target: "nya_core::obs",
         stall_p99_ms = stall_p99,
         failover_p99_ms = failover_p99,
+        stall_count = s.stall_ms.count,
+        failover_count = s.failover_ms.count,
         paths_alive = s.paths.len() as u64,
+        streams_live = s.streams_live,
+        streams_closed = s.streams_closed,
+        stream_resets = s.stream_resets,
+        path_down = s.path_down,
+        path_degraded = s.path_degraded,
+        probe_miss = s.probe_miss,
+        failbacks = s.failbacks,
+        session_all_down_resets = s.session_all_down_resets,
+        bytes_data_tx = s.bytes_data_tx,
+        bytes_ctrl_tx = s.bytes_ctrl_tx,
         paths = %format_paths(&s.paths),
         links = %format_links(&s.links),
         streams = %format_streams(&s.streams, s.streams_live),
-        metrics = %metrics,
         "snapshot"
+    );
+    debug!(
+        target: "nya_core::obs",
+        metrics = %format_snapshot_metrics(ps),
+        "snapshot metrics"
     );
 }
 

@@ -1,6 +1,7 @@
 //! OpenTelemetry export layer. SDK stays here and in binary `main.rs` only.
 #![allow(clippy::type_complexity)]
 
+mod endpoint;
 mod metrics_export;
 mod resource;
 mod subscribe;
@@ -73,10 +74,6 @@ pub fn install(role: &'static str, version: &'static str, obs: &ObsOpts) -> Resu
 
     validate_signal_keys(&obs.otel)?;
     let instance = resolve_instance_name(obs)?;
-    let endpoint = resolve_endpoint(&obs.otel, None)?;
-    if endpoint.is_empty() {
-        bail!("obs.otel.endpoint (or OTEL_EXPORTER_OTLP_ENDPOINT) required when otel.enabled");
-    }
     let protocol = resolve_protocol(&obs.otel)?;
     if matches!(protocol, OtelProtocol::Grpc) && !cfg!(feature = "grpc") {
         bail!("rebuild with --features otel-grpc");
@@ -85,15 +82,37 @@ pub fn install(role: &'static str, version: &'static str, obs: &ObsOpts) -> Resu
     let traces_on = signal_on(&obs.otel, &obs.otel.traces);
     let metrics_on = signal_on(&obs.otel, &obs.otel.metrics);
     let logs_on = signal_on(&obs.otel, &obs.otel.logs);
-    if traces_on {
-        let _ = resolve_endpoint(&obs.otel, Some(&obs.otel.traces))?;
-    }
-    if metrics_on {
-        let _ = resolve_endpoint(&obs.otel, Some(&obs.otel.metrics))?;
-    }
-    if logs_on {
-        let _ = resolve_endpoint(&obs.otel, Some(&obs.otel.logs))?;
-    }
+    let traces_url = if traces_on {
+        Some(endpoint::exporter_url(
+            &obs.otel,
+            &obs.otel.traces,
+            protocol,
+            "traces",
+        )?)
+    } else {
+        None
+    };
+    let metrics_url = if metrics_on {
+        Some(endpoint::exporter_url(
+            &obs.otel,
+            &obs.otel.metrics,
+            protocol,
+            "metrics",
+        )?)
+    } else {
+        None
+    };
+    let logs_url = if logs_on {
+        Some(endpoint::exporter_url(
+            &obs.otel,
+            &obs.otel.logs,
+            protocol,
+            "logs",
+        )?)
+    } else {
+        None
+    };
+    let (raw_parent, _) = endpoint::resolve_endpoint_kind(&obs.otel, None);
 
     let timeout = Duration::from_millis(obs.otel.timeout_ms.unwrap_or(5000).max(1));
     let gzip = obs.otel.gzip.unwrap_or(true);
@@ -107,7 +126,7 @@ pub fn install(role: &'static str, version: &'static str, obs: &ObsOpts) -> Resu
     let tracer = if traces_on {
         Some(build_tracer(
             &resource,
-            &resolve_endpoint(&obs.otel, Some(&obs.otel.traces))?,
+            traces_url.as_deref().unwrap(),
             protocol,
             gzip,
             &headers,
@@ -121,7 +140,7 @@ pub fn install(role: &'static str, version: &'static str, obs: &ObsOpts) -> Resu
     let meter = if metrics_on {
         Some(build_meter(
             &resource,
-            &resolve_endpoint(&obs.otel, Some(&obs.otel.metrics))?,
+            metrics_url.as_deref().unwrap(),
             protocol,
             gzip,
             &headers,
@@ -134,7 +153,7 @@ pub fn install(role: &'static str, version: &'static str, obs: &ObsOpts) -> Resu
     let logger = if logs_on {
         Some(build_logger(
             &resource,
-            &resolve_endpoint(&obs.otel, Some(&obs.otel.logs))?,
+            logs_url.as_deref().unwrap(),
             protocol,
             gzip,
             &headers,
@@ -175,9 +194,17 @@ pub fn install(role: &'static str, version: &'static str, obs: &ObsOpts) -> Resu
         metrics_on,
     });
 
+    let parent_log = if raw_parent.trim().is_empty() {
+        "-"
+    } else {
+        raw_parent.as_str()
+    };
     info!(
         instance_name = %instance,
-        endpoint = %endpoint,
+        endpoint = parent_log,
+        traces_endpoint = traces_url.as_deref().unwrap_or("-"),
+        metrics_endpoint = metrics_url.as_deref().unwrap_or("-"),
+        logs_endpoint = logs_url.as_deref().unwrap_or("-"),
         protocol = ?protocol,
         traces = traces_on,
         metrics = metrics_on,
@@ -274,32 +301,6 @@ fn resolve_instance_name(obs: &ObsOpts) -> Result<String> {
         (None, Some(s)) => Ok(s),
         (None, None) => bail!("obs.instance_name or NYA_INSTANCE_NAME required when otel.enabled"),
     }
-}
-
-fn resolve_endpoint(otel: &OtelOpts, sig: Option<&OtelSignalOpts>) -> Result<String> {
-    if let Some(sig) = sig {
-        if let Some(e) = sig
-            .endpoint
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            return Ok(e.to_string());
-        }
-    }
-    if let Some(e) = otel
-        .endpoint
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        return Ok(e.to_string());
-    }
-    Ok(std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_default())
 }
 
 fn resolve_protocol(otel: &OtelOpts) -> Result<OtelProtocol> {

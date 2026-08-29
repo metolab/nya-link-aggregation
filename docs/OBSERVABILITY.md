@@ -748,34 +748,20 @@ sequenceDiagram
 
 #### 10s snapshot 的 tracing 字段（一条 `info`，target `nya_core::obs`）
 
-必须覆盖 Q1–Q8：
+info 行是紧凑计分卡（**不再**带 `metrics=` 全量 catalog；catalog 在同 target 的 `debug`「snapshot metrics」以及 `/metrics` / OTLP metrics）：
 
 ```text
-streams_opened, streams_closed,
-stream_resets, stream_resets_dial_failed, stream_resets_timeout,
-stream_resets_peer, stream_resets_session_dead, stream_resets_protocol,
-streams_stalled, streams_live,
-stall_count, stall_p99_ms,
-failover_count, failover_p99_ms,
-migrates, migrates_speculative, migrates_path_down, migrates_ensure_sticky, migrates_send_blocked,
-data_retransmit, data_hedge, probe_miss, window_blocks,
-picks_unknown_rtt, picks_unknown_over_known,
-failbacks, failbacks_upgrade, failbacks_class_empty, failbacks_same_link,
-hol_rebalances, path_added, path_down, path_degraded,
-bytes_data_tx, bytes_data_rx, bytes_ctrl_tx, bytes_ctrl_rx, frame_send_drop,
-session_all_down_resets,
-sessions_live, sessions_created, sessions_dead,
-inbound_accept, inbound_reject, inbound_open_fail,
-outbound_dial_ok, outbound_dial_fail,
-handshake_create_ok, handshake_join_ok,
-handshake_fail_auth, handshake_fail_version, handshake_fail_unknown, handshake_fail_other,
-reconnect_ok, reconnect_fail,
-paths_alive,
+stall_p99_ms, failover_p99_ms, stall_count, failover_count,
+paths_alive, streams_live, streams_closed, stream_resets,
+path_down, path_degraded, probe_miss, failbacks, session_all_down_resets,
+bytes_data_tx, bytes_ctrl_tx,
 paths = "<压缩串>",
 links = "<线路汇总>",
 streams = "<粘滞表，最多 64 条，多出 +N>"
 "snapshot"
 ```
+
+完整 Q1–Q8 字段仍在 `format_snapshot_metrics` / Prometheus / OTLP metrics。
 
 `paths` 压缩（单会话名；多会话 `path` 与 `link` 都带 4-hex 前缀，例如 `a1b2:a#0` / `a1b2:a`）：
 
@@ -1106,7 +1092,7 @@ Prometheus 点号 → 下划线（`nya_instance_name`）。Tempo TraceQL 保留�
 | 键 | 默认 | 说明 |
 | --- | --- | --- |
 | `enabled` | `false` | 总开关 |
-| `endpoint` | 空 | 如 `http://127.0.0.1:4318`。HTTP 路径由 SDK 追加 `/v1/metrics` `/v1/logs` `/v1/traces` |
+| `endpoint` | 空 | HTTP **基址**，如 `http://127.0.0.1:4318`。**nya-obs** 为每个信号拼接 `/v1/traces` `/v1/metrics` `/v1/logs`（`opentelemetry-otlp` 0.31 的 `with_endpoint` 不会自己追加）。父级可空，若每个 **enabled** 信号有自己的 `endpoint`。基址带 `?`/`#` 是 `install()` 错误；query 只允许写在完整 `/v1/{signal}` URL 上，token 走 `[obs.otel.headers]` |
 | `protocol` | `http/protobuf` | 另可 `grpc`（须 `--features otel-grpc`） |
 | `gzip` | `true` | HTTP 始终编了 gzip；gRPC 编进 `otel-grpc` |
 | `timeout_ms` | 5000 | 每次 OTLP 导出超时；traces/logs `shutdown` flush。0.31 PeriodicReader **没有** collection timeout |
@@ -1127,7 +1113,7 @@ Prometheus 点号 → 下划线（`nya_instance_name`）。Tempo TraceQL 保留�
 | `batch_size` | ✓ | 非法 | ✓ | 512（须 `<= queue_size`） |
 | `delay_ms` | ✓ | 非法 | ✓ | 5000（须 `>= 10`） |
 
-stderr 级别只看 `RUST_LOG`（默认 `nya_client=info,nya_core=info`）。OTLP logs 用 `logs.level`，两层 filter 独立：stderr `info` + 远程 `debug` 时 debug 会创建并上报、不打到 stderr。
+stderr 级别只看 `RUST_LOG`（默认 `nya_client|nya_server=info,nya_core=info,nya_obs=info`；`nya_obs=info` 在 `RUST_LOG` 已设但未点名 `nya_obs` 时仍会 `add_directive`）。OTLP logs 用 `logs.level`，两层 filter 独立：stderr `info` + 远程 `debug` 时 debug 会创建并上报、不打到 stderr。OTLP logs **不**摄入 `nya_core::obs` snapshot、`nya_obs` pulse、SDK crates。
 
 ### HTTP 认证（Basic / Bearer / 任意头）
 
@@ -1168,7 +1154,9 @@ OTEL_EXPORTER_OTLP_HEADERS="Authorization=Basic dXNlcjpwYXNz"
 
 ### Logs
 
-全量 `tracing` 事件（无 allowlist），按 `logs.level` 裁。DenyList 字段名：`psk`、`proof`、`exporter`、`session`（完整 hex）。队列满丢最旧，最多每 10s 一条 `otel log queue full`，不堵 overlay。成功握手时若当前有控制面 span，日志会带 `trace_id` / `span_id`。
+全量 `tracing` 事件（无 allowlist，有 denylist），按 `logs.level` 裁。DenyList **target**：`nya_core::obs`、`nya_otel`、`nya_obs`、`opentelemetry` / `opentelemetry_sdk` / `opentelemetry_otlp`、`hyper` / `reqwest` / `tonic`。DenyList 字段名：`psk`、`proof`、`exporter`、`session`（完整 hex）。队列满丢最旧，最多每 10s 一条 `otel log queue full`，不堵 overlay。成功握手时若当前有控制面 span，日志会带 `trace_id` / `span_id`。
+
+stderr 上 SDK `ExportError` 默认 `off`。`nya_obs` 对 BatchLog/BatchSpan 失败打第一条 ERROR，之后每 60s 一条 pulse（`sdk_name` + `error`/`status`，query 已剥）。**不**覆盖 metrics `PeriodicReader`（SDK `otel_debug!`）；metrics 是否到达看远端 series，不要用「pulse 安静」当三信号健康。
 
 ### Traces（控制面）
 
@@ -1178,8 +1166,8 @@ OTEL_EXPORTER_OTLP_HEADERS="Authorization=Basic dXNlcjpwYXNz"
 | --- | --- | --- |
 | `nya.startup` | `main`：start/bind + attach | internal |
 | `nya.link.dial` | client `connect_pinned` | client |
-| `nya.link.accept` | server TLS accept | server |
-| `nya.handshake` | create/join I/O；属性 `nya.kind=create\|join` | client / server |
+| `nya.link.accept` | server TLS 成功后的 **marker**（`tls_ms`）；失败 accept **不**建 span | server |
+| `nya.handshake` | overlay create/join 或 overlay 失败的 **marker**（`hs_ms`）；不跨 `add_path`。codec 噪声（HTTP `GET ` 等）无 span | client / server |
 | `nya.path.up` | path 注册瞬间（毫秒） | internal |
 | `nya.inbound.socks5` / `nya.inbound.forward` | 到 `open_stream` 返回 | server |
 | `nya.outbound.dial` | `TcpStream::connect` | client |

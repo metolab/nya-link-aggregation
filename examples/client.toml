@@ -16,10 +16,12 @@ max_paths = 32
 # [obs]
 # snapshot_interval_ms = 10000
 # metrics_listen = "127.0.0.1:9100"
-# instance_name = "edge-sh-03"
+# instance_name = "edge-sh-03"   # must differ from the server instance_name
 #
 # Remote OTLP (default off). instance_name is required when enabled.
 # No username/password keys: HTTP Basic/Bearer go in [obs.otel.headers].
+# Query/fragment only on a full /v1/{signal} URL; tokens in headers.
+# HTTP parent is a base; nya-obs appends /v1/traces|metrics|logs.
 # [obs.otel]
 # enabled = true
 # endpoint = "http://127.0.0.1:4318"
