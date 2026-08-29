@@ -1964,6 +1964,7 @@ mod tests {
         let client = Session::new_client(cfg);
         let bad = inject_named(&client, 1, "soy#0", 7);
         bad.rtt_class_us.store(227_000, Ordering::Relaxed);
+        bad.rtt_ewma_us.store(227_000, Ordering::Relaxed);
         bad.stable_up_hold_us
             .store(1_000_000_000, Ordering::Relaxed);
         inject_named(&client, 2, "soy#1", 7);
@@ -1982,6 +1983,7 @@ mod tests {
         let (server, _inc) = Session::new_server(cfg);
         let bad = inject_named(&server, 1, "soy#0", 7);
         bad.rtt_class_us.store(227_000, Ordering::Relaxed);
+        bad.rtt_ewma_us.store(227_000, Ordering::Relaxed);
         inject_named(&server, 2, "soy#1", 7);
         server.debug_maintain();
         assert_eq!(server.snapshot().path_outlier_recycle, 0);
@@ -2010,6 +2012,7 @@ mod tests {
         let client = Session::new_client(cfg);
         let bad = inject_named(&client, 1, "soy#0", 7);
         bad.rtt_class_us.store(227_000, Ordering::Relaxed);
+        bad.rtt_ewma_us.store(227_000, Ordering::Relaxed);
         bad.note_class_known_now();
         inject_named(&client, 2, "soy#1", 7);
         let before = client.snapshot().path_outlier_recycle;
@@ -2032,6 +2035,54 @@ mod tests {
         client.debug_maintain();
         assert_eq!(client.snapshot().path_outlier_recycle, before + 1);
         assert!(!client.inner.paths.lock().unwrap().contains_key(&1));
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn outlier_skips_recovered_fast() {
+        let mut cfg = SessionConfig::default();
+        cfg.tuning.stable_up_hold = Duration::ZERO;
+        let client = Session::new_client(cfg);
+        let bad = inject_named(&client, 1, "soy#0", 7);
+        bad.rtt_class_us.store(227_000, Ordering::Relaxed);
+        inject_named(&client, 2, "soy#1", 7);
+        let before = client.snapshot().path_outlier_recycle;
+        client.debug_maintain();
+        assert_eq!(client.snapshot().path_outlier_recycle, before);
+        assert!(client.inner.paths.lock().unwrap().contains_key(&1));
+        assert!(
+            bad.outlier_since_for_test().is_none(),
+            "recovered fast must clear_outlier, not start the backup timer"
+        );
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn outlier_clears_when_fast_recovers_mid_hold() {
+        let mut cfg = SessionConfig::default();
+        cfg.tuning.stable_up_hold = Duration::from_millis(50);
+        let client = Session::new_client(cfg);
+        let bad = inject_named(&client, 1, "soy#0", 7);
+        bad.rtt_class_us.store(227_000, Ordering::Relaxed);
+        bad.rtt_ewma_us.store(227_000, Ordering::Relaxed);
+        inject_named(&client, 2, "soy#1", 7);
+        let before = client.snapshot().path_outlier_recycle;
+        bad.backdate_class_known(Duration::from_millis(50));
+        client.debug_maintain();
+        assert_eq!(client.snapshot().path_outlier_recycle, before);
+        assert!(client.inner.paths.lock().unwrap().contains_key(&1));
+        assert!(
+            bad.outlier_since_for_test().is_some(),
+            "both clocks backup after age must start the timer"
+        );
+        bad.rtt_ewma_us.store(7_000, Ordering::Relaxed);
+        client.debug_maintain();
+        assert_eq!(client.snapshot().path_outlier_recycle, before);
+        assert!(client.inner.paths.lock().unwrap().contains_key(&1));
+        assert!(
+            bad.outlier_since_for_test().is_none(),
+            "fast recovered under the cliff must clear_outlier mid-hold"
+        );
         client.shutdown();
     }
 

@@ -249,7 +249,13 @@ impl Session {
                 p.clear_outlier();
                 continue;
             };
-            if health::is_backup(&self.inner.cfg, p.class_rtt(), sib) {
+            // Class-only backup races the H5/G4a walk: one 7/8 that
+            // crosses the cliff is still backup for ~8 holds, so G4b
+            // always won. Recycle only if fast agrees the 5-tuple is
+            // still slow; recovered fast clears the timer (H6).
+            if health::is_backup(&self.inner.cfg, p.class_rtt(), sib)
+                && health::is_backup(&self.inner.cfg, p.rtt(), sib)
+            {
                 if p.mark_outlier() >= hold {
                     recycle.push(p.id);
                 }
