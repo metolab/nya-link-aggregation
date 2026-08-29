@@ -61,25 +61,36 @@ impl Session {
         }
 
         let alive: Vec<&Arc<PathState>> = paths.iter().filter(|p| p.is_alive()).collect();
+        let quiet: Vec<&Arc<PathState>> = alive
+            .iter()
+            .copied()
+            .filter(|p| p.last_rx_ago() >= self.degrade_for(p))
+            .collect();
         let silent: Vec<&Arc<PathState>> = alive
             .iter()
             .copied()
             .filter(|p| p.last_rx_ago() >= self.down_for(p))
             .collect();
-        let known_silent = silent.iter().filter(|p| p.rtt_known()).count();
-        // N−1 of N≥3: one path still RX, so this is not "peer is fully stuck"
-        // (all-N blackhole still tears at down_for — TCP RTO recovery is worse
-        // than a reconnect). Soak GZ–HK was 3-of-4.
-        let correlated = alive.len() >= 3 && known_silent >= 1 && silent.len() == alive.len() - 1;
+        let known_quiet = quiet.iter().filter(|p| p.rtt_known()).count();
+        // Membership at degrade_for so sequential down_for crossings still
+        // form N−1; enter only once someone is actually at down_for (3-of-4
+        // at ~50 ms must not start an 8 s episode). All-N still tears at
+        // down_for — TCP RTO recovery is worse than a reconnect.
+        let correlated = alive.len() >= 3
+            && known_quiet >= 1
+            && quiet.len() == alive.len() - 1
+            && !silent.is_empty();
         {
             let mut g = self.inner.correlated_since.lock().unwrap();
             if correlated {
                 if g.is_none() {
                     *g = Some(Instant::now());
                     info!(
+                        quiet = quiet.len(),
                         silent = silent.len(),
                         alive = alive.len(),
-                        known_silent,
+                        known_quiet,
+                        budget_ms = self.inner.cfg.all_down_timeout.as_millis() as u64,
                         "correlated silence"
                     );
                     self.inner
@@ -225,7 +236,7 @@ impl Session {
         let hold = self.inner.cfg.tuning.stable_up_hold;
         let mut recycle = Vec::new();
         for p in &paths {
-            if !p.is_up() || !p.class_known() {
+            if !p.is_up() || !p.class_known() || !p.class_known_aged(hold) {
                 p.clear_outlier();
                 continue;
             }

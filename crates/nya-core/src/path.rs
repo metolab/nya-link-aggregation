@@ -54,6 +54,8 @@ pub struct PathState {
     class_low_since: std::sync::Mutex<Option<Instant>>,
     class_low_accum: std::sync::Mutex<Duration>,
     outlier_since: std::sync::Mutex<Option<Instant>>,
+    /// First freeze of `rtt_class_us`. Recycle age-gate; never cleared.
+    class_known_since: std::sync::Mutex<Option<Instant>>,
     /// CAS: one failover_ms sample per path.
     pub failover_recorded: AtomicBool,
     urgent_queued: AtomicU64,
@@ -97,6 +99,7 @@ impl PathState {
             class_low_since: std::sync::Mutex::new(None),
             class_low_accum: std::sync::Mutex::new(Duration::ZERO),
             outlier_since: std::sync::Mutex::new(None),
+            class_known_since: std::sync::Mutex::new(None),
             failover_recorded: AtomicBool::new(false),
             urgent_queued: AtomicU64::new(0),
             bulk_queued: AtomicU64::new(0),
@@ -322,6 +325,7 @@ impl PathState {
             let n = self.class_init_n.fetch_add(1, Ordering::Relaxed) + 1;
             if n >= 8 {
                 self.rtt_class_us.store(fast, Ordering::Relaxed);
+                self.note_class_known_now();
                 tracing::debug!(
                     path = %self.name,
                     old_us = 0u64,
@@ -349,6 +353,7 @@ impl PathState {
             if start.elapsed() >= hold {
                 let new_us = (c_old * 7 + fast) / 8;
                 self.rtt_class_us.store(new_us, Ordering::Relaxed);
+                *high = None; // one 7/8 per hold; timeout-stable raise stays a ratchet
                 tracing::info!(
                     path = %self.name,
                     old_us = c_old,
@@ -390,6 +395,39 @@ impl PathState {
 
     pub(crate) fn clear_outlier(&self) {
         *self.outlier_since.lock().unwrap() = None;
+    }
+
+    pub(crate) fn note_class_known_now(&self) {
+        *self.class_known_since.lock().unwrap() = Some(Instant::now());
+    }
+
+    pub(crate) fn class_known_aged(&self, hold: Duration) -> bool {
+        match *self.class_known_since.lock().unwrap() {
+            Some(t) => t.elapsed() >= hold,
+            None => false,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn backdate_class_known(&self, age: Duration) {
+        *self.class_known_since.lock().unwrap() =
+            Some(Instant::now().checked_sub(age).unwrap_or_else(Instant::now));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn backdate_outlier(&self, age: Duration) {
+        *self.outlier_since.lock().unwrap() =
+            Some(Instant::now().checked_sub(age).unwrap_or_else(Instant::now));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn class_known_since_for_test(&self) -> Option<Instant> {
+        *self.class_known_since.lock().unwrap()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn outlier_since_for_test(&self) -> Option<Instant> {
+        *self.outlier_since.lock().unwrap()
     }
 
     #[cfg(test)]
@@ -865,6 +903,58 @@ mod tests {
             "paused + resumed drop must 7/8, class={class}"
         );
         assert_eq!(p.class_low_accum(), Duration::ZERO);
+    }
+
+    #[test]
+    fn raise_store_clears_high_timer() {
+        let p = path();
+        p.stable_up_hold_us.store(50_000, Ordering::Relaxed);
+        p.rtt_class_us.store(8_000, Ordering::Relaxed);
+        p.rtt_ewma_us.store(200_000, Ordering::Relaxed);
+        p.rtt_stable_us.store(8_000, Ordering::Relaxed);
+        p.record_rtt(Duration::from_millis(200));
+        assert_eq!(
+            p.rtt_class_us.load(Ordering::Relaxed),
+            8_000,
+            "hold not elapsed → no 7/8"
+        );
+        std::thread::sleep(Duration::from_millis(55));
+        p.record_rtt(Duration::from_millis(200));
+        let after_first = p.rtt_class_us.load(Ordering::Relaxed);
+        assert_eq!(
+            after_first,
+            (8_000 * 7 + 200_000) / 8,
+            "first hold stores 7/8 vs fast"
+        );
+        p.record_rtt(Duration::from_millis(200));
+        assert_eq!(
+            p.rtt_class_us.load(Ordering::Relaxed),
+            after_first,
+            "immediate raise must not store"
+        );
+        std::thread::sleep(Duration::from_millis(55));
+        p.record_rtt(Duration::from_millis(200));
+        let after_second = p.rtt_class_us.load(Ordering::Relaxed);
+        assert!(
+            after_second != after_first,
+            "second hold must 7/8 again, class={after_second}"
+        );
+    }
+
+    #[test]
+    fn class_init_window_notes_known_since() {
+        let p = path();
+        for _ in 0..7 {
+            p.record_rtt(Duration::from_millis(10));
+            assert!(
+                p.class_known_since_for_test().is_none(),
+                "init window must not timestamp before freeze"
+            );
+            assert!(!p.class_known());
+        }
+        p.record_rtt(Duration::from_millis(10));
+        assert!(p.class_known());
+        assert!(p.class_known_since_for_test().is_some());
     }
 
     #[test]

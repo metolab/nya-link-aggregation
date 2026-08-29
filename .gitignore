@@ -9,6 +9,7 @@ certs/
 e2e-reports/
 mixed-report.txt
 *.log
+nya-link-aggregation-logs-*.tar.gz
 .DS_Store
 .local/
 

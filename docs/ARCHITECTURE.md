@@ -60,7 +60,7 @@ PSK 证明「谁能加入这条会话」；pin 证明「TLS 对端是这张证�
 
 - **fast RTT**：近期 EWMA，用于打分和瞬时判断
 - **stable RTT**：更慢抬升，给 loss / down 时钟用，避免尖刺拆 TCP
-- **class RTT**：调度用的 class 成员资格；相对 fast 过时偏高时让位，尖刺时不跟着跳 class
+- **class RTT**：调度用的 class 成员资格；相对 fast 过时偏高时让位。raise 连续 `stable_up_hold` 后一次 7/8 并清 high 时钟（timeout-stable 仍是 hold 后连续 7/8，喂 loss/down）。尖刺时不跟着每 ping 跳 class
 
 超时由 `Tuning` 从 stable RTT 推出来，再夹紧：
 
@@ -73,7 +73,7 @@ PSK 证明「谁能加入这条会话」；pin 证明「TLS 对端是这张证�
 | failback 同类 | `max(8ms, 0.45×更好路径 RTT)` | 同 class 内要差这么多才迁回 |
 | failback 跨 class | 当前 ≥ 更好 × 1.5 + 8ms | 明显更好的 class 才 Upgrade |
 
-路径还有 alive / degraded / down。全部 down 超过 `all_down_timeout` 则拆会话。N≥3 且恰好 N−1 条静默时，把静默路径标 degraded、暂缓 `path_failed`（预算仍是 `all_down_timeout`），避免对端短卡时集体拆 TCP。全员静默仍按 `down_for` 拆。客户端链路监督协程按指数退避重连（200ms–2s）。同链路 TCP 相对姐妹连接已是 backup 且持续 `stable_up_hold` 时，客户端主动拆掉重拨。
+路径还有 alive / degraded / down。全部 down 超过 `all_down_timeout` 则拆会话。N≥3 且恰好 N−1 条路径超过 `degrade_for`（quiet）、其中至少一条已到 `down_for` 时进入 correlated：把已到 `down_for` 的已知 RTT 路径标 degraded、暂缓 `path_failed`（预算仍是 `all_down_timeout`），避免对端短卡时因 `last_rx` 不同步而逐条拆 TCP。仅 3 条过 degrade、谁都没到 down 不进入。全员静默仍按 `down_for` 拆。客户端链路监督协程按指数退避重连（200ms–2s）。同链路 TCP 相对姐妹连接已是 backup、且 class 已冻结满 `stable_up_hold`、再持续 backup `stable_up_hold` 时，客户端主动拆掉重拨（串行 2s）。
 
 ## 调度
 

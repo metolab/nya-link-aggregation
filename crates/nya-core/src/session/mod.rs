@@ -1736,6 +1736,7 @@ mod tests {
         p.rtt_ewma_us.store(rtt_ms * 1000, Ordering::Relaxed);
         p.rtt_stable_us.store(rtt_ms * 1000, Ordering::Relaxed);
         p.rtt_class_us.store(rtt_ms * 1000, Ordering::Relaxed);
+        p.note_class_known_now();
         client.inner.paths.lock().unwrap().insert(id, p.clone());
         p
     }
@@ -1999,6 +2000,158 @@ mod tests {
         client.debug_maintain();
         assert_eq!(client.snapshot().path_outlier_recycle, 0);
         assert!(client.inner.paths.lock().unwrap().contains_key(&1));
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn outlier_recycle_young_class_waits_hold() {
+        let mut cfg = SessionConfig::default();
+        cfg.tuning.stable_up_hold = Duration::from_millis(50);
+        let client = Session::new_client(cfg);
+        let bad = inject_named(&client, 1, "soy#0", 7);
+        bad.rtt_class_us.store(227_000, Ordering::Relaxed);
+        bad.note_class_known_now();
+        inject_named(&client, 2, "soy#1", 7);
+        let before = client.snapshot().path_outlier_recycle;
+        client.debug_maintain();
+        assert_eq!(client.snapshot().path_outlier_recycle, before);
+        assert!(client.inner.paths.lock().unwrap().contains_key(&1));
+        assert!(
+            bad.outlier_since_for_test().is_none(),
+            "age floor must clear_outlier, not start the backup timer"
+        );
+        bad.backdate_class_known(Duration::from_millis(50));
+        client.debug_maintain();
+        assert_eq!(
+            client.snapshot().path_outlier_recycle,
+            before,
+            "backup timer starts only after class-known age; must not recycle yet"
+        );
+        assert!(client.inner.paths.lock().unwrap().contains_key(&1));
+        bad.backdate_outlier(Duration::from_millis(50));
+        client.debug_maintain();
+        assert_eq!(client.snapshot().path_outlier_recycle, before + 1);
+        assert!(!client.inner.paths.lock().unwrap().contains_key(&1));
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn n4_three_quiet_sequential_holds_until_budget() {
+        let client = Session::new_client(SessionConfig::default());
+        let a0 = inject_named(&client, 1, "a#0", 7);
+        inject_named(&client, 2, "a#1", 7);
+        let b0 = inject_named(&client, 3, "b#0", 7);
+        let b1 = inject_named(&client, 4, "b#1", 7);
+        let tun = client
+            .open_stream(Target {
+                host: "t".into(),
+                port: 1,
+            })
+            .await
+            .unwrap();
+        let sid = {
+            let g = client.inner.streams.lock().unwrap();
+            g.values().next().unwrap().id
+        };
+        client.set_sticky(sid, 1);
+        age_rx(&a0, 400);
+        age_rx(&b0, 80);
+        age_rx(&b1, 80);
+        let before_n = client.snapshot().path_down;
+        let before_c = client.snapshot().correlated_silence;
+        let before_m = client.snapshot().migrates_speculative;
+        client.debug_maintain();
+        assert_eq!(
+            client.snapshot().path_down,
+            before_n,
+            "A past down_for must be held when B/C are quiet"
+        );
+        assert_eq!(client.snapshot().correlated_silence, before_c + 1);
+        assert!(client.snapshot().migrates_speculative > before_m);
+        let sticky = client
+            .inner
+            .streams
+            .lock()
+            .unwrap()
+            .get(&sid)
+            .unwrap()
+            .sticky
+            .load(Ordering::Relaxed);
+        assert_eq!(sticky, 2);
+        age_rx(&b0, 400);
+        age_rx(&b1, 400);
+        client.debug_maintain();
+        assert_eq!(client.snapshot().path_down, before_n);
+        assert!(client.inner.paths.lock().unwrap().contains_key(&2));
+        drop(tun);
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn n4_three_quiet_no_down_for_does_not_hold() {
+        let client = Session::new_client(SessionConfig::default());
+        let a0 = inject_named(&client, 1, "a#0", 7);
+        inject_named(&client, 2, "a#1", 7);
+        let b0 = inject_named(&client, 3, "b#0", 7);
+        let b1 = inject_named(&client, 4, "b#1", 7);
+        age_rx(&a0, 80);
+        age_rx(&b0, 80);
+        age_rx(&b1, 80);
+        let before_n = client.snapshot().path_down;
+        let before_c = client.snapshot().correlated_silence;
+        client.debug_maintain();
+        assert_eq!(client.snapshot().path_down, before_n);
+        assert_eq!(
+            client.snapshot().correlated_silence,
+            before_c,
+            "3-of-4 at degrade_for with nobody at down_for must not enter"
+        );
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn n4_quiet_recovers_before_down_for_tears() {
+        let client = Session::new_client(SessionConfig::default());
+        let a0 = inject_named(&client, 1, "a#0", 7);
+        inject_named(&client, 2, "a#1", 7);
+        let b0 = inject_named(&client, 3, "b#0", 7);
+        let b1 = inject_named(&client, 4, "b#1", 7);
+        age_rx(&a0, 80);
+        age_rx(&b0, 80);
+        age_rx(&b1, 80);
+        client.debug_maintain();
+        assert_eq!(client.snapshot().correlated_silence, 0);
+        b0.touch_rx();
+        age_rx(&a0, 400);
+        let before_n = client.snapshot().path_down;
+        client.debug_maintain();
+        assert_eq!(client.snapshot().path_down, before_n + 1);
+        assert!(!client.inner.paths.lock().unwrap().contains_key(&1));
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn n4_correlated_falling_edge_tears_silent() {
+        let client = Session::new_client(SessionConfig::default());
+        let a0 = inject_named(&client, 1, "a#0", 7);
+        inject_named(&client, 2, "a#1", 7);
+        let b0 = inject_named(&client, 3, "b#0", 7);
+        let b1 = inject_named(&client, 4, "b#1", 7);
+        age_rx(&a0, 400);
+        age_rx(&b0, 80);
+        age_rx(&b1, 80);
+        client.debug_maintain();
+        assert_eq!(client.snapshot().correlated_silence, 1);
+        assert!(client.inner.paths.lock().unwrap().contains_key(&1));
+        b1.touch_rx();
+        let before_n = client.snapshot().path_down;
+        client.debug_maintain();
+        assert_eq!(
+            client.snapshot().path_down,
+            before_n + 1,
+            "falling edge must tear A already past down_for"
+        );
+        assert!(!client.inner.paths.lock().unwrap().contains_key(&1));
         client.shutdown();
     }
 

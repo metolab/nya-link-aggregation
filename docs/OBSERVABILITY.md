@@ -331,7 +331,7 @@ goodput = data / wire                    // 重传的 STREAM_DATA 算 data，诚
 | 事件 | 分类 | 说明 |
 | --- | --- | --- |
 | `record_rtt` / EWMA / 每个 Pong | **no** | 10–50ms × N 路径 |
-| class 真正改写 `rtt_class_us`（init freeze / raise / drop 7/8） | init **dbg**；raise/drop **info** `path, old_us, new_us, kind` | 稀有。另：`correlated silence`、`outlier recycle`、`unknown session, will recreate` 也是 **info** |
+| class 真正改写 `rtt_class_us`（init freeze / raise / drop 7/8） | init **dbg**；raise/drop **info** `path, old_us, new_us, kind` | 稀有。raise 是每 hold 一次 7/8。另：`correlated silence`（membership=`degrade_for`，enter 要 `silent>=1`；字段 `quiet`/`silent`/`alive`/`known_quiet`/`budget_ms`）、`outlier recycle`、`unknown session, will recreate` 也是 **info**。50 ms-only 3-of-4 不进 `corr` |
 | `mark_degraded` | **met** `path_degraded` 在 `steer::maintain` 调用处 | PathState 内部不打 |
 | `next_ping` / ping 发出 | **no** 日志；字节走 Q6 `send_frame` | |
 | writer 队列满 | 已由 `frame_send_drop`；**dbg** 当 `urgent` 失败时 `path, urgent=true` | bulk 满是预期，不要 info |
