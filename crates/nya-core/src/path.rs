@@ -56,7 +56,10 @@ pub struct PathState {
     outlier_since: std::sync::Mutex<Option<Instant>>,
     /// First freeze of `rtt_class_us`. Recycle age-gate; never cleared.
     class_known_since: std::sync::Mutex<Option<Instant>>,
-    /// Set on a class-raise store; cleared on a drop store iff `new_us <= fast`.
+    /// Set on a class-raise store or init freeze; cleared on a drop
+    /// store iff `new_us <= fast`. Happy-path freeze (class == fast)
+    /// never catch-up-clears, so production paths keep this until a
+    /// later dip walks class down to fast.
     class_unwind_permit: AtomicBool,
     /// CAS: one failover_ms sample per path.
     pub failover_recorded: AtomicBool,
@@ -335,6 +338,10 @@ impl PathState {
             if n >= 8 {
                 self.rtt_class_us.store(fast, Ordering::Relaxed);
                 self.note_class_known_now();
+                // Class store that may need unwind if later Pongs pull
+                // fast under class (including below class_should_drop).
+                // class == fast here, so permit && fast < class is false.
+                self.class_unwind_permit.store(true, Ordering::Relaxed);
                 tracing::debug!(
                     path = %self.name,
                     old_us = 0u64,
@@ -974,8 +981,8 @@ mod tests {
         assert!(p.class_known());
         assert!(p.class_known_since_for_test().is_some());
         assert!(
-            !p.class_unwind_permit_for_test(),
-            "init freeze is not a raise"
+            p.class_unwind_permit_for_test(),
+            "init freeze is a class store that may need unwind"
         );
     }
 
@@ -1163,5 +1170,111 @@ mod tests {
             220_000,
             "after catch-up, 220 vs 180 must not drop"
         );
+    }
+
+    #[test]
+    fn init_permit_walks_below_class_drop_floor() {
+        let p = path();
+        p.stable_up_hold_us.store(0, Ordering::Relaxed);
+        for _ in 0..8 {
+            p.record_rtt(Duration::from_millis(14));
+        }
+        assert_eq!(p.rtt_class_us.load(Ordering::Relaxed), 14_000);
+        assert!(p.class_unwind_permit_for_test());
+        assert!(
+            !Tuning::STANDARD.class_should_drop(14_000, 7_000),
+            "14 vs 7 is under the 8ms floor; 15 vs 7 would already drop"
+        );
+        p.rtt_ewma_us.store(7_000, Ordering::Relaxed);
+        p.rtt_stable_us.store(7_000, Ordering::Relaxed);
+        p.record_rtt(Duration::from_millis(7));
+        assert_eq!(p.rtt_class_us.load(Ordering::Relaxed), 13_125);
+        assert!(p.class_unwind_permit_for_test());
+        p.record_rtt(Duration::from_millis(7));
+        assert_eq!(p.rtt_class_us.load(Ordering::Relaxed), 12_359);
+        assert!(
+            p.class_unwind_permit_for_test(),
+            "12359 > 7000 is not catch-up"
+        );
+    }
+
+    #[test]
+    fn init_permit_clears_when_seven_eighths_meets_fast() {
+        let p = path();
+        p.stable_up_hold_us.store(0, Ordering::Relaxed);
+        for _ in 0..8 {
+            p.record_rtt(Duration::from_millis(14));
+        }
+        assert!(p.class_unwind_permit_for_test());
+        p.rtt_ewma_us.store(7_000, Ordering::Relaxed);
+        p.rtt_stable_us.store(7_000, Ordering::Relaxed);
+        assert!(!Tuning::STANDARD.class_should_drop(14_000, 7_000));
+        let mut n = 0;
+        while p.rtt_class_us.load(Ordering::Relaxed) > 7_000 {
+            p.record_rtt(Duration::from_millis(7));
+            n += 1;
+            assert!(n < 200, "catch-up must finish well before 200 holds");
+        }
+        assert_eq!(p.rtt_class_us.load(Ordering::Relaxed), 7_000);
+        assert!(
+            !p.class_unwind_permit_for_test(),
+            "new_us == fast must clear permit after init walk"
+        );
+        p.rtt_class_us.store(180_000, Ordering::Relaxed);
+        p.rtt_ewma_us.store(140_000, Ordering::Relaxed);
+        p.rtt_stable_us.store(180_000, Ordering::Relaxed);
+        p.record_rtt(Duration::from_millis(140));
+        assert_eq!(
+            p.rtt_class_us.load(Ordering::Relaxed),
+            180_000,
+            "after init catch-up, 140 vs 180 must not drop"
+        );
+        p.rtt_class_us.store(220_000, Ordering::Relaxed);
+        p.rtt_ewma_us.store(180_000, Ordering::Relaxed);
+        p.record_rtt(Duration::from_millis(180));
+        assert_eq!(
+            p.rtt_class_us.load(Ordering::Relaxed),
+            220_000,
+            "after init catch-up, 220 vs 180 must not drop"
+        );
+    }
+
+    #[test]
+    fn init_freeze_equal_fast_does_not_drop() {
+        let p = path();
+        p.stable_up_hold_us.store(0, Ordering::Relaxed);
+        for _ in 0..8 {
+            p.record_rtt(Duration::from_millis(10));
+        }
+        assert_eq!(p.rtt_class_us.load(Ordering::Relaxed), 10_000);
+        assert!(p.class_unwind_permit_for_test());
+        p.record_rtt(Duration::from_millis(10));
+        assert_eq!(
+            p.rtt_class_us.load(Ordering::Relaxed),
+            10_000,
+            "identical extra sample must not 7/8 at freeze"
+        );
+        assert!(p.class_unwind_permit_for_test());
+    }
+
+    #[test]
+    fn init_then_jitter_low_tail_does_drop() {
+        let p = path();
+        p.stable_up_hold_us.store(0, Ordering::Relaxed);
+        for _ in 0..8 {
+            p.record_rtt(Duration::from_millis(180));
+        }
+        assert_eq!(p.rtt_class_us.load(Ordering::Relaxed), 180_000);
+        assert!(p.class_unwind_permit_for_test());
+        assert!(!Tuning::STANDARD.class_should_drop(180_000, 140_000));
+        p.rtt_ewma_us.store(140_000, Ordering::Relaxed);
+        p.rtt_stable_us.store(140_000, Ordering::Relaxed);
+        p.record_rtt(Duration::from_millis(140));
+        assert_eq!(
+            p.rtt_class_us.load(Ordering::Relaxed),
+            175_000,
+            "production init permit must chase 180→140; poke-class tests do not"
+        );
+        assert!(p.class_unwind_permit_for_test());
     }
 }

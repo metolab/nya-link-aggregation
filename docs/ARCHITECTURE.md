@@ -60,7 +60,7 @@ PSK 证明「谁能加入这条会话」；pin 证明「TLS 对端是这张证�
 
 - **fast RTT**：近期 EWMA，用于打分和瞬时判断
 - **stable RTT**：更慢抬升，给 loss / down 时钟用，避免尖刺拆 TCP
-- **class RTT**：调度用的 class 成员资格；相对 fast 过时偏高时让位。raise 仍是 hold 后一次 7/8；raise store 置 unwind permit；fast < class 时每 hold 一次 7/8；仅当这次 drop store 的 new_us ≤ fast 才清 permit（整数 7/8 追上 fast）。EWMA 从尖刺回落到 (class, 2×class] 死区时 permit 保持。未 raise 过的路径仍走 0.25/8 ms 门。timeout-stable 仍不是这套时钟。DEGRADED 仍探活（在途 Ping 最多一条）。尖刺时不跟着每 ping 跳 class
+- **class RTT**：调度用的 class 成员资格；相对 fast 过时偏高时让位。raise 仍是 hold 后一次 7/8；raise store 与 init freeze 都置 unwind permit。完成 init 的生产路径 permit 为真，直到某次 drop store 的 new_us ≤ fast 才清；happy-path freeze（class==fast）不会 catch-up 清 permit，故 `permit && fast < class` 在会话剩余时间绕过 0.25/8 ms 门。fast < class 时每 hold 一次 7/8。EWMA 从尖刺回落到 (class, 2×class] 死区时 permit 保持。仅 poke class 的测试、以及已经 catch-up 清 permit 的路径仍走 0.25/8 ms 门。timeout-stable 仍不是这套时钟。DEGRADED 仍探活（在途 Ping 最多一条）。尖刺时不跟着每 ping 跳 class
 
 超时由 `Tuning` 从 stable RTT 推出来，再夹紧：
 
