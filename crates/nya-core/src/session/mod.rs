@@ -26,7 +26,7 @@ use crate::metrics::{
     LIFETIME_MS_BOUNDS, STALL_MS_BOUNDS,
 };
 use crate::path::{spawn_path_io, PathState, STATE_DOWN};
-use crate::scheduler::{backup_prefer_class, pick_path_pref, PickPref};
+use crate::scheduler::{backup_prefer_class, pick_path_pref, pick_path_pref_spread, PickPref};
 use crate::stream::{StreamState, Unacked};
 
 pub use crate::stream::TunnelStream;
@@ -63,6 +63,7 @@ pub(crate) struct Inner {
     dead: AtomicBool,
     dead_notify: Notify,
     all_down_since: Mutex<Option<Instant>>,
+    correlated_since: Mutex<Option<Instant>>,
     metrics: Counters,
     process: Arc<ProcessCounters>,
     last_rtt_us: Mutex<HashMap<String, u64>>,
@@ -104,6 +105,7 @@ impl Session {
             dead: AtomicBool::new(false),
             dead_notify: Notify::new(),
             all_down_since: Mutex::new(None),
+            correlated_since: Mutex::new(None),
             metrics: Counters::default(),
             process,
             last_rtt_us: Mutex::new(HashMap::new()),
@@ -324,6 +326,11 @@ impl Session {
     fn pick_pref(&self, pref: PickPref) -> Option<u32> {
         let paths = self.path_list();
         pick_path_pref(&paths, &self.inner.cfg, pref)
+    }
+
+    fn pick_pref_spread(&self, pref: PickPref, stream_id: u32) -> Option<u32> {
+        let paths = self.path_list();
+        pick_path_pref_spread(&paths, &self.inner.cfg, pref, stream_id)
     }
 
     fn ensure_sticky(&self, stream_id: u32) -> Option<u32> {
@@ -675,6 +682,24 @@ impl Session {
     pub fn snapshot(&self) -> Snapshot {
         let paths = self.path_list();
         let mut snap = self.inner.metrics.snap_with_paths(&paths);
+        let min_class = snap
+            .paths
+            .iter()
+            .filter(|p| p.rtt_known)
+            .map(|p| p.class_rtt_us)
+            .min();
+        if let Some(min) = min_class {
+            for p in &mut snap.paths {
+                if !p.rtt_known {
+                    continue;
+                }
+                p.backup = crate::health::is_backup(
+                    &self.inner.cfg,
+                    Duration::from_micros(p.class_rtt_us),
+                    Duration::from_micros(min),
+                );
+            }
+        }
         let (held, live, sample) = self.stream_snaps();
         snap.streams = sample;
         snap.streams_held = held;
@@ -1702,10 +1727,15 @@ mod tests {
     }
 
     fn inject_known_path(client: &Session, id: u32) -> Arc<PathState> {
+        inject_named(client, id, &format!("t#{id}"), 7)
+    }
+
+    fn inject_named(client: &Session, id: u32, name: &str, rtt_ms: u64) -> Arc<PathState> {
         let (tx, _rx) = mpsc::channel(8);
-        let p = PathState::new(id, format!("t#{id}"), tx);
-        p.rtt_ewma_us.store(7_000, Ordering::Relaxed);
-        p.rtt_stable_us.store(7_000, Ordering::Relaxed);
+        let p = PathState::new(id, name.into(), tx);
+        p.rtt_ewma_us.store(rtt_ms * 1000, Ordering::Relaxed);
+        p.rtt_stable_us.store(rtt_ms * 1000, Ordering::Relaxed);
+        p.rtt_class_us.store(rtt_ms * 1000, Ordering::Relaxed);
         client.inner.paths.lock().unwrap().insert(id, p.clone());
         p
     }
@@ -1749,6 +1779,239 @@ mod tests {
         let before = client.snapshot().path_degraded;
         client.debug_maintain();
         assert_eq!(client.snapshot().path_degraded, before + 1);
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn sequential_open_spreads_sticky() {
+        let client = Session::new_client(SessionConfig::default());
+        inject_named(&client, 1, "a#0", 7);
+        inject_named(&client, 2, "a#1", 7);
+        inject_named(&client, 3, "b#0", 7);
+        inject_named(&client, 4, "b#1", 7);
+        let mut tuns = Vec::new();
+        for _ in 0..8 {
+            tuns.push(
+                client
+                    .open_stream(Target {
+                        host: "t".into(),
+                        port: 1,
+                    })
+                    .await
+                    .unwrap(),
+            );
+        }
+        let stickies: Vec<u32> = client
+            .inner
+            .streams
+            .lock()
+            .unwrap()
+            .values()
+            .map(|st| st.sticky.load(Ordering::Relaxed))
+            .filter(|id| *id != 0)
+            .collect();
+        let uniq: std::collections::BTreeSet<_> = stickies.iter().copied().collect();
+        assert!(
+            uniq.len() >= 2,
+            "zero-load sequential opens must spread, stickies={stickies:?}"
+        );
+        drop(tuns);
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn single_path_silence_still_downs_without_degraded() {
+        let client = Session::new_client(SessionConfig::default());
+        let p = inject_known_path(&client, 1);
+        age_rx(&p, 400);
+        let before_d = client.snapshot().path_degraded;
+        let before_n = client.snapshot().path_down;
+        client.debug_maintain();
+        assert_eq!(client.snapshot().path_degraded, before_d);
+        assert_eq!(client.snapshot().path_down, before_n + 1);
+        assert!(!client.inner.paths.lock().unwrap().contains_key(&1));
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn n2_both_silent_tears() {
+        let client = Session::new_client(SessionConfig::default());
+        let a = inject_named(&client, 1, "a#0", 7);
+        let b = inject_named(&client, 2, "b#0", 7);
+        age_rx(&a, 400);
+        age_rx(&b, 400);
+        let before_d = client.snapshot().path_degraded;
+        let before_n = client.snapshot().path_down;
+        client.debug_maintain();
+        assert_eq!(client.snapshot().path_degraded, before_d);
+        assert_eq!(client.snapshot().path_down, before_n + 2);
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn n2_one_silent_downs() {
+        let client = Session::new_client(SessionConfig::default());
+        let a = inject_named(&client, 1, "a#0", 7);
+        inject_named(&client, 2, "b#0", 7);
+        age_rx(&a, 400);
+        let before_d = client.snapshot().path_degraded;
+        let before_n = client.snapshot().path_down;
+        client.debug_maintain();
+        assert_eq!(client.snapshot().path_degraded, before_d);
+        assert_eq!(client.snapshot().path_down, before_n + 1);
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn n4_three_silent_migrates_without_path_down() {
+        let client = Session::new_client(SessionConfig::default());
+        let a0 = inject_named(&client, 1, "a#0", 7);
+        inject_named(&client, 2, "a#1", 7);
+        let b0 = inject_named(&client, 3, "b#0", 7);
+        let b1 = inject_named(&client, 4, "b#1", 7);
+        let tun = client
+            .open_stream(Target {
+                host: "t".into(),
+                port: 1,
+            })
+            .await
+            .unwrap();
+        let sid = {
+            let g = client.inner.streams.lock().unwrap();
+            g.values().next().unwrap().id
+        };
+        client.set_sticky(sid, 1);
+        age_rx(&a0, 400);
+        age_rx(&b0, 400);
+        age_rx(&b1, 400);
+        let before_n = client.snapshot().path_down;
+        let before_m = client.snapshot().migrates_speculative;
+        client.debug_maintain();
+        assert_eq!(client.snapshot().path_down, before_n);
+        assert!(client.snapshot().migrates_speculative > before_m);
+        let sticky = client
+            .inner
+            .streams
+            .lock()
+            .unwrap()
+            .get(&sid)
+            .unwrap()
+            .sticky
+            .load(Ordering::Relaxed);
+        assert_eq!(sticky, 2);
+        drop(tun);
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn n4_all_silent_tears() {
+        let client = Session::new_client(SessionConfig::default());
+        let ps: Vec<_> = (1..=4)
+            .map(|i| inject_named(&client, i, &format!("p{i}"), 7))
+            .collect();
+        for p in &ps {
+            age_rx(p, 400);
+        }
+        let before_d = client.snapshot().path_degraded;
+        let before_n = client.snapshot().path_down;
+        client.debug_maintain();
+        assert_eq!(client.snapshot().path_degraded, before_d);
+        assert_eq!(client.snapshot().path_down, before_n + 4);
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn unknown_rtt_still_tears() {
+        let client = Session::new_client(SessionConfig::default());
+        let (tx, _rx) = mpsc::channel(8);
+        let p = PathState::new(1, "a#0".into(), tx);
+        client.inner.paths.lock().unwrap().insert(1, p.clone());
+        inject_named(&client, 2, "b#0", 7);
+        age_rx(&p, 600);
+        let before_n = client.snapshot().path_down;
+        client.debug_maintain();
+        assert_eq!(client.snapshot().path_down, before_n + 1);
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn correlated_budget_tears_silent_keeps_up() {
+        let cfg = SessionConfig {
+            all_down_timeout: Duration::ZERO,
+            ..SessionConfig::default()
+        };
+        let client = Session::new_client(cfg);
+        let a0 = inject_named(&client, 1, "a#0", 7);
+        inject_named(&client, 2, "a#1", 7);
+        let b0 = inject_named(&client, 3, "b#0", 7);
+        let b1 = inject_named(&client, 4, "b#1", 7);
+        age_rx(&a0, 400);
+        age_rx(&b0, 400);
+        age_rx(&b1, 400);
+        let before_n = client.snapshot().path_down;
+        client.debug_maintain();
+        assert_eq!(client.snapshot().path_down, before_n + 3);
+        assert!(client.inner.paths.lock().unwrap().contains_key(&2));
+        assert_eq!(client.snapshot().session_all_down_resets, 0);
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn outlier_recycle_same_link_client() {
+        let mut cfg = SessionConfig::default();
+        cfg.tuning.stable_up_hold = Duration::ZERO;
+        let client = Session::new_client(cfg);
+        let bad = inject_named(&client, 1, "soy#0", 7);
+        bad.rtt_class_us.store(227_000, Ordering::Relaxed);
+        bad.stable_up_hold_us
+            .store(1_000_000_000, Ordering::Relaxed);
+        inject_named(&client, 2, "soy#1", 7);
+        inject_named(&client, 3, "akcdn#0", 7);
+        let before = client.snapshot().path_outlier_recycle;
+        client.debug_maintain();
+        assert_eq!(client.snapshot().path_outlier_recycle, before + 1);
+        assert!(!client.inner.paths.lock().unwrap().contains_key(&1));
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn outlier_recycle_not_on_server() {
+        let mut cfg = SessionConfig::default();
+        cfg.tuning.stable_up_hold = Duration::ZERO;
+        let (server, _inc) = Session::new_server(cfg);
+        let bad = inject_named(&server, 1, "soy#0", 7);
+        bad.rtt_class_us.store(227_000, Ordering::Relaxed);
+        inject_named(&server, 2, "soy#1", 7);
+        server.debug_maintain();
+        assert_eq!(server.snapshot().path_outlier_recycle, 0);
+        assert!(server.inner.paths.lock().unwrap().contains_key(&1));
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn outlier_recycle_ignores_other_link() {
+        let mut cfg = SessionConfig::default();
+        cfg.tuning.stable_up_hold = Duration::ZERO;
+        let client = Session::new_client(cfg);
+        let slow = inject_named(&client, 1, "far#0", 227);
+        slow.rtt_class_us.store(227_000, Ordering::Relaxed);
+        inject_named(&client, 2, "near#0", 7);
+        client.debug_maintain();
+        assert_eq!(client.snapshot().path_outlier_recycle, 0);
+        assert!(client.inner.paths.lock().unwrap().contains_key(&1));
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn snapshot_marks_backup_flag() {
+        let client = Session::new_client(SessionConfig::default());
+        inject_named(&client, 1, "a#0", 7);
+        inject_named(&client, 2, "b#0", 80);
+        let snap = client.snapshot();
+        let a = snap.paths.iter().find(|p| p.name == "a#0").unwrap();
+        let b = snap.paths.iter().find(|p| p.name == "b#0").unwrap();
+        assert!(!a.backup);
+        assert!(b.backup);
         client.shutdown();
     }
 

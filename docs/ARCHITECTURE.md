@@ -52,7 +52,7 @@ TLS framed IO                 对端 session::handle_frame
 
 PSK 证明「谁能加入这条会话」；pin 证明「TLS 对端是这张证书」。二者缺一不可。
 
-路径名在客户端是 `{link.name}#{i}`，例如 `a#0`、`a#1`。创建会话的那条路径在服务端记为 `init`。
+路径名在客户端是 `{link.name}#{i}`，例如 `a#0`、`a#1`。`CreateSession` 带同样的名字；旧客户端省略该字段时服务端才回落到 `init`。
 
 ## 路径与健康
 
@@ -73,7 +73,7 @@ PSK 证明「谁能加入这条会话」；pin 证明「TLS 对端是这张证�
 | failback 同类 | `max(8ms, 0.45×更好路径 RTT)` | 同 class 内要差这么多才迁回 |
 | failback 跨 class | 当前 ≥ 更好 × 1.5 + 8ms | 明显更好的 class 才 Upgrade |
 
-路径还有 alive / degraded / down。全部 down 超过 `all_down_timeout` 则拆会话。客户端链路监督协程按指数退避重连（200ms–2s）。
+路径还有 alive / degraded / down。全部 down 超过 `all_down_timeout` 则拆会话。N≥3 且恰好 N−1 条静默时，把静默路径标 degraded、暂缓 `path_failed`（预算仍是 `all_down_timeout`），避免对端短卡时集体拆 TCP。全员静默仍按 `down_for` 拆。客户端链路监督协程按指数退避重连（200ms–2s）。同链路 TCP 相对姐妹连接已是 backup 且持续 `stable_up_hold` 时，客户端主动拆掉重拨。
 
 ## 调度
 
@@ -102,9 +102,9 @@ HOL 隔离靠「每链路多连接 + 姐妹优先 backup」，不是按 ISP 钉�
 
 ## 可观测性
 
-`Counters` 挂在每个 `Session` 上，进程边缘（入站 / 出站 / 握手 / 重连）走 `ProcessCounters`（始终在 `Inner` 上）。默认每 10s 一条 `nya_core::obs` snapshot；`[obs].metrics_listen` 默认关。决策点（pick / migrate / failback / HOL）是结构化 `debug!`。热路径（STREAM_DATA / ACK / Ping）不打日志。可选 OTLP 在独立 crate `nya-obs`（只从二进制 `main` 安装）；名字来自 `visit_metrics` 一份 catalog。
+`Counters` 挂在每个 `Session` 上，进程边缘（入站 / 出站 / 握手 / 重连）走 `ProcessCounters`（始终在 `Inner` 上）。默认每 10s 一条 `nya_core::obs` snapshot；`[obs].metrics_listen` 默认关。info 计分卡带 `mig`/`hol`/`hedge`/`rtx`/`fb_slink`/`picks_unk`/`recycle`/`corr`；决策点（pick / migrate / failback / HOL）仍是结构化 `debug!`。class raise/drop、correlated silence、outlier recycle、unknown-session recreate 走 **info**。热路径（STREAM_DATA / ACK / Ping）不打日志。可选 OTLP 在独立 crate `nya-obs`（只从二进制 `main` 安装）；名字来自 `visit_metrics` 一份 catalog。
 
-线路状态按 `link_key` 汇总（`a#0`/`a#1` → `a`）：up/deg 连接数、RTT 范围、sticky、inflight、队列、rx 新鲜/最旧。迁移原因拆成 speculative / path_down / ensure_sticky / send_blocked；另有 retransmit/hedge、probe_miss、未知 RTT pick。snapshot 带压缩 `streams=`（不进 Prometheus 标签）。
+线路状态按 `link_key` 汇总（`a#0`/`a#1` → `a`）：up/deg 连接数、RTT 范围、sticky、inflight、队列、rx 新鲜/最旧。`paths=` 可带 ` bak`。迁移原因拆成 speculative / path_down / ensure_sticky / send-blocked；另有 retransmit/hedge、probe_miss、未知 RTT pick。snapshot 带压缩 `streams=`（不进 Prometheus 标签）。
 
 业务计分卡：流完成比、send-unacked ∪ recv-hole stall、每路径一次 `failover_ms`（`last_rx_ago`）、跨 link `failbacks`、overlay goodput（`path.rs::send_frame` / decode）。e2e SLA 仍用应用 ping；overlay p99 只进 notes。见 [OBSERVABILITY.md](OBSERVABILITY.md)。
 

@@ -263,7 +263,7 @@ mod tests {
         let exp = export_from_client(&tls).unwrap();
         let sid = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            client_create_session(&mut tls, b"psk", &exp, "default"),
+            client_create_session(&mut tls, b"psk", &exp, "default", "a#0"),
         )
         .await
         .expect("client handshake timed out")
@@ -317,7 +317,7 @@ mod tests {
         let exp = export_from_client(&tls).unwrap();
         let sid = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            client_create_session(&mut tls, b"psk", &exp, "default"),
+            client_create_session(&mut tls, b"psk", &exp, "default", "a#0"),
         )
         .await
         .expect("client handshake timed out")

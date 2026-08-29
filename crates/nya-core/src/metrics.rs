@@ -153,6 +153,8 @@ pub struct Counters {
     pub path_added: AtomicU64,
     pub path_down: AtomicU64,
     pub path_degraded: AtomicU64,
+    pub path_outlier_recycle: AtomicU64,
+    pub correlated_silence: AtomicU64,
     pub migrates: AtomicU64,
     pub migrates_speculative: AtomicU64,
     pub migrates_path_down: AtomicU64,
@@ -196,6 +198,8 @@ impl Default for Counters {
             path_added: AtomicU64::new(0),
             path_down: AtomicU64::new(0),
             path_degraded: AtomicU64::new(0),
+            path_outlier_recycle: AtomicU64::new(0),
+            correlated_silence: AtomicU64::new(0),
             migrates: AtomicU64::new(0),
             migrates_speculative: AtomicU64::new(0),
             migrates_path_down: AtomicU64::new(0),
@@ -252,6 +256,7 @@ pub struct PathSnap {
     pub pending_ping: u64,
     pub queued_urgent: u64,
     pub queued_bulk: u64,
+    pub backup: bool,
 }
 
 /// Named WAN link (`a` / `b`), rolled up from its TCP connections (`a#0`, `a#1`).
@@ -365,6 +370,8 @@ pub struct Snapshot {
     pub path_added: u64,
     pub path_down: u64,
     pub path_degraded: u64,
+    pub path_outlier_recycle: u64,
+    pub correlated_silence: u64,
     pub migrates: u64,
     pub migrates_speculative: u64,
     pub migrates_path_down: u64,
@@ -413,6 +420,8 @@ impl Snapshot {
         self.path_added += other.path_added;
         self.path_down += other.path_down;
         self.path_degraded += other.path_degraded;
+        self.path_outlier_recycle += other.path_outlier_recycle;
+        self.correlated_silence += other.correlated_silence;
         self.migrates += other.migrates;
         self.migrates_speculative += other.migrates_speculative;
         self.migrates_path_down += other.migrates_path_down;
@@ -458,6 +467,8 @@ impl Counters {
             path_added: self.path_added.load(Ordering::Relaxed),
             path_down: self.path_down.load(Ordering::Relaxed),
             path_degraded: self.path_degraded.load(Ordering::Relaxed),
+            path_outlier_recycle: self.path_outlier_recycle.load(Ordering::Relaxed),
+            correlated_silence: self.correlated_silence.load(Ordering::Relaxed),
             migrates: self.migrates.load(Ordering::Relaxed),
             migrates_speculative: self.migrates_speculative.load(Ordering::Relaxed),
             migrates_path_down: self.migrates_path_down.load(Ordering::Relaxed),
@@ -513,6 +524,7 @@ impl Counters {
                     pending_ping: p.pending_ping_count(),
                     queued_urgent: p.queued_urgent(),
                     queued_bulk: p.queued_bulk(),
+                    backup: false,
                 })
                 .collect(),
             links: Vec::new(),

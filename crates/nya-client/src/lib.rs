@@ -15,7 +15,7 @@ use tracing::{info, warn, Instrument};
 
 use nya_core::{
     client_create_session, client_join_session, connect_pinned, export_from_client, parse_pin_hex,
-    spawn_obs_session, Session,
+    spawn_obs_session, HandshakeError, Session,
 };
 use nya_proto::SESSION_ID_LEN;
 
@@ -43,6 +43,20 @@ impl SessionJoin {
 
     fn set_id(&self, sid: [u8; SESSION_ID_LEN]) {
         *self.id.lock().unwrap() = Some(sid);
+    }
+
+    /// Forget `sid` only if it is still the stored id. A late unknown-session
+    /// Join must not clobber a newer Create.
+    fn clear_if(&self, sid: [u8; SESSION_ID_LEN]) -> bool {
+        let mut g = self.id.lock().unwrap();
+        if *g == Some(sid) {
+            *g = None;
+            self.creating.store(false, Ordering::SeqCst);
+            self.ready.notify_waiters();
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -194,7 +208,8 @@ async fn connect_one(
             );
             match tokio::time::timeout(
                 hs,
-                client_create_session(&mut tls, psk, &exporter, "default").instrument(span.clone()),
+                client_create_session(&mut tls, psk, &exporter, "default", path_name)
+                    .instrument(span.clone()),
             )
             .await
             {
@@ -247,6 +262,12 @@ async fn connect_one(
                 Ok(Err(e)) => {
                     span.record("otel.status_code", "ERROR");
                     session.process().inc_handshake_fail(&e);
+                    if matches!(e, HandshakeError::UnknownSession) {
+                        if join.clear_if(sid) {
+                            info!(path = %path_name, "unknown session, will recreate");
+                        }
+                        return Err(anyhow::anyhow!("unknown session"));
+                    }
                     return Err(anyhow::anyhow!("join: {e}"));
                 }
                 Err(_) => {
@@ -272,4 +293,36 @@ async fn connect_one(
         .fetch_add(1, Ordering::Relaxed);
     session.add_path(path_name.to_string(), tls).await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clear_if_matching_sid_forgets_and_allows_create() {
+        let join = SessionJoin::new();
+        let sid = [7u8; SESSION_ID_LEN];
+        join.set_id(sid);
+        join.creating.store(true, Ordering::SeqCst);
+        assert!(join.clear_if(sid));
+        assert!(join.get_id().is_none());
+        assert!(!join.creating.load(Ordering::SeqCst));
+        assert!(join
+            .creating
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok());
+    }
+
+    #[test]
+    fn clear_if_other_sid_is_noop() {
+        let join = SessionJoin::new();
+        let keep = [1u8; SESSION_ID_LEN];
+        let stale = [2u8; SESSION_ID_LEN];
+        join.set_id(keep);
+        join.creating.store(true, Ordering::SeqCst);
+        assert!(!join.clear_if(stale));
+        assert_eq!(join.get_id(), Some(keep));
+        assert!(join.creating.load(Ordering::SeqCst));
+    }
 }

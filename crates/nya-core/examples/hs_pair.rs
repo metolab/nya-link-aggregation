@@ -51,7 +51,7 @@ async fn main() {
             eprintln!("tls connected, creating session");
             let sid = tokio::time::timeout(
                 std::time::Duration::from_secs(2),
-                client_create_session(&mut tls, b"smoke-psk", &exp, "default"),
+                client_create_session(&mut tls, b"smoke-psk", &exp, "default", "a#0"),
             )
             .await
             .expect("timeout")

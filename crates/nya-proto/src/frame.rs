@@ -97,6 +97,8 @@ pub struct CreateSession {
     pub user_id: String,
     pub nonce: [u8; NONCE_LEN],
     pub proof: [u8; PROOF_LEN],
+    /// Optional. Empty when an old peer omitted the trailing field.
+    pub path_name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -201,6 +203,7 @@ impl Frame {
                 put_str(&mut o, &c.user_id);
                 o.extend_from_slice(&c.nonce);
                 o.extend_from_slice(&c.proof);
+                put_str(&mut o, &c.path_name);
             }
             Frame::CreateSessionOk(c) => {
                 o.push(T_CREATE_OK);
@@ -271,11 +274,17 @@ impl Frame {
                 nonce.copy_from_slice(p.bytes(NONCE_LEN)?);
                 let mut proof = [0u8; PROOF_LEN];
                 proof.copy_from_slice(p.bytes(PROOF_LEN)?);
+                let path_name = if p.rest().is_empty() {
+                    String::new()
+                } else {
+                    p.str()?
+                };
                 Frame::CreateSession(CreateSession {
                     version,
                     user_id,
                     nonce,
                     proof,
+                    path_name,
                 })
             }
             T_CREATE_OK => {
@@ -446,7 +455,37 @@ mod tests {
             user_id: "default".into(),
             nonce: [3u8; NONCE_LEN],
             proof: [9u8; PROOF_LEN],
+            path_name: "soy#0".into(),
         }));
+    }
+
+    #[test]
+    fn create_session_old_bytes_have_empty_path_name() {
+        let mut o = Vec::new();
+        o.push(T_CREATE);
+        o.push(crate::PROTOCOL_VERSION);
+        put_str(&mut o, "default");
+        o.extend_from_slice(&[3u8; NONCE_LEN]);
+        o.extend_from_slice(&[9u8; PROOF_LEN]);
+        match Frame::decode(&o).unwrap() {
+            Frame::CreateSession(c) => {
+                assert_eq!(c.user_id, "default");
+                assert!(c.path_name.is_empty());
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_session_one_byte_tail_is_truncated() {
+        let mut o = Vec::new();
+        o.push(T_CREATE);
+        o.push(crate::PROTOCOL_VERSION);
+        put_str(&mut o, "default");
+        o.extend_from_slice(&[3u8; NONCE_LEN]);
+        o.extend_from_slice(&[9u8; PROOF_LEN]);
+        o.push(0x00);
+        assert!(matches!(Frame::decode(&o), Err(ProtoError::Truncated)));
     }
 
     #[test]

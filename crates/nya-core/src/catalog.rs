@@ -119,6 +119,16 @@ pub fn visit_metrics(ps: &ProcessSnapshot, sink: &mut impl MetricSink) {
         "paths marked degraded",
         s.path_degraded,
     );
+    sink.counter(
+        "nya_path_outlier_recycle_total",
+        "same-link outlier TCP recycles",
+        s.path_outlier_recycle,
+    );
+    sink.counter(
+        "nya_correlated_silence_total",
+        "correlated-silence episodes",
+        s.correlated_silence,
+    );
     sink.counter("nya_migrates_total", "stream resticks", s.migrates);
     sink.counter(
         "nya_migrates_speculative_total",

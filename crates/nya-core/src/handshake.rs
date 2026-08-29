@@ -26,6 +26,7 @@ pub async fn client_create_session<T: AsyncRead + AsyncWrite + Unpin>(
     psk: &[u8],
     exporter: &[u8],
     user_id: &str,
+    path_name: &str,
 ) -> Result<[u8; SESSION_ID_LEN], HandshakeError> {
     let mut nonce = [0u8; NONCE_LEN];
     rand::thread_rng().fill_bytes(&mut nonce);
@@ -37,6 +38,7 @@ pub async fn client_create_session<T: AsyncRead + AsyncWrite + Unpin>(
             user_id: user_id.to_string(),
             nonce,
             proof,
+            path_name: path_name.to_string(),
         }),
     )
     .await?;
@@ -44,6 +46,9 @@ pub async fn client_create_session<T: AsyncRead + AsyncWrite + Unpin>(
     tokio::task::yield_now().await;
     match read_frame(io).await? {
         Frame::CreateSessionOk(ok) => Ok(ok.session_id),
+        Frame::HandshakeErr(e) if e.message == "unknown session" => {
+            Err(HandshakeError::UnknownSession)
+        }
         Frame::HandshakeErr(e) => Err(HandshakeError::Rejected(e.message)),
         _ => Err(HandshakeError::Unexpected),
     }
@@ -70,6 +75,9 @@ pub async fn client_join_session<T: AsyncRead + AsyncWrite + Unpin>(
     tokio::task::yield_now().await;
     match read_frame(io).await? {
         Frame::JoinSessionOk(_) => Ok(()),
+        Frame::HandshakeErr(e) if e.message == "unknown session" => {
+            Err(HandshakeError::UnknownSession)
+        }
         Frame::HandshakeErr(e) => Err(HandshakeError::Rejected(e.message)),
         _ => Err(HandshakeError::Unexpected),
     }
@@ -131,11 +139,16 @@ pub async fn server_accept_handshake<T: AsyncRead + AsyncWrite + Unpin>(
             };
             write_frame(io, &Frame::CreateSessionOk(CreateSessionOk { session_id })).await?;
             tracing::debug!("create-session ok written");
+            let path_name = if c.path_name.is_empty() {
+                "init".into()
+            } else {
+                c.path_name
+            };
             Ok(HandshakeResult::Created {
                 session,
                 session_id,
                 incoming,
-                path_name: "init".into(),
+                path_name,
             })
         }
         Frame::JoinSession(j) => {
@@ -201,7 +214,7 @@ mod tests {
         };
 
         let client = async {
-            let sid = client_create_session(&mut c0, psk, &exp, "default")
+            let sid = client_create_session(&mut c0, psk, &exp, "default", "soy#0")
                 .await
                 .unwrap();
             client_join_session(&mut c1, psk, &exp, sid, "b")
@@ -213,11 +226,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_uses_client_path_name() {
+        let psk = b"psk";
+        let exp = [7u8; 32];
+        let table = SessionTable::new(SessionConfig::default());
+        let (mut c0, mut s0) = duplex(16 * 1024);
+        let server = async {
+            let a = server_accept_handshake(&mut s0, psk, &exp, &table)
+                .await
+                .unwrap();
+            match a {
+                HandshakeResult::Created {
+                    path_name, session, ..
+                } => {
+                    assert_eq!(path_name, "soy#0");
+                    session.shutdown();
+                }
+                _ => panic!("expected create"),
+            }
+        };
+        let client = async {
+            client_create_session(&mut c0, psk, &exp, "default", "soy#0")
+                .await
+                .unwrap();
+        };
+        tokio::join!(server, client);
+    }
+
+    #[tokio::test]
+    async fn empty_path_name_falls_back_to_init() {
+        let psk = b"psk";
+        let exp = [7u8; 32];
+        let table = SessionTable::new(SessionConfig::default());
+        let (mut c0, mut s0) = duplex(16 * 1024);
+        let server = async {
+            let a = server_accept_handshake(&mut s0, psk, &exp, &table)
+                .await
+                .unwrap();
+            match a {
+                HandshakeResult::Created {
+                    path_name, session, ..
+                } => {
+                    assert_eq!(path_name, "init");
+                    session.shutdown();
+                }
+                _ => panic!("expected create"),
+            }
+        };
+        let client = async {
+            client_create_session(&mut c0, psk, &exp, "default", "")
+                .await
+                .unwrap();
+        };
+        tokio::join!(server, client);
+    }
+
+    #[tokio::test]
+    async fn join_unknown_session_is_unknown_session() {
+        let psk = b"psk";
+        let exp = [7u8; 32];
+        let table = SessionTable::new(SessionConfig::default());
+        let (mut c, mut s) = duplex(16 * 1024);
+        let server = server_accept_handshake(&mut s, psk, &exp, &table);
+        let client = client_join_session(&mut c, psk, &exp, [1u8; 16], "a#0");
+        let (sr, cr) = tokio::join!(server, client);
+        assert!(matches!(sr, Err(HandshakeError::UnknownSession)));
+        assert!(matches!(cr, Err(HandshakeError::UnknownSession)));
+    }
+
+    #[tokio::test]
     async fn bad_psk_rejected() {
         let table = SessionTable::new(SessionConfig::default());
         let (mut c, mut s) = duplex(16 * 1024);
         let server = server_accept_handshake(&mut s, b"one", &[1u8; 32], &table);
-        let client = client_create_session(&mut c, b"two", &[1u8; 32], "default");
+        let client = client_create_session(&mut c, b"two", &[1u8; 32], "default", "a#0");
         let (sr, cr) = tokio::join!(server, client);
         assert!(sr.is_err());
         assert!(cr.is_err());

@@ -4,7 +4,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::metrics::{mono_ms, path_state_label};
 
@@ -44,6 +44,7 @@ impl Session {
             return;
         }
         let paths = self.path_list();
+        let mut miss_by_id = std::collections::HashMap::new();
         for p in &paths {
             if !p.is_alive() {
                 continue;
@@ -56,15 +57,63 @@ impl Session {
                     .probe_miss
                     .fetch_add(miss, Ordering::Relaxed);
             }
+            miss_by_id.insert(p.id, miss);
+        }
+
+        let alive: Vec<&Arc<PathState>> = paths.iter().filter(|p| p.is_alive()).collect();
+        let silent: Vec<&Arc<PathState>> = alive
+            .iter()
+            .copied()
+            .filter(|p| p.last_rx_ago() >= self.down_for(p))
+            .collect();
+        let known_silent = silent.iter().filter(|p| p.rtt_known()).count();
+        // N−1 of N≥3: one path still RX, so this is not "peer is fully stuck"
+        // (all-N blackhole still tears at down_for — TCP RTO recovery is worse
+        // than a reconnect). Soak GZ–HK was 3-of-4.
+        let correlated = alive.len() >= 3 && known_silent >= 1 && silent.len() == alive.len() - 1;
+        {
+            let mut g = self.inner.correlated_since.lock().unwrap();
+            if correlated {
+                if g.is_none() {
+                    *g = Some(Instant::now());
+                    info!(
+                        silent = silent.len(),
+                        alive = alive.len(),
+                        known_silent,
+                        "correlated silence"
+                    );
+                    self.inner
+                        .metrics
+                        .correlated_silence
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            } else {
+                *g = None;
+            }
+        }
+        let budget_elapsed = self
+            .inner
+            .correlated_since
+            .lock()
+            .unwrap()
+            .map(|t| t.elapsed() >= self.inner.cfg.all_down_timeout)
+            .unwrap_or(false);
+
+        for p in &paths {
+            if !p.is_alive() {
+                continue;
+            }
             let ago = p.last_rx_ago();
-            if ago >= self.down_for(p) {
+            let silent_this = ago >= self.down_for(p);
+            let tear = silent_this && (!p.rtt_known() || !correlated || budget_elapsed);
+            if tear {
                 warn!(path = %p.name, ?ago, down = ?self.down_for(p), "path silent, marking down");
                 self.path_failed(p.id);
             } else if p.is_up()
                 && health::should_mark_degraded(
                     ago,
                     self.degrade_for(p),
-                    miss,
+                    miss_by_id.get(&p.id).copied().unwrap_or(0),
                     p.pending_ping_count(),
                 )
             {
@@ -80,6 +129,27 @@ impl Session {
                     .path_degraded
                     .fetch_add(1, Ordering::Relaxed);
             }
+        }
+
+        if budget_elapsed && !self.has_alive_path() {
+            let ids: Vec<u32> = self.inner.streams.lock().unwrap().keys().copied().collect();
+            if !ids.is_empty() {
+                warn!(
+                    count = ids.len(),
+                    "correlated silence past timeout, resetting streams"
+                );
+                self.inner
+                    .metrics
+                    .session_all_down_resets
+                    .fetch_add(1, Ordering::Relaxed);
+                for id in ids {
+                    self.reset_stream(id, ResetReason::Timeout);
+                }
+            }
+        }
+
+        if self.inner.is_client {
+            self.maybe_recycle_outliers();
         }
 
         self.reap_closed_streams();
@@ -147,6 +217,48 @@ impl Session {
             }
         } else {
             *self.inner.all_down_since.lock().unwrap() = None;
+        }
+    }
+
+    fn maybe_recycle_outliers(&self) {
+        let paths = self.path_list();
+        let hold = self.inner.cfg.tuning.stable_up_hold;
+        let mut recycle = Vec::new();
+        for p in &paths {
+            if !p.is_up() || !p.class_known() {
+                p.clear_outlier();
+                continue;
+            }
+            let best_sib = paths
+                .iter()
+                .filter(|q| q.id != p.id && q.is_up() && q.class_known() && q.link() == p.link())
+                .map(|q| q.class_rtt())
+                .min();
+            let Some(sib) = best_sib else {
+                p.clear_outlier();
+                continue;
+            };
+            if health::is_backup(&self.inner.cfg, p.class_rtt(), sib) {
+                if p.mark_outlier() >= hold {
+                    recycle.push(p.id);
+                }
+            } else {
+                p.clear_outlier();
+            }
+        }
+        for id in recycle {
+            if let Some(p) = self.get_path(id) {
+                info!(
+                    path = %p.name,
+                    class_us = p.class_rtt().as_micros() as u64,
+                    "outlier recycle"
+                );
+                self.inner
+                    .metrics
+                    .path_outlier_recycle
+                    .fetch_add(1, Ordering::Relaxed);
+                self.path_failed(id);
+            }
         }
     }
 
@@ -245,17 +357,26 @@ impl Session {
                 if u.last_sent.elapsed() < thresh {
                     continue;
                 }
+                let path_ok = self
+                    .get_path(u.path_id)
+                    .map(|p| p.is_schedulable())
+                    .unwrap_or(false);
+                let alt = backup_prefer_class(&self.path_list(), u.path_id, &self.inner.cfg);
+                // Correlated silence / all DEGRADED: nowhere useful to send.
+                if !path_ok && alt.is_none() {
+                    continue;
+                }
                 // Retry in place. At most one hedge copy on the next-best
                 // live path — never fan-out to every connection.
                 u.last_sent = Instant::now();
-                self.send_data_frame(st.id, *offset, u.data.clone(), u.path_id);
-                self.inner
-                    .metrics
-                    .data_retransmit
-                    .fetch_add(1, Ordering::Relaxed);
-                if let Some(alt) =
-                    backup_prefer_class(&self.path_list(), u.path_id, &self.inner.cfg)
-                {
+                if path_ok {
+                    self.send_data_frame(st.id, *offset, u.data.clone(), u.path_id);
+                    self.inner
+                        .metrics
+                        .data_retransmit
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                if let Some(alt) = alt {
                     self.send_data_frame(st.id, *offset, u.data.clone(), alt);
                     self.inner
                         .metrics

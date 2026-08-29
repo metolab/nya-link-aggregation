@@ -10,4 +10,5 @@ e2e-reports/
 mixed-report.txt
 *.log
 .DS_Store
+.local/
 

@@ -147,6 +147,14 @@ fn emit_snapshot(ps: &ProcessSnapshot) {
         session_all_down_resets = s.session_all_down_resets,
         bytes_data_tx = s.bytes_data_tx,
         bytes_ctrl_tx = s.bytes_ctrl_tx,
+        mig = s.migrates,
+        hol = s.hol_rebalances,
+        hedge = s.data_hedge,
+        rtx = s.data_retransmit,
+        fb_slink = s.failbacks_same_link,
+        picks_unk = s.picks_unknown_rtt,
+        recycle = s.path_outlier_recycle,
+        corr = s.correlated_silence,
         paths = %format_paths(&s.paths),
         links = %format_links(&s.links),
         streams = %format_streams(&s.streams, s.streams_live),
@@ -164,7 +172,7 @@ fn format_paths(paths: &[crate::metrics::PathSnap]) -> String {
         .iter()
         .map(|p| {
             format!(
-                "{}={}/{}/{}ms {} inf={} st={} cong={} rx={} tx={} ping={} q={}/{}{}",
+                "{}={}/{}/{}ms {} inf={} st={} cong={} rx={} tx={} ping={} q={}/{}{}{}",
                 p.name,
                 p.rtt_us / 1000,
                 p.stable_rtt_us / 1000,
@@ -178,6 +186,7 @@ fn format_paths(paths: &[crate::metrics::PathSnap]) -> String {
                 p.pending_ping,
                 p.queued_urgent,
                 p.queued_bulk,
+                if p.backup { " bak" } else { "" },
                 if p.rtt_known { "" } else { " unk" },
             )
         })
@@ -359,7 +368,9 @@ mod tests {
         assert!(names.contains("nya_path_rtt_us"));
         assert!(names.contains("nya_failover_ms_bucket"));
         let n_counter = names.iter().filter(|n| n.ends_with("_total")).count();
-        assert_eq!(n_counter, 48, "{names:?}");
+        assert_eq!(n_counter, 50, "{names:?}");
+        assert!(names.contains("nya_path_outlier_recycle_total"));
+        assert!(names.contains("nya_correlated_silence_total"));
         let kv = format_snapshot_metrics(&ps);
         assert!(kv.contains("nya_failbacks_total=3"), "{kv}");
         assert!(kv.contains("nya_streams_held=2"), "{kv}");
@@ -370,5 +381,53 @@ mod tests {
         let body = render_prometheus(&ps);
         assert!(body.contains("nya_failbacks_total 3"));
         assert!(kv.contains("nya_failbacks_total=3"));
+    }
+
+    #[test]
+    fn format_paths_appends_bak_and_stays_compact() {
+        let paths = vec![
+            crate::metrics::PathSnap {
+                name: "akcdn#0".into(),
+                rtt_us: 7_000,
+                stable_rtt_us: 6_000,
+                class_rtt_us: 7_000,
+                state: 1,
+                rtt_known: true,
+                ..Default::default()
+            },
+            crate::metrics::PathSnap {
+                name: "soy#0".into(),
+                rtt_us: 80_000,
+                stable_rtt_us: 48_000,
+                class_rtt_us: 148_000,
+                state: 1,
+                rtt_known: true,
+                backup: true,
+                ..Default::default()
+            },
+            crate::metrics::PathSnap {
+                name: "soy#1".into(),
+                rtt_us: 7_000,
+                stable_rtt_us: 7_000,
+                class_rtt_us: 7_000,
+                state: 1,
+                rtt_known: true,
+                ..Default::default()
+            },
+            crate::metrics::PathSnap {
+                name: "akcdn#1".into(),
+                rtt_us: 7_000,
+                stable_rtt_us: 6_000,
+                class_rtt_us: 7_000,
+                state: 1,
+                rtt_known: false,
+                ..Default::default()
+            },
+        ];
+        let s = format_paths(&paths);
+        assert!(s.contains("soy#0="), "{s}");
+        assert!(s.contains(" bak"), "{s}");
+        assert!(s.contains(" unk"), "{s}");
+        assert!(s.len() < 2048, "paths= {} bytes", s.len());
     }
 }

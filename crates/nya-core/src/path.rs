@@ -52,6 +52,8 @@ pub struct PathState {
     high_since: std::sync::Mutex<Option<Instant>>,
     class_high_since: std::sync::Mutex<Option<Instant>>,
     class_low_since: std::sync::Mutex<Option<Instant>>,
+    class_low_accum: std::sync::Mutex<Duration>,
+    outlier_since: std::sync::Mutex<Option<Instant>>,
     /// CAS: one failover_ms sample per path.
     pub failover_recorded: AtomicBool,
     urgent_queued: AtomicU64,
@@ -93,6 +95,8 @@ impl PathState {
             high_since: std::sync::Mutex::new(None),
             class_high_since: std::sync::Mutex::new(None),
             class_low_since: std::sync::Mutex::new(None),
+            class_low_accum: std::sync::Mutex::new(Duration::ZERO),
+            outlier_since: std::sync::Mutex::new(None),
             failover_recorded: AtomicBool::new(false),
             urgent_queued: AtomicU64::new(0),
             bulk_queued: AtomicU64::new(0),
@@ -334,16 +338,18 @@ impl PathState {
             && fast > c_old + t.stable_raise_add_us;
         let drop = t.class_should_drop(c_old, fast);
 
-        // Lock order: class_high_since then class_low_since, both paths.
+        // Lock order: class_high_since, class_low_since, class_low_accum.
         let mut high = self.class_high_since.lock().unwrap();
         let mut low = self.class_low_since.lock().unwrap();
+        let mut accum = self.class_low_accum.lock().unwrap();
         if raise {
             *low = None;
+            *accum = Duration::ZERO;
             let start = high.get_or_insert_with(Instant::now);
             if start.elapsed() >= hold {
                 let new_us = (c_old * 7 + fast) / 8;
                 self.rtt_class_us.store(new_us, Ordering::Relaxed);
-                tracing::debug!(
+                tracing::info!(
                     path = %self.name,
                     old_us = c_old,
                     new_us,
@@ -356,10 +362,12 @@ impl PathState {
         *high = None;
         if drop {
             let start = low.get_or_insert_with(Instant::now);
-            if start.elapsed() >= hold {
+            if start.elapsed().saturating_add(*accum) >= hold {
                 let new_us = (c_old * 7 + fast) / 8;
                 self.rtt_class_us.store(new_us, Ordering::Relaxed);
-                tracing::debug!(
+                *low = None;
+                *accum = Duration::ZERO;
+                tracing::info!(
                     path = %self.name,
                     old_us = c_old,
                     new_us,
@@ -369,7 +377,24 @@ impl PathState {
             }
             return;
         }
-        *low = None;
+        if let Some(start) = low.take() {
+            *accum = accum.saturating_add(start.elapsed());
+        }
+    }
+
+    pub(crate) fn mark_outlier(&self) -> Duration {
+        let mut g = self.outlier_since.lock().unwrap();
+        let start = g.get_or_insert_with(Instant::now);
+        start.elapsed()
+    }
+
+    pub(crate) fn clear_outlier(&self) {
+        *self.outlier_since.lock().unwrap() = None;
+    }
+
+    #[cfg(test)]
+    pub fn class_low_accum(&self) -> Duration {
+        *self.class_low_accum.lock().unwrap()
     }
 
     pub fn mark_degraded(&self) {
@@ -525,6 +550,11 @@ pub fn spawn_path_io<T>(
                     }
                     let ago = path.last_rx_ago();
                     if ago >= ping_every && path.pending_ping_count() == 0 {
+                        if !path.is_up() {
+                            // DEGRADED/DOWN: do not fill a silent pipe (G5).
+                            next_ping = tokio::time::Instant::now() + ping_every;
+                            continue;
+                        }
                         let ping = path.next_ping();
                         if let Err(e) =
                             send_frame(&mut framed, &session, &path, Frame::Ping(ping)).await
@@ -798,5 +828,53 @@ mod tests {
             220_000,
             "220 vs 180 is below 0.25×class; class holds"
         );
+    }
+
+    #[test]
+    fn single_non_drop_pauses_low_timer() {
+        let p = path();
+        p.stable_up_hold_us.store(80_000, Ordering::Relaxed);
+        p.rtt_class_us.store(280_000, Ordering::Relaxed);
+        p.rtt_ewma_us.store(180_000, Ordering::Relaxed);
+        p.record_rtt(Duration::from_millis(180));
+        std::thread::sleep(Duration::from_millis(40));
+        p.record_rtt(Duration::from_millis(180));
+        // Fast near class: 280−250=30 < 0.25×280=70, not a drop.
+        p.record_rtt(Duration::from_millis(400));
+        let paused = p.class_low_accum();
+        assert!(
+            paused >= Duration::from_millis(25),
+            "non-drop must freeze accum, got {paused:?}"
+        );
+        assert!(p.class_low_since.lock().unwrap().is_none());
+        let class_before = p.rtt_class_us.load(Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(80));
+        p.record_rtt(Duration::from_millis(400));
+        assert_eq!(
+            p.rtt_class_us.load(Ordering::Relaxed),
+            class_before,
+            "paused timer must not count wall clock during non-drop"
+        );
+        p.rtt_ewma_us.store(180_000, Ordering::Relaxed);
+        p.record_rtt(Duration::from_millis(180));
+        std::thread::sleep(Duration::from_millis(50));
+        p.record_rtt(Duration::from_millis(180));
+        let class = p.rtt_class_us.load(Ordering::Relaxed);
+        assert!(
+            class < 280_000,
+            "paused + resumed drop must 7/8, class={class}"
+        );
+        assert_eq!(p.class_low_accum(), Duration::ZERO);
+    }
+
+    #[test]
+    fn drop_store_clears_accum() {
+        let p = path();
+        p.stable_up_hold_us.store(0, Ordering::Relaxed);
+        p.rtt_class_us.store(280_000, Ordering::Relaxed);
+        p.rtt_ewma_us.store(180_000, Ordering::Relaxed);
+        p.record_rtt(Duration::from_millis(180));
+        assert_eq!(p.class_low_accum(), Duration::ZERO);
+        assert!(p.class_low_since.lock().unwrap().is_none());
     }
 }

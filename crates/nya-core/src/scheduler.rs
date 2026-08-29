@@ -155,6 +155,20 @@ pub(crate) fn fastest_class_set<'a>(
     candidates
 }
 
+fn path_score(p: &PathState, cfg: &SessionConfig, pref: PickPref) -> (u64, bool) {
+    let load = load_term(p, cfg, pref);
+    let class = p.class_rtt().as_micros() as u64;
+    let fast = rtt_score_us(p, cfg);
+    // Class RTT dominates so a 1.7× spike on every peer cannot lose to a
+    // same-class-by-cliff slow path on fast EWMA. Fast is the tie-break
+    // among equal class_rtt (spiked peer loses to an unshifted sibling).
+    let score = class
+        .saturating_mul(load)
+        .saturating_mul(1024)
+        .saturating_add(fast.saturating_mul(load));
+    (score, p.rtt_known())
+}
+
 pub(crate) fn pick_from(
     candidates: &[&Arc<PathState>],
     cfg: &SessionConfig,
@@ -167,17 +181,7 @@ pub(crate) fn pick_from(
     let mut best_score = u64::MAX;
     let mut best_known = candidates[0].rtt_known();
     for p in candidates {
-        let load = load_term(p, cfg, pref);
-        let class = p.class_rtt().as_micros() as u64;
-        let fast = rtt_score_us(p, cfg);
-        // Class RTT dominates so a 1.7× spike on every peer cannot lose to a
-        // same-class-by-cliff slow path on fast EWMA. Fast is the tie-break
-        // among equal class_rtt (spiked peer loses to an unshifted sibling).
-        let score = class
-            .saturating_mul(load)
-            .saturating_mul(1024)
-            .saturating_add(fast.saturating_mul(load));
-        let known = p.rtt_known();
+        let (score, known) = path_score(p, cfg, pref);
         let better = score < best_score
             || (score == best_score && known && !best_known)
             || (score == best_score && known == best_known && p.id < best_id);
@@ -188,6 +192,40 @@ pub(crate) fn pick_from(
         }
     }
     Some(best_id)
+}
+
+/// Like [`pick_from`], but exact `(score, known)` ties rotate by `stream_id`.
+/// Failback / HOL / backup keep [`pick_from`] (min id) so equal peers do not chatter.
+pub(crate) fn pick_from_spread(
+    candidates: &[&Arc<PathState>],
+    cfg: &SessionConfig,
+    pref: PickPref,
+    stream_id: u32,
+) -> Option<u32> {
+    let best_id = pick_from(candidates, cfg, pref)?;
+    let best = candidates.iter().find(|p| p.id == best_id)?;
+    let (best_score, best_known) = path_score(best, cfg, pref);
+    let mut tied: Vec<u32> = candidates
+        .iter()
+        .filter(|p| path_score(p, cfg, pref) == (best_score, best_known))
+        .map(|p| p.id)
+        .collect();
+    if tied.is_empty() {
+        return Some(best_id);
+    }
+    tied.sort_unstable();
+    let n = tied.len() as u32;
+    let idx = stream_id.wrapping_sub(1) % n;
+    Some(tied[idx as usize])
+}
+
+pub fn pick_path_pref_spread(
+    paths: &[Arc<PathState>],
+    cfg: &SessionConfig,
+    pref: PickPref,
+    stream_id: u32,
+) -> Option<u32> {
+    pick_from_spread(&fastest_class_set(paths, cfg), cfg, pref, stream_id)
 }
 
 /// Frozen candidate dump for debug logs. Same score as [`pick_from`].
@@ -582,6 +620,54 @@ mod tests {
         a.sticky_streams.store(3, Ordering::Relaxed);
         let picked = pick_path(&[a, b.clone()], &cfg).unwrap();
         assert_eq!(picked, 2, "empty sibling should win");
+    }
+
+    #[test]
+    fn zero_load_sequential_spreads() {
+        let cfg = SessionConfig::default();
+        let paths = vec![
+            mk_named(1, "a#0".into(), 7),
+            mk_named(2, "a#1".into(), 7),
+            mk_named(3, "b#0".into(), 7),
+            mk_named(4, "b#1".into(), 7),
+        ];
+        let mut ids = Vec::new();
+        for sid in 1..=8 {
+            ids.push(pick_path_pref_spread(&paths, &cfg, PickPref::Any, sid).unwrap());
+        }
+        let uniq: std::collections::BTreeSet<_> = ids.iter().copied().collect();
+        assert!(uniq.len() >= 2, "exact-score ties must spread, got {ids:?}");
+        assert_eq!(ids[0], 1, "stream 1 maps to lowest path_id");
+        assert_eq!(ids[1], 2);
+        assert_eq!(ids[4], 1, "repeats after n");
+    }
+
+    #[test]
+    fn load_beats_spread() {
+        let cfg = SessionConfig::default();
+        let a = mk_named(1, "a#0".into(), 7);
+        let b = mk_named(2, "a#1".into(), 7);
+        a.sticky_streams.store(3, Ordering::Relaxed);
+        let paths = vec![a, b];
+        for sid in 1..=6 {
+            let picked = pick_path_pref_spread(&paths, &cfg, PickPref::Any, sid).unwrap();
+            assert_eq!(
+                picked, 2,
+                "loaded sibling must lose every stream_id, sid={sid}"
+            );
+        }
+    }
+
+    #[test]
+    fn in_class_6_vs_7_does_not_spread() {
+        let cfg = SessionConfig::default();
+        let a = mk_named(1, "a#0".into(), 6);
+        let b = mk_named(2, "a#1".into(), 7);
+        let paths = vec![a, b];
+        for sid in 1..=4 {
+            let picked = pick_path_pref_spread(&paths, &cfg, PickPref::Any, sid).unwrap();
+            assert_eq!(picked, 1, "6ms vs 7ms is not an exact score tie, sid={sid}");
+        }
     }
 
     #[test]

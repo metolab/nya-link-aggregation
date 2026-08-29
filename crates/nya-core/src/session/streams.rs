@@ -24,10 +24,10 @@ impl Session {
             return Err(SessionError::ServerCannotOpen);
         }
         self.wait_ready(self.inner.cfg.all_down_timeout).await?;
-        let path_id = self
-            .pick_pref(crate::scheduler::PickPref::Interactive)
-            .ok_or(SessionError::NoPath)?;
         let id = self.inner.next_stream_id.fetch_add(1, Ordering::Relaxed);
+        let path_id = self
+            .pick_pref_spread(crate::scheduler::PickPref::Interactive, id)
+            .ok_or(SessionError::NoPath)?;
         let (tun, _st) = self.alloc_local_stream(id);
         self.set_sticky(id, path_id);
         self.inner

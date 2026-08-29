@@ -331,7 +331,7 @@ goodput = data / wire                    // 重传的 STREAM_DATA 算 data，诚
 | 事件 | 分类 | 说明 |
 | --- | --- | --- |
 | `record_rtt` / EWMA / 每个 Pong | **no** | 10–50ms × N 路径 |
-| class 真正改写 `rtt_class_us`（init freeze / raise / drop 7/8） | **dbg** `path, old_us, new_us, kind=init\|raise\|drop` | 稀有；`debug!` 即可，不必 `enabled!` |
+| class 真正改写 `rtt_class_us`（init freeze / raise / drop 7/8） | init **dbg**；raise/drop **info** `path, old_us, new_us, kind` | 稀有。另：`correlated silence`、`outlier recycle`、`unknown session, will recreate` 也是 **info** |
 | `mark_degraded` | **met** `path_degraded` 在 `steer::maintain` 调用处 | PathState 内部不打 |
 | `next_ping` / ping 发出 | **no** 日志；字节走 Q6 `send_frame` | |
 | writer 队列满 | 已由 `frame_send_drop`；**dbg** 当 `urgent` 失败时 `path, urgent=true` | bulk 满是预期，不要 info |
@@ -755,6 +755,7 @@ stall_p99_ms, failover_p99_ms, stall_count, failover_count,
 paths_alive, streams_live, streams_closed, stream_resets,
 path_down, path_degraded, probe_miss, failbacks, session_all_down_resets,
 bytes_data_tx, bytes_ctrl_tx,
+mig, hol, hedge, rtx, fb_slink, picks_unk, recycle, corr,
 paths = "<压缩串>",
 links = "<线路汇总>",
 streams = "<粘滞表，最多 64 条，多出 +N>"
@@ -769,7 +770,9 @@ streams = "<粘滞表，最多 64 条，多出 +N>"
 a#0=12/12/12ms up inf=0 st=2 cong=0 rx=3 tx=1 ping=0 q=0/0; a#1=13/12/12ms deg inf=8 st=0 cong=1 rx=40 tx=2 ping=1 q=0/3 unk
 ```
 
-语法：`{name}={rtt}/{stable}/{class}ms {state} inf= st= cong= rx= tx= ping= q={urgent}/{bulk}{ unk}?`
+语法：`{name}={rtt}/{stable}/{class}ms {state} inf= st= cong= rx= tx= ping= q={urgent}/{bulk}{ bak}?{ unk}?`
+
+`bak` 表示该路径相对本快照里已知 RTT 的最小 class 是 backup（`2×min+20ms`），不是 G4b 同链路回收候选。
 
 `links`：`{name}={up}/{deg} {rtt_min}-{rtt_max}ms st= inf= cong= rx={fresh}/{stale} q={urgent}/{bulk}`
 
