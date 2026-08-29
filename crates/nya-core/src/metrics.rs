@@ -4,8 +4,12 @@
 //! `merge_add`. Prometheus exposition cumulates at export time.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
+
+use tracing::debug;
+
+use crate::hop::{HopRole, HopSample};
 
 use super::path::{link_key, PathState, STATE_DEGRADED, STATE_DOWN, STATE_UP};
 
@@ -533,7 +537,6 @@ impl Counters {
     }
 }
 
-#[derive(Default)]
 pub struct ProcessCounters {
     pub handshake_create_ok: AtomicU64,
     pub handshake_join_ok: AtomicU64,
@@ -551,9 +554,86 @@ pub struct ProcessCounters {
     pub sessions_created: AtomicU64,
     pub sessions_dead: AtomicU64,
     pub sessions_live: AtomicU64,
+    hop_open_ms: Histogram,
+    hop_first_rx_ms: Histogram,
+    hop_last_rx_ms: Histogram,
+    hop_dial_ms: Histogram,
+    hop_origin_first_ms: Histogram,
+    hop_origin_last_ms: Histogram,
+    hop_tail: Mutex<Option<HopSample>>,
+}
+
+impl Default for ProcessCounters {
+    fn default() -> Self {
+        Self {
+            handshake_create_ok: AtomicU64::new(0),
+            handshake_join_ok: AtomicU64::new(0),
+            handshake_fail_auth: AtomicU64::new(0),
+            handshake_fail_version: AtomicU64::new(0),
+            handshake_fail_unknown: AtomicU64::new(0),
+            handshake_fail_other: AtomicU64::new(0),
+            inbound_accept: AtomicU64::new(0),
+            inbound_reject: AtomicU64::new(0),
+            inbound_open_fail: AtomicU64::new(0),
+            outbound_dial_ok: AtomicU64::new(0),
+            outbound_dial_fail: AtomicU64::new(0),
+            reconnect_ok: AtomicU64::new(0),
+            reconnect_fail: AtomicU64::new(0),
+            sessions_created: AtomicU64::new(0),
+            sessions_dead: AtomicU64::new(0),
+            sessions_live: AtomicU64::new(0),
+            hop_open_ms: Histogram::new(STALL_MS_BOUNDS),
+            hop_first_rx_ms: Histogram::new(STALL_MS_BOUNDS),
+            hop_last_rx_ms: Histogram::new(STALL_MS_BOUNDS),
+            hop_dial_ms: Histogram::new(STALL_MS_BOUNDS),
+            hop_origin_first_ms: Histogram::new(STALL_MS_BOUNDS),
+            hop_origin_last_ms: Histogram::new(STALL_MS_BOUNDS),
+            hop_tail: Mutex::new(None),
+        }
+    }
+}
+
+fn observe_us_as_ms(h: &Histogram, us: Option<u64>) {
+    if let Some(us) = us {
+        h.observe(us / 1000);
+    }
 }
 
 impl ProcessCounters {
+    pub fn record_hop(&self, sample: HopSample) {
+        debug!(
+            target: "nya_core::hop",
+            event = "hop",
+            stream_id = sample.stream_id,
+            host = %sample.host,
+            outcome = sample.outcome.as_str(),
+            hops = %sample.format_debug_fields(),
+            "hop"
+        );
+        match sample.role {
+            HopRole::Client => {
+                observe_us_as_ms(&self.hop_open_ms, sample.open_us);
+                observe_us_as_ms(&self.hop_first_rx_ms, sample.first_rx_us);
+                observe_us_as_ms(&self.hop_last_rx_ms, sample.last_rx_us);
+            }
+            HopRole::Server => {
+                observe_us_as_ms(&self.hop_dial_ms, sample.dial_us);
+                observe_us_as_ms(&self.hop_origin_first_ms, sample.origin_first_rx_us);
+                observe_us_as_ms(&self.hop_origin_last_ms, sample.origin_last_rx_us);
+            }
+        }
+        let rank = sample.rank_us();
+        let mut g = self.hop_tail.lock().unwrap();
+        match g.as_ref() {
+            Some(cur) if cur.rank_us() >= rank => {}
+            _ => *g = Some(sample),
+        }
+    }
+
+    pub fn take_interval_tail(&self) -> Option<HopSample> {
+        self.hop_tail.lock().unwrap().take()
+    }
+
     pub fn snap(&self) -> ProcessCountersSnap {
         ProcessCountersSnap {
             handshake_create_ok: self.handshake_create_ok.load(Ordering::Relaxed),
@@ -572,6 +652,12 @@ impl ProcessCounters {
             sessions_created: self.sessions_created.load(Ordering::Relaxed),
             sessions_dead: self.sessions_dead.load(Ordering::Relaxed),
             sessions_live: self.sessions_live.load(Ordering::Relaxed),
+            hop_open_ms: self.hop_open_ms.snap(),
+            hop_first_rx_ms: self.hop_first_rx_ms.snap(),
+            hop_last_rx_ms: self.hop_last_rx_ms.snap(),
+            hop_dial_ms: self.hop_dial_ms.snap(),
+            hop_origin_first_ms: self.hop_origin_first_ms.snap(),
+            hop_origin_last_ms: self.hop_origin_last_ms.snap(),
         }
     }
 
@@ -612,6 +698,12 @@ pub struct ProcessCountersSnap {
     pub sessions_created: u64,
     pub sessions_dead: u64,
     pub sessions_live: u64,
+    pub hop_open_ms: HistSnap,
+    pub hop_first_rx_ms: HistSnap,
+    pub hop_last_rx_ms: HistSnap,
+    pub hop_dial_ms: HistSnap,
+    pub hop_origin_first_ms: HistSnap,
+    pub hop_origin_last_ms: HistSnap,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -764,6 +856,138 @@ mod tests {
         assert_eq!(b.conns, 1);
         assert_eq!(b.up, 1);
         assert_eq!(b.degraded, 0);
+    }
+
+    #[test]
+    fn record_hop_observes_mapped_fields_only() {
+        let pc = ProcessCounters::default();
+        pc.record_hop(HopSample {
+            role: HopRole::Server,
+            stream_id: 7,
+            host: "clients3.google.com".into(),
+            copy_us: Some(5_042_000),
+            dial_us: Some(80),
+            origin_first_rx_us: Some(5_042_000),
+            origin_last_rx_us: Some(5_042_000),
+            max_gap: Some(5_000_000),
+            crx_at_gap: Some(30_000),
+            origin_at_gap: Some(5_030_000),
+            crx_at_olast: Some(5_038_000),
+            ..Default::default()
+        });
+        let snap = pc.snap();
+        assert_eq!(snap.hop_dial_ms.count, 1);
+        assert_eq!(snap.hop_origin_first_ms.count, 1);
+        assert_eq!(snap.hop_origin_last_ms.count, 1);
+        assert_eq!(snap.hop_open_ms.count, 0);
+        assert_eq!(snap.hop_first_rx_ms.count, 0);
+        assert_eq!(snap.hop_last_rx_ms.count, 0);
+        let of = percentile(&snap.hop_origin_first_ms, STALL_MS_BOUNDS, 99.0).unwrap();
+        assert!(of >= 2000, "origin_first p99={of}");
+        let tail = pc.take_interval_tail().expect("tail");
+        assert_eq!(tail.host, "clients3.google.com");
+        assert_eq!(tail.stream_id, 7);
+        assert_eq!(tail.copy_us, Some(5_042_000));
+        assert!(pc.take_interval_tail().is_none());
+        // snap() must not consume tail — already taken; record another and snap
+        pc.record_hop(HopSample {
+            role: HopRole::Client,
+            stream_id: 1,
+            host: "x".into(),
+            copy_us: Some(40_000),
+            open_us: Some(80),
+            ..Default::default()
+        });
+        let _ = pc.snap();
+        assert!(pc.take_interval_tail().is_some());
+    }
+
+    #[test]
+    fn hop_tail_larger_rank_wins() {
+        let pc = ProcessCounters::default();
+        pc.record_hop(HopSample {
+            role: HopRole::Client,
+            stream_id: 1,
+            host: "a".into(),
+            copy_us: Some(40_000),
+            ..Default::default()
+        });
+        pc.record_hop(HopSample {
+            role: HopRole::Client,
+            stream_id: 2,
+            host: "b".into(),
+            copy_us: Some(5_000_000),
+            ..Default::default()
+        });
+        let tail = pc.take_interval_tail().unwrap();
+        assert_eq!(tail.stream_id, 2);
+        assert_eq!(tail.host, "b");
+    }
+
+    #[test]
+    fn record_hop_40ms_is_debug_not_info() {
+        use std::sync::Arc;
+        use tracing::span::{Attributes, Id, Record};
+        use tracing::{Event, Metadata, Subscriber};
+
+        struct CapArc(Arc<Mutex<Vec<(String, String)>>>);
+        impl Subscriber for CapArc {
+            fn enabled(&self, _: &Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _: &Attributes<'_>) -> Id {
+                Id::from_u64(1)
+            }
+            fn record(&self, _: &Id, _: &Record<'_>) {}
+            fn record_follows_from(&self, _: &Id, _: &Id) {}
+            fn event(&self, event: &Event<'_>) {
+                self.0.lock().unwrap().push((
+                    event.metadata().level().as_str().to_string(),
+                    event.metadata().target().to_string(),
+                ));
+            }
+            fn enter(&self, _: &Id) {}
+            fn exit(&self, _: &Id) {}
+        }
+        let store = Arc::new(Mutex::new(Vec::new()));
+        tracing::subscriber::with_default(CapArc(store.clone()), || {
+            let pc = ProcessCounters::default();
+            pc.record_hop(HopSample {
+                role: HopRole::Client,
+                stream_id: 1,
+                host: "example.com".into(),
+                copy_us: Some(40_000),
+                open_us: Some(80),
+                ..Default::default()
+            });
+        });
+        let ev = store.lock().unwrap().clone();
+        assert!(
+            ev.iter().any(|(l, t)| l == "DEBUG" && t == "nya_core::hop"),
+            "{ev:?}"
+        );
+        assert!(
+            !ev.iter().any(|(l, t)| l == "INFO" && t == "nya_core::hop"),
+            "{ev:?}"
+        );
+    }
+
+    #[test]
+    fn missing_copy_is_not_observed() {
+        let pc = ProcessCounters::default();
+        pc.record_hop(HopSample {
+            role: HopRole::Server,
+            stream_id: 3,
+            host: "www.gstatic.com".into(),
+            outcome: crate::hop::HopOutcome::DialFail,
+            dial_us: Some(8_000_000),
+            copy_us: None,
+            ..Default::default()
+        });
+        let snap = pc.snap();
+        assert_eq!(snap.hop_dial_ms.count, 1);
+        assert_eq!(snap.hop_origin_first_ms.count, 0);
+        assert_eq!(pc.take_interval_tail().unwrap().copy_us, None);
     }
 
     #[test]

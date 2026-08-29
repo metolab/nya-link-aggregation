@@ -413,9 +413,9 @@ goodput = data / wire                    // 重传的 STREAM_DATA 算 data，诚
 | --- | --- | --- |
 | socks5/forward listen | **ops info** 已有 | 保留 |
 | SOCKS 握手/请求解析失败 | **met** `inbound_reject` + 现有 warn | **全部**：`not socks5`、`bad socks ver`、非 CONNECT（0x07）、坏 atyp（0x08）。不只 CONNECT/atyp |
-| `open_stream` 失败 | **ops warn** 已有 + **met** `inbound_open_fail` | socks 与 forward 都计 |
+| `open_stream` 失败 | **ops warn** 已有 + **met** `inbound_open_fail`；**dbg** `nya_core::hop` `outcome=open_fail`（`open_us` only） | socks 与 forward 都计 |
 | 成功 `open_stream` 即将 copy | **met** `inbound_accept`；**不要** info | |
-| copy 结束 | **no** | |
+| copy 结束 | **no** info；**dbg** `target=nya_core::hop` `event=hop`（`open_us` / `first_rx_us` / `last_rx_us` / `copy_us`）；**met** snapshot-only hop hists（不进 catalog / `n_counter`） | |
 
 #### `nya-server::lib`（`serve_one`）
 
@@ -431,8 +431,9 @@ goodput = data / wire                    // 重传的 STREAM_DATA 算 data，诚
 
 | 事件 | 分类 | 说明 |
 | --- | --- | --- |
-| `"outbound connected"` | **dbg**（现 info 降级）+ **met** `outbound_dial_ok` 经由 `inc.session.process()` | |
-| dial 失败 | **ops warn** 已有 + **met** `outbound_dial_fail`；已 `reset(DialFailed)` | 保留 warn |
+| `"outbound connected"` | **dbg**（现 info 降级）+ **met** `outbound_dial_ok` 经由 `inc.process()` | |
+| dial 失败 | **ops warn** 已有 + **met** `outbound_dial_fail`；**dbg** hop `outcome=dial_fail`（`dial_us` only）；已 `reset(DialFailed)` | 保留 warn |
+| copy 结束 | **no** info；**dbg** `nya_core::hop`（`dial_us` / `ofirst` / `olast` / `max_gap` / `crx_at_gap` / `origin_at_gap` / `crx_at_olast`）；**met** snapshot-only origin hop hists | |
 
 #### `nya-e2e`
 
@@ -756,11 +757,39 @@ paths_alive, streams_live, streams_closed, stream_resets,
 path_down, path_degraded, probe_miss, failbacks, session_all_down_resets,
 bytes_data_tx, bytes_ctrl_tx,
 mig, hol, hedge, rtx, fb_slink, picks_unk, recycle, corr,
+open_p99_ms, first_rx_p99_ms, last_rx_p99_ms,           # client; omit when count=0
+dial_p99_ms, origin_first_p99_ms, origin_last_p99_ms,   # server; omit when count=0
+tail = "<host> copy=<us|-> … sid=<id>",                 # omit if no hop this interval
 paths = "<压缩串>",
 links = "<线路汇总>",
 streams = "<粘滞表，最多 64 条，多出 +N>"
 "snapshot"
 ```
+
+Hop p99 来自 `ProcessCounters` snapshot-only histograms（`STALL_MS_BOUNDS`），**不**进 `visit_metrics` / Prometheus（`n_counter` 仍为 50）。客户端只 observe `open` / `first_rx` / `last_rx`；服务端只 observe `dial` / `origin_first` / `origin_last`。`copy` / `cfirst` / `clast` / `crx_at_olast` / `max_gap` / `crx_at_gap` / `origin_at_gap` 只走 debug + `tail=`。
+
+`tail=` 语法（µs；无时长门）：
+
+```text
+tail=<host> copy=<us|-> [open=<us>] [first_rx=<us|->] [last_rx=<us|->] [dial=<us>] [ofirst=<us|->] [olast=<us|->] [cfirst=<us|->] [clast=<us|->] [crx_at_olast=<us|->] [max_gap=<us|->] [crx_at_gap=<us|->] [origin_at_gap=<us|->] sid=<id>
+```
+
+始终 `host copy=… sid=…`。`copy` 在 copy 未开始时为 `-`（open-fail / dial-fail）。客户端有 `open` / `first_rx` / `last_rx`；服务端有 `dial` / `ofirst` / `olast` / `cfirst` / `clast` / `crx_at_olast` / `max_gap` / `crx_at_gap` / `origin_at_gap`。`-` 只在 copy 已跑但该字节从未到达时用。
+
+curl `samples.csv` 的 `ts` 是**请求结束**时间；join：`host` + `copy_us ≈ wall_ms×1000` + hop copy-end 靠近 `ts`（start ≈ `ts − wall_ms`）。精确 join 是 client `sid` ↔ server `sid`。
+
+分类（docs + canary，**不是**调度器输入；不要写成 Tuning 毫秒门）：
+
+- `open_us` 很大 → overlay `wait_ready`
+- `dial_us` 很大或 `ofirst` 一直 `-` → 源站 connect / connect 后沉默
+- `ofirst` / client `first_rx` 主导 copy（tls≈ttfb）→ 源站 TLS
+- **不要**把 copy 结束时 `olast≈copy` 当成源站（成功的 generate_204 几乎都这样）
+- **不要**把最终 `crx_at_olast` 当成 GET 到达（TLS close_notify 会覆盖）
+- `olast ≪ copy` → overlay 卡住已在 copy 缓冲里的 204
+- max-gap ≈ remainder 且 `origin_at_gap ≈ olast ≈ copy`、`crx_at_gap ≪ olast` → GET 之后源站思考
+- max-gap 是握手量级、`first_rx≈tls ≪ copy`、最终 `crx≈copy` → overlay 在握手后延迟了 GET
+
+debug hop：`RUST_LOG=nya_core::hop=debug`。默认 info 期刊不打每条流。
 
 完整 Q1–Q8 字段仍在 `format_snapshot_metrics` / Prometheus / OTLP metrics。
 
@@ -1172,8 +1201,8 @@ stderr 上 SDK `ExportError` 默认 `off`。`nya_obs` 对 BatchLog/BatchSpan 失
 | `nya.link.accept` | server TLS 成功后的 **marker**（`tls_ms`）；失败 accept **不**建 span | server |
 | `nya.handshake` | overlay create/join 或 overlay 失败的 **marker**（`hs_ms`）；不跨 `add_path`。codec 噪声（HTTP `GET ` 等）无 span | client / server |
 | `nya.path.up` | path 注册瞬间（毫秒） | internal |
-| `nya.inbound.socks5` / `nya.inbound.forward` | 到 `open_stream` 返回 | server |
-| `nya.outbound.dial` | `TcpStream::connect` | client |
+| `nya.inbound.socks5` / `nya.inbound.forward` | 到 `open_stream` 返回；属性 `nya.open_us`。**不**包 `copy_bidirectional` | server |
+| `nya.outbound.dial` | `TcpStream::connect`；属性 `nya.dial_us`。**不**包 copy | client |
 
 失败：`otel.status_code=ERROR`。无协议 `traceparent`。
 

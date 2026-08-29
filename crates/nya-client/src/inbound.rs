@@ -1,12 +1,13 @@
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::Ordering;
+use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{info, warn, Instrument};
 
-use nya_core::Session;
+use nya_core::{HopClock, HopOutcome, HopProbe, HopRole, HopSample, Session, TunnelStream};
 use nya_proto::Target;
 
 use crate::config::Inbound;
@@ -73,7 +74,7 @@ pub async fn serve_forward_listener(
         tokio::select! {
             _ = session.wait_dead() => break,
             acc = listener.accept() => {
-                let (mut tcp, peer) = acc?;
+                let (tcp, peer) = acc?;
                 let session = session.clone();
                 let dest = dest.clone();
                 tokio::spawn(async move {
@@ -83,19 +84,23 @@ pub async fn serve_forward_listener(
                         otel.kind = "server",
                         nya.target = %dest,
                         otel.status_code = tracing::field::Empty,
+                        nya.open_us = tracing::field::Empty,
                     );
+                    let t0 = Instant::now();
                     let opened = session
                         .open_stream(dest.clone())
                         .instrument(span.clone())
                         .await;
+                    let open_us = (t0.elapsed().as_micros() as u64).max(1);
+                    span.record("nya.open_us", open_us);
                     match opened {
-                        Ok(mut tun) => {
+                        Ok(tun) => {
                             drop(span);
                             session
                                 .process()
                                 .inbound_accept
                                 .fetch_add(1, Ordering::Relaxed);
-                            let _ = tokio::io::copy_bidirectional(&mut tcp, &mut tun).await;
+                            copy_with_hop(&session, tcp, tun, dest.host.clone(), open_us).await;
                         }
                         Err(e) => {
                             span.record("otel.status_code", "ERROR");
@@ -103,6 +108,7 @@ pub async fn serve_forward_listener(
                                 .process()
                                 .inbound_open_fail
                                 .fetch_add(1, Ordering::Relaxed);
+                            record_open_fail(&session, dest.host.clone(), open_us);
                             {
                                 let _g = span.enter();
                                 warn!(%peer, error = %e, "open forward stream");
@@ -186,7 +192,9 @@ async fn serve_socks5(mut tcp: TcpStream, session: Session) -> Result<()> {
         nya.host = %host,
         nya.port = port,
         otel.status_code = tracing::field::Empty,
+        nya.open_us = tracing::field::Empty,
     );
+    let t0 = Instant::now();
     let opened = session
         .open_stream(Target {
             host: host.clone(),
@@ -194,15 +202,17 @@ async fn serve_socks5(mut tcp: TcpStream, session: Session) -> Result<()> {
         })
         .instrument(span.clone())
         .await;
+    let open_us = (t0.elapsed().as_micros() as u64).max(1);
+    span.record("nya.open_us", open_us);
     match opened {
-        Ok(mut tun) => {
+        Ok(tun) => {
             drop(span);
             session
                 .process()
                 .inbound_accept
                 .fetch_add(1, Ordering::Relaxed);
             reply(&mut tcp, 0x00).await?;
-            let _ = tokio::io::copy_bidirectional(&mut tcp, &mut tun).await;
+            copy_with_hop(&session, tcp, tun, host, open_us).await;
         }
         Err(e) => {
             span.record("otel.status_code", "ERROR");
@@ -210,6 +220,7 @@ async fn serve_socks5(mut tcp: TcpStream, session: Session) -> Result<()> {
                 .process()
                 .inbound_open_fail
                 .fetch_add(1, Ordering::Relaxed);
+            record_open_fail(&session, host.clone(), open_us);
             reply(&mut tcp, 0x04).await?;
             {
                 let _g = span.enter();
@@ -218,6 +229,48 @@ async fn serve_socks5(mut tcp: TcpStream, session: Session) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn record_open_fail(session: &Session, host: String, open_us: u64) {
+    session.process().record_hop(HopSample {
+        role: HopRole::Client,
+        stream_id: 0,
+        host,
+        outcome: HopOutcome::OpenFail,
+        open_us: Some(open_us),
+        copy_us: None,
+        ..Default::default()
+    });
+}
+
+async fn copy_with_hop(
+    session: &Session,
+    mut tcp: TcpStream,
+    tun: TunnelStream,
+    host: String,
+    open_us: u64,
+) {
+    let clock = HopClock::new();
+    let stream_id = tun.id;
+    let mut overlay = HopProbe::wrap(tun, clock.clone());
+    let t_copy = Instant::now();
+    let copy = tokio::io::copy_bidirectional(&mut tcp, &mut overlay).await;
+    session.process().record_hop(HopSample {
+        role: HopRole::Client,
+        stream_id,
+        host,
+        outcome: if copy.is_ok() {
+            HopOutcome::Ok
+        } else {
+            HopOutcome::CopyErr
+        },
+        copy_us: Some((t_copy.elapsed().as_micros() as u64).max(1)),
+        open_us: Some(open_us),
+        first_rx_us: clock.first_rx_us(),
+        last_rx_us: clock.last_rx_us(),
+        first_tx_us: clock.first_tx_us(),
+        ..Default::default()
+    });
 }
 
 async fn reply(tcp: &mut TcpStream, rep: u8) -> Result<()> {

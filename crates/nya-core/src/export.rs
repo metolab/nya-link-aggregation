@@ -11,7 +11,8 @@ use tracing::{debug, info, warn};
 
 use crate::catalog::{format_snapshot_metrics, snapshot_p99};
 use crate::cfg::ObsOpts;
-use crate::metrics::{path_state_label, ProcessSnapshot};
+use crate::hop::HopSample;
+use crate::metrics::{path_state_label, percentile, ProcessSnapshot, STALL_MS_BOUNDS};
 use crate::session::{Session, SessionTable};
 
 const HTTP_READ_CAP: usize = 8 * 1024;
@@ -41,7 +42,11 @@ pub fn spawn_obs_session(session: Session, obs: ObsOpts) {
                 session: session.snapshot(),
             }
         };
-        run_obs(interval, listen, snap, async {
+        let take_tail = {
+            let session = session.clone();
+            move || session.process().take_interval_tail()
+        };
+        run_obs(interval, listen, snap, take_tail, async {
             session.wait_dead().await;
         })
         .await;
@@ -59,7 +64,11 @@ pub fn spawn_obs_table(table: Arc<SessionTable>, obs: ObsOpts, mut stop: watch::
             let table = table.clone();
             move || table.aggregate_snapshot()
         };
-        run_obs(interval, listen, snap, async {
+        let take_tail = {
+            let table = table.clone();
+            move || table.process().take_interval_tail()
+        };
+        run_obs(interval, listen, snap, take_tail, async {
             tokio::select! {
                 _ = stop.wait_for(|v| *v) => {}
                 _ = async {
@@ -76,12 +85,19 @@ pub fn spawn_obs_table(table: Arc<SessionTable>, obs: ObsOpts, mut stop: watch::
     });
 }
 
-async fn run_obs<F, S>(interval: Option<Duration>, listen: Option<String>, snap: F, stop: S)
-where
+async fn run_obs<F, T, S>(
+    interval: Option<Duration>,
+    listen: Option<String>,
+    snap: F,
+    take_tail: T,
+    stop: S,
+) where
     F: Fn() -> ProcessSnapshot + Send + Sync + 'static,
+    T: Fn() -> Option<HopSample> + Send + Sync + 'static,
     S: std::future::Future<Output = ()> + Send,
 {
     let snap = Arc::new(snap);
+    let take_tail = Arc::new(take_tail);
     let http = match listen.as_deref() {
         None => None,
         Some(s) => match parse_metrics_listen(s) {
@@ -115,7 +131,11 @@ where
         loop {
             tokio::select! {
                 _ = &mut stop => break,
-                _ = tick.tick() => emit_snapshot(&snap()),
+                _ = tick.tick() => {
+                    let ps = snap();
+                    let tail = take_tail();
+                    emit_snapshot(&ps, tail);
+                }
             }
         }
     } else {
@@ -126,10 +146,22 @@ where
     }
 }
 
-fn emit_snapshot(ps: &ProcessSnapshot) {
+fn hop_p99(h: &crate::metrics::HistSnap) -> Option<u64> {
+    percentile(h, STALL_MS_BOUNDS, 99.0)
+}
+
+fn emit_snapshot(ps: &ProcessSnapshot, tail: Option<HopSample>) {
     // Info must not attach `metrics=` (full catalog). That dump is debug-only.
     let s = &ps.session;
     let (stall_p99, failover_p99) = snapshot_p99(ps);
+    let p = &ps.process;
+    let open_p99_ms = hop_p99(&p.hop_open_ms);
+    let first_rx_p99_ms = hop_p99(&p.hop_first_rx_ms);
+    let last_rx_p99_ms = hop_p99(&p.hop_last_rx_ms);
+    let dial_p99_ms = hop_p99(&p.hop_dial_ms);
+    let origin_first_p99_ms = hop_p99(&p.hop_origin_first_ms);
+    let origin_last_p99_ms = hop_p99(&p.hop_origin_last_ms);
+    let tail = tail.as_ref().map(|t| t.format_tail());
     info!(
         target: "nya_core::obs",
         stall_p99_ms = stall_p99,
@@ -155,6 +187,13 @@ fn emit_snapshot(ps: &ProcessSnapshot) {
         picks_unk = s.picks_unknown_rtt,
         recycle = s.path_outlier_recycle,
         corr = s.correlated_silence,
+        open_p99_ms,
+        first_rx_p99_ms,
+        last_rx_p99_ms,
+        dial_p99_ms,
+        origin_first_p99_ms,
+        origin_last_p99_ms,
+        tail = tail.as_deref(),
         paths = %format_paths(&s.paths),
         links = %format_links(&s.links),
         streams = %format_streams(&s.streams, s.streams_live),

@@ -24,6 +24,7 @@ mod cfg;
 mod export;
 mod handshake;
 mod health;
+mod hop;
 mod metrics;
 mod path;
 mod scheduler;
@@ -42,6 +43,7 @@ pub use handshake::{
     client_create_session, client_join_session, server_accept_handshake, HandshakeError,
     HandshakeResult,
 };
+pub use hop::{HopClock, HopOutcome, HopProbe, HopRole, HopSample, OriginPeerSlots};
 pub use metrics::{
     percentile, rollup_links, HistSnap, Histogram, LinkSnap, PathSnap, ProcessCounters,
     ProcessSnapshot, Snapshot as SessionSnapshot, FAILOVER_MS_BOUNDS, LIFETIME_MS_BOUNDS,
