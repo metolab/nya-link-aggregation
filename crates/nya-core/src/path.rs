@@ -56,6 +56,8 @@ pub struct PathState {
     outlier_since: std::sync::Mutex<Option<Instant>>,
     /// First freeze of `rtt_class_us`. Recycle age-gate; never cleared.
     class_known_since: std::sync::Mutex<Option<Instant>>,
+    /// Set on a class-raise store; cleared on a drop store iff `new_us <= fast`.
+    class_unwind_permit: AtomicBool,
     /// CAS: one failover_ms sample per path.
     pub failover_recorded: AtomicBool,
     urgent_queued: AtomicU64,
@@ -100,6 +102,7 @@ impl PathState {
             class_low_accum: std::sync::Mutex::new(Duration::ZERO),
             outlier_since: std::sync::Mutex::new(None),
             class_known_since: std::sync::Mutex::new(None),
+            class_unwind_permit: AtomicBool::new(false),
             failover_recorded: AtomicBool::new(false),
             urgent_queued: AtomicU64::new(0),
             bulk_queued: AtomicU64::new(0),
@@ -264,6 +267,12 @@ impl PathState {
         self.pending_ping.lock().unwrap().len() as u64
     }
 
+    /// UP and DEGRADED probe; DOWN does not. At most one in-flight Ping.
+    /// Idle-gate is `ago >= ping_every`.
+    pub(crate) fn should_send_ping(&self, ago: Duration, ping_every: Duration) -> bool {
+        self.is_alive() && self.pending_ping_count() == 0 && ago >= ping_every
+    }
+
     /// Drop pings with no Pong within `max_age`. Returns how many were expired.
     pub fn expire_stale_pings(&self, max_age: Duration) -> u64 {
         let mut g = self.pending_ping.lock().unwrap();
@@ -340,9 +349,9 @@ impl PathState {
         let hold = Duration::from_micros(self.stable_up_hold_us.load(Ordering::Relaxed));
         let raise = fast > c_old.saturating_mul(t.stable_raise_mult)
             && fast > c_old + t.stable_raise_add_us;
-        let drop = t.class_should_drop(c_old, fast);
 
         // Lock order: class_high_since, class_low_since, class_low_accum.
+        // class_unwind_permit is Relaxed while this trio is held, like rtt_class_us.
         let mut high = self.class_high_since.lock().unwrap();
         let mut low = self.class_low_since.lock().unwrap();
         let mut accum = self.class_low_accum.lock().unwrap();
@@ -354,6 +363,7 @@ impl PathState {
                 let new_us = (c_old * 7 + fast) / 8;
                 self.rtt_class_us.store(new_us, Ordering::Relaxed);
                 *high = None; // one 7/8 per hold; timeout-stable raise stays a ratchet
+                self.class_unwind_permit.store(true, Ordering::Relaxed);
                 tracing::info!(
                     path = %self.name,
                     old_us = c_old,
@@ -365,6 +375,8 @@ impl PathState {
             return;
         }
         *high = None;
+        let drop = t.class_should_drop(c_old, fast)
+            || (self.class_unwind_permit.load(Ordering::Relaxed) && fast < c_old);
         if drop {
             let start = low.get_or_insert_with(Instant::now);
             if start.elapsed().saturating_add(*accum) >= hold {
@@ -372,6 +384,11 @@ impl PathState {
                 self.rtt_class_us.store(new_us, Ordering::Relaxed);
                 *low = None;
                 *accum = Duration::ZERO;
+                // Clear only when integer 7/8 has met fast.
+                // (7(f+1)+f)/8 = f when c_old == fast + 1.
+                if new_us <= fast {
+                    self.class_unwind_permit.store(false, Ordering::Relaxed);
+                }
                 tracing::info!(
                     path = %self.name,
                     old_us = c_old,
@@ -382,6 +399,7 @@ impl PathState {
             }
             return;
         }
+        // Dead zone (class, 2×class]: leave permit true and G4a-pause.
         if let Some(start) = low.take() {
             *accum = accum.saturating_add(start.elapsed());
         }
@@ -428,6 +446,11 @@ impl PathState {
     #[cfg(test)]
     pub(crate) fn outlier_since_for_test(&self) -> Option<Instant> {
         *self.outlier_since.lock().unwrap()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn class_unwind_permit_for_test(&self) -> bool {
+        self.class_unwind_permit.load(Ordering::Relaxed)
     }
 
     #[cfg(test)]
@@ -587,12 +610,7 @@ pub fn spawn_path_io<T>(
                         break;
                     }
                     let ago = path.last_rx_ago();
-                    if ago >= ping_every && path.pending_ping_count() == 0 {
-                        if !path.is_up() {
-                            // DEGRADED/DOWN: do not fill a silent pipe (G5).
-                            next_ping = tokio::time::Instant::now() + ping_every;
-                            continue;
-                        }
+                    if path.should_send_ping(ago, ping_every) {
                         let ping = path.next_ping();
                         if let Err(e) =
                             send_frame(&mut framed, &session, &path, Frame::Ping(ping)).await
@@ -606,9 +624,9 @@ pub fn spawn_path_io<T>(
                         next_ping = tokio::time::Instant::now()
                             + ping_every.saturating_sub(ago);
                     } else {
-                        // pending > 0 and still silent. Must wait a
-                        // non-zero interval — saturating_sub(ago) is 0
-                        // here and would busy-loop sleep_until(now).
+                        // pending > 0 (or DOWN, which already broke the loop).
+                        // Must wait a non-zero interval — saturating_sub(ago)
+                        // is 0 here and would busy-loop sleep_until(now).
                         next_ping = tokio::time::Instant::now() + ping_every;
                     }
                 }
@@ -955,6 +973,10 @@ mod tests {
         p.record_rtt(Duration::from_millis(10));
         assert!(p.class_known());
         assert!(p.class_known_since_for_test().is_some());
+        assert!(
+            !p.class_unwind_permit_for_test(),
+            "init freeze is not a raise"
+        );
     }
 
     #[test]
@@ -966,5 +988,180 @@ mod tests {
         p.record_rtt(Duration::from_millis(180));
         assert_eq!(p.class_low_accum(), Duration::ZERO);
         assert!(p.class_low_since.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn degraded_path_still_probes() {
+        let p = path();
+        p.mark_degraded();
+        let every = Duration::from_millis(10);
+        assert!(p.should_send_ping(every, every));
+    }
+
+    #[test]
+    fn down_path_does_not_probe() {
+        let p = path();
+        p.state.store(STATE_DOWN, Ordering::Relaxed);
+        let every = Duration::from_millis(10);
+        assert!(!p.should_send_ping(every, every));
+    }
+
+    #[test]
+    fn pending_ping_blocks_probe() {
+        let p = path();
+        p.next_ping();
+        let every = Duration::from_millis(10);
+        assert!(!p.should_send_ping(every, every));
+        p.mark_degraded();
+        assert!(!p.should_send_ping(every, every));
+    }
+
+    #[test]
+    fn idle_gate_does_not_probe() {
+        let p = path();
+        let every = Duration::from_millis(10);
+        assert!(!p.should_send_ping(every - Duration::from_nanos(1), every));
+    }
+
+    #[test]
+    fn up_path_still_probes() {
+        let p = path();
+        let every = Duration::from_millis(10);
+        assert!(p.should_send_ping(every, every));
+    }
+
+    fn raise_to_unwind_class(p: &PathState) {
+        p.stable_up_hold_us.store(50_000, Ordering::Relaxed);
+        p.rtt_class_us.store(8_000, Ordering::Relaxed);
+        p.rtt_ewma_us.store(50_000, Ordering::Relaxed);
+        p.rtt_stable_us.store(8_000, Ordering::Relaxed);
+        p.record_rtt(Duration::from_millis(50));
+        assert_eq!(p.rtt_class_us.load(Ordering::Relaxed), 8_000);
+        std::thread::sleep(Duration::from_millis(55));
+        p.record_rtt(Duration::from_millis(50));
+        assert_eq!(p.rtt_class_us.load(Ordering::Relaxed), 13_250);
+        assert!(p.class_unwind_permit_for_test());
+        assert!(!Tuning::STANDARD.class_should_drop(13_250, 8_000));
+    }
+
+    #[test]
+    fn raise_permit_allows_drop_below_abs_floor() {
+        let p = path();
+        raise_to_unwind_class(&p);
+        p.rtt_ewma_us.store(8_000, Ordering::Relaxed);
+        p.rtt_stable_us.store(8_000, Ordering::Relaxed);
+        p.record_rtt(Duration::from_millis(8));
+        assert_eq!(
+            p.rtt_class_us.load(Ordering::Relaxed),
+            13_250,
+            "G4a hold: first recovered sample must not store"
+        );
+        std::thread::sleep(Duration::from_millis(55));
+        p.record_rtt(Duration::from_millis(8));
+        assert_eq!(p.rtt_class_us.load(Ordering::Relaxed), 12_593);
+        assert!(
+            p.class_unwind_permit_for_test(),
+            "12593 > 8000 is not catch-up"
+        );
+        p.record_rtt(Duration::from_millis(8));
+        assert_eq!(
+            p.rtt_class_us.load(Ordering::Relaxed),
+            12_593,
+            "drop store clears low; next hold starts here"
+        );
+        std::thread::sleep(Duration::from_millis(55));
+        p.record_rtt(Duration::from_millis(8));
+        assert_eq!(p.rtt_class_us.load(Ordering::Relaxed), 12_018);
+        assert!(p.class_unwind_permit_for_test());
+    }
+
+    #[test]
+    fn permit_survives_ewma_descent_dead_zone() {
+        let p = path();
+        raise_to_unwind_class(&p);
+        // Walk ewma 50000 → 41600 → 34880 → 29504 (still raise vs 13250)
+        // then ~25 ms into (class, 2×class]. No sleep: raise hold must not fire.
+        for _ in 0..4 {
+            p.record_rtt(Duration::from_millis(8));
+        }
+        let class = p.rtt_class_us.load(Ordering::Relaxed);
+        let fast = p.rtt_ewma_us.load(Ordering::Relaxed);
+        assert_eq!(class, 13_250, "dead zone must not store a drop");
+        assert!(
+            p.class_unwind_permit_for_test(),
+            "permit must survive (class, 2×class], fast={fast}"
+        );
+        assert!(
+            fast > class && fast <= class.saturating_mul(2),
+            "expected dead zone, fast={fast} class={class}"
+        );
+        assert!(!Tuning::STANDARD.class_should_drop(class, fast));
+    }
+
+    #[test]
+    fn permit_not_spent_on_one_us_dip() {
+        let p = path();
+        raise_to_unwind_class(&p);
+        p.rtt_ewma_us.store(13_200, Ordering::Relaxed);
+        p.rtt_stable_us.store(13_200, Ordering::Relaxed);
+        p.record_rtt(Duration::from_micros(13_200));
+        assert_eq!(
+            p.rtt_class_us.load(Ordering::Relaxed),
+            13_250,
+            "G4a hold: dip sample must not store"
+        );
+        std::thread::sleep(Duration::from_millis(55));
+        p.record_rtt(Duration::from_micros(13_200));
+        assert_eq!(p.rtt_class_us.load(Ordering::Relaxed), 13_243);
+        assert!(
+            p.class_unwind_permit_for_test(),
+            "13243 > 13200 is not catch-up"
+        );
+        p.rtt_ewma_us.store(8_000, Ordering::Relaxed);
+        p.rtt_stable_us.store(8_000, Ordering::Relaxed);
+        p.record_rtt(Duration::from_millis(8));
+        assert_eq!(p.rtt_class_us.load(Ordering::Relaxed), 13_243);
+        std::thread::sleep(Duration::from_millis(55));
+        p.record_rtt(Duration::from_millis(8));
+        let class = p.rtt_class_us.load(Ordering::Relaxed);
+        assert!(
+            class < 13_243,
+            "recovered-8 ms hold must drop, class={class}"
+        );
+        assert!(p.class_unwind_permit_for_test());
+    }
+
+    #[test]
+    fn permit_clears_when_seven_eighths_meets_fast() {
+        let p = path();
+        raise_to_unwind_class(&p);
+        p.stable_up_hold_us.store(0, Ordering::Relaxed);
+        p.rtt_class_us.store(8_001, Ordering::Relaxed);
+        p.rtt_ewma_us.store(8_000, Ordering::Relaxed);
+        p.rtt_stable_us.store(8_000, Ordering::Relaxed);
+        p.record_rtt(Duration::from_micros(8_000));
+        assert_eq!(p.rtt_class_us.load(Ordering::Relaxed), 8_000);
+        assert!(
+            !p.class_unwind_permit_for_test(),
+            "new_us == fast must clear permit"
+        );
+        p.stable_up_hold_us.store(0, Ordering::Relaxed);
+        p.rtt_class_us.store(180_000, Ordering::Relaxed);
+        p.rtt_ewma_us.store(140_000, Ordering::Relaxed);
+        p.rtt_stable_us.store(180_000, Ordering::Relaxed);
+        p.record_rtt(Duration::from_millis(140));
+        assert_eq!(
+            p.rtt_class_us.load(Ordering::Relaxed),
+            180_000,
+            "after catch-up, 140 vs 180 must not drop"
+        );
+        p.rtt_class_us.store(220_000, Ordering::Relaxed);
+        p.rtt_ewma_us.store(180_000, Ordering::Relaxed);
+        p.record_rtt(Duration::from_millis(180));
+        assert_eq!(
+            p.rtt_class_us.load(Ordering::Relaxed),
+            220_000,
+            "after catch-up, 220 vs 180 must not drop"
+        );
     }
 }
