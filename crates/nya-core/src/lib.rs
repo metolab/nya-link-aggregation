@@ -1,4 +1,4 @@
-//! Multi-path TCP+TLS overlay (sticky-per-stream, failover / failback).
+//! Multi-path TCP+TLS overlay (path-agnostic offsets, RTT-scaled retry).
 //!
 //! Data path:
 //! ```text

@@ -14,8 +14,8 @@ pub use frame::{
     ProtoError, ResetReason, StreamAck, StreamClose, StreamData, StreamOpen, StreamReset, Target,
 };
 
-pub const PROTOCOL_VERSION: u8 = 1;
-pub const ALPN: &[u8] = b"nya/1";
+pub const PROTOCOL_VERSION: u8 = 2;
+pub const ALPN: &[u8] = b"nya/2";
 pub const TLS_EXPORTER_LABEL: &str = "nya-link-aggregation";
 pub const SESSION_ID_LEN: usize = 16;
 pub const NONCE_LEN: usize = 32;

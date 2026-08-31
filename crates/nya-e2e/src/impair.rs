@@ -200,6 +200,16 @@ impl LinkHandle {
         self.live_conns().len()
     }
 
+    /// Blackhole one overlay TCP for `hold`, then clear (other conns stay up).
+    pub fn blackhole_conn_for(&self, idx: usize, hold: Duration) {
+        self.set_conn_blackhole(idx, true);
+        let h = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(hold).await;
+            h.set_conn_blackhole(idx, false);
+        });
+    }
+
     /// Blackhole a single overlay TCP connection (0-based among live conns).
     pub fn set_conn_blackhole(&self, idx: usize, on: bool) {
         let live = self.live_conns();

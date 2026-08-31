@@ -12,7 +12,7 @@
 
 ## Overview
 
-nya 是多路径 TCP+TLS overlay：应用流粘在最快 RTT class 上，路径变差时 migrate，恢复后 failback。项目是否「有用」，不取决于帧吞吐或 vanity counter，而取决于应用 TCP 看起来是否像一条稳定连接——流是否跑完、发送/乱序是否卡住、路径静默后多久切走、切换是在救命还是在 chatter。
+nya 是多路径 TCP+TLS overlay：路径是池，offset 发在此刻最好的活 TCP 上，未 ACK 则按 2×RTT 换路再发。项目是否「有用」，不取决于帧吞吐或 vanity counter，而取决于应用 TCP 看起来是否像一条稳定连接——流是否跑完、发送/乱序是否卡住、单条 5-tuple 空洞是否把 first-byte 拖到路径 down 钟。
 
 现状是半套可观测性：`crates/nya-core/src/metrics.rs` 的 `Counters` 只活在进程里，`Session::snapshot()` 几乎只被 `nya-e2e` 读取；生产二进制没有任何导出。决策点（`steer::maybe_failback`、`maybe_speculative`、`migrate_from_path`）打在 `info!`，每条 STREAM_DATA / ACK / Ping 正确地保持沉默，但 `pick_path` 打分、HOL rebalance、send-blocked 跳连、reset 原因都是盲区。README 写 `RUST_LOG=nya_core=debug`，但 client/server `main.rs` 在 `from_default_env()` 之后 `add_directive("nya_core=info")`。tracing-subscriber 0.3 对**同等特异度**的 directive 是替换而不是取最大：`RUST_LOG=nya_core=debug` **一定会被盖成 info**。更具体的 target（例如 `nya_core::session::steer=debug`）仍然生效。
 

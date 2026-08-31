@@ -1,7 +1,7 @@
 //! One overlay session: many TCP+TLS paths, many multiplexed streams.
 //!
 //! * [`streams`] — open/accept, windowed send, recv reorder, ACKs
-//! * [`steer`] — health tick, speculative migrate, failback, same-link rebalance
+//! * [`steer`] — health tick, RTT-scaled retry, failback, same-link rebalance
 //!
 //! Path pick lives in [`crate::scheduler`]. Timeouts in [`crate::health`].
 
@@ -17,17 +17,30 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, Notify};
 use tracing::{debug, info, warn};
 
-use nya_proto::{Frame, Pong, ResetReason, StreamData};
+use nya_proto::{Frame, Pong, ResetReason, StreamData, StreamOpen, Target};
 
 use crate::cfg::SessionConfig;
+use crate::health;
 use crate::metrics::HistSnap;
 use crate::metrics::{
     flatten_paths, Counters, ProcessCounters, ProcessSnapshot, Snapshot, FAILOVER_MS_BOUNDS,
     LIFETIME_MS_BOUNDS, STALL_MS_BOUNDS,
 };
 use crate::path::{spawn_path_io, PathState, STATE_DOWN};
-use crate::scheduler::{backup_prefer_class, pick_path_pref, pick_path_pref_spread, PickPref};
+use crate::scheduler::{pick_path_pref, pick_path_pref_spread, pick_retry_path, PickPref};
 use crate::stream::{StreamState, Unacked};
+
+struct OpenUnacked {
+    path_id: u32,
+    sent_at: Instant,
+    target: Target,
+}
+
+struct PendingEarly {
+    at: Instant,
+    path_id: u32,
+    data: StreamData,
+}
 
 pub use crate::stream::TunnelStream;
 
@@ -67,6 +80,8 @@ pub(crate) struct Inner {
     metrics: Counters,
     process: Arc<ProcessCounters>,
     last_rtt_us: Mutex<HashMap<String, u64>>,
+    opens: Mutex<HashMap<u32, OpenUnacked>>,
+    pending_early: Mutex<HashMap<u32, Vec<PendingEarly>>>,
 }
 
 #[derive(Clone)]
@@ -109,6 +124,8 @@ impl Session {
             metrics: Counters::default(),
             process,
             last_rtt_us: Mutex::new(HashMap::new()),
+            opens: Mutex::new(HashMap::new()),
+            pending_early: Mutex::new(HashMap::new()),
         });
         let session = Self { inner };
         session.spawn_maintenance();
@@ -189,11 +206,30 @@ impl Session {
     }
 
     pub async fn wait_ready(&self, timeout: Duration) -> Result<(), SessionError> {
-        self.wait_paths(1, timeout).await
+        self.wait_alive(1, timeout).await
+    }
+
+    /// Wait until at least `n` overlay TCPs are alive (RTT may still be unknown).
+    pub async fn wait_alive(&self, n: usize, timeout: Duration) -> Result<(), SessionError> {
+        let start = Instant::now();
+        loop {
+            if self.alive_path_count() >= n {
+                return Ok(());
+            }
+            if self.is_dead() {
+                return Err(SessionError::Dead);
+            }
+            if start.elapsed() >= timeout {
+                return Err(SessionError::NoPath);
+            }
+            tokio::select! {
+                _ = self.inner.ready.notified() => {}
+                _ = tokio::time::sleep(self.inner.cfg.tuning.ready_poll) => {}
+            }
+        }
     }
 
     /// Wait until at least `n` paths are alive and have a measured RTT.
-    /// Alive-only lets the first stream pick on the unknown-RTT placeholder.
     pub async fn wait_paths(&self, n: usize, timeout: Duration) -> Result<(), SessionError> {
         let start = Instant::now();
         loop {
@@ -281,7 +317,8 @@ impl Session {
         info!(path = %path.name, path_id, "path down");
         self.inner.metrics.path_down.fetch_add(1, Ordering::Relaxed);
         self.observe_failover(&path);
-        self.migrate_from_path(path_id);
+        self.rehome_unacked_from(path_id);
+        self.retry_open_from(path_id);
         self.inner.paths.lock().unwrap().remove(&path_id);
         if !self.has_alive_path() {
             *self.inner.all_down_since.lock().unwrap() = Some(Instant::now());
@@ -328,52 +365,191 @@ impl Session {
         pick_path_pref(&paths, &self.inner.cfg, pref)
     }
 
+    fn pick_retry(&self, avoid: u32) -> Option<u32> {
+        pick_retry_path(&self.path_list(), &self.inner.cfg, avoid)
+    }
+
+    fn retry_after(&self, path_id: u32) -> Duration {
+        match self.get_path(path_id) {
+            Some(p) => health::loss_timeout(&self.inner.cfg, p.rtt()),
+            None => self.inner.cfg.tuning.loss_timeout_floor,
+        }
+    }
+
+    fn note_retry(&self, from: u32, to: u32) {
+        let from_link = self.get_path(from).map(|p| p.link().to_string());
+        let to_link = self.get_path(to).map(|p| p.link().to_string());
+        if from_link.is_some() && from_link == to_link {
+            self.inner
+                .metrics
+                .data_retransmit
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.inner
+                .metrics
+                .data_hedge
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Expired unacked copies: one send on a *different* path. Never in-place.
+    fn retry_expired_unacked(&self, st: &StreamState) {
+        if !st.is_steerable() {
+            return;
+        }
+        let mut unacked = st.unacked.lock().unwrap();
+        for (offset, u) in unacked.iter_mut() {
+            if u.last_sent.elapsed() < self.retry_after(u.path_id) {
+                continue;
+            }
+            let Some(alt) = self.pick_retry(u.path_id) else {
+                continue;
+            };
+            let from = u.path_id;
+            self.rehome_unacked(u, alt);
+            self.send_data_frame(st.id, *offset, u.data.clone(), alt);
+            self.note_retry(from, alt);
+        }
+    }
+
+    fn rehome_unacked_from(&self, dead: u32) {
+        let streams: Vec<_> = self
+            .inner
+            .streams
+            .lock()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect();
+        let Some(alt) = self.pick_retry(dead) else {
+            return;
+        };
+        for st in streams {
+            self.retransmit_from_on(&st, dead, alt);
+        }
+    }
+
+    fn remember_open(&self, id: u32, path_id: u32, target: Target) {
+        self.inner.opens.lock().unwrap().insert(
+            id,
+            OpenUnacked {
+                path_id,
+                sent_at: Instant::now(),
+                target,
+            },
+        );
+    }
+
+    fn forget_open(&self, id: u32) {
+        self.inner.opens.lock().unwrap().remove(&id);
+    }
+
+    fn retry_opens(&self) {
+        let snapshot: Vec<(u32, u32, Target)> = self
+            .inner
+            .opens
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, o)| o.sent_at.elapsed() >= self.retry_after(o.path_id))
+            .map(|(id, o)| (*id, o.path_id, o.target.clone()))
+            .collect();
+        for (id, from, target) in snapshot {
+            let Some(alt) = self.pick_retry(from) else {
+                continue;
+            };
+            if self.send_on_path(
+                alt,
+                Frame::StreamOpen(StreamOpen {
+                    stream_id: id,
+                    target: target.clone(),
+                }),
+            ) {
+                if let Some(o) = self.inner.opens.lock().unwrap().get_mut(&id) {
+                    o.path_id = alt;
+                    o.sent_at = Instant::now();
+                    o.target = target;
+                }
+                self.note_retry(from, alt);
+            }
+        }
+    }
+
+    fn retry_open_from(&self, dead: u32) {
+        let snapshot: Vec<(u32, Target)> = self
+            .inner
+            .opens
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, o)| o.path_id == dead)
+            .map(|(id, o)| (*id, o.target.clone()))
+            .collect();
+        for (id, target) in snapshot {
+            let Some(alt) = self.pick_retry(dead) else {
+                continue;
+            };
+            if self.send_on_path(
+                alt,
+                Frame::StreamOpen(StreamOpen {
+                    stream_id: id,
+                    target: target.clone(),
+                }),
+            ) {
+                if let Some(o) = self.inner.opens.lock().unwrap().get_mut(&id) {
+                    o.path_id = alt;
+                    o.sent_at = Instant::now();
+                }
+                self.note_retry(dead, alt);
+            }
+        }
+    }
+
+    fn min_known_rtt(&self) -> Duration {
+        self.path_list()
+            .iter()
+            .filter(|p| p.rtt_known())
+            .map(|p| p.rtt())
+            .min()
+            .unwrap_or(self.inner.cfg.ping_interval_max)
+    }
+
+    fn push_early_data(&self, path_id: u32, data: StreamData) {
+        self.inner
+            .pending_early
+            .lock()
+            .unwrap()
+            .entry(data.stream_id)
+            .or_default()
+            .push(PendingEarly {
+                at: Instant::now(),
+                path_id,
+                data,
+            });
+    }
+
+    fn take_early_data(&self, id: u32) -> Vec<PendingEarly> {
+        self.inner
+            .pending_early
+            .lock()
+            .unwrap()
+            .remove(&id)
+            .unwrap_or_default()
+    }
+
+    fn expire_early_data(&self) {
+        // Open retry fires at 1× loss_timeout; keep DATA a second cycle.
+        let thresh = health::loss_timeout(&self.inner.cfg, self.min_known_rtt()).saturating_mul(2);
+        let mut g = self.inner.pending_early.lock().unwrap();
+        for v in g.values_mut() {
+            v.retain(|e| e.at.elapsed() < thresh);
+        }
+        g.retain(|_, v| !v.is_empty());
+    }
+
     fn pick_pref_spread(&self, pref: PickPref, stream_id: u32) -> Option<u32> {
         let paths = self.path_list();
         pick_path_pref_spread(&paths, &self.inner.cfg, pref, stream_id)
-    }
-
-    fn ensure_sticky(&self, stream_id: u32) -> Option<u32> {
-        let st = self.get_stream(stream_id)?;
-        let cur = st.sticky.load(Ordering::Relaxed);
-        if let Some(p) = self.get_path(cur) {
-            if p.is_schedulable() {
-                return Some(cur);
-            }
-            if p.is_alive() {
-                if let Some(alt) = backup_prefer_class(&self.path_list(), cur, &self.inner.cfg) {
-                    if alt != cur {
-                        self.set_sticky(stream_id, alt);
-                        self.note_migrate("ensure_sticky");
-                        debug!(
-                            stream_id,
-                            from = cur,
-                            to = alt,
-                            reason = "ensure_sticky",
-                            "migrate"
-                        );
-                        return Some(alt);
-                    }
-                }
-                return Some(cur);
-            }
-        }
-        let pref = if st.bulk.load(Ordering::Relaxed) {
-            PickPref::Any
-        } else {
-            PickPref::Interactive
-        };
-        let picked = self.pick_pref(pref)?;
-        self.set_sticky(stream_id, picked);
-        self.note_migrate("ensure_sticky");
-        debug!(
-            stream_id,
-            from = cur,
-            to = picked,
-            reason = "ensure_sticky",
-            "migrate"
-        );
-        Some(picked)
     }
 
     pub fn last_known_rtt(&self, name: &str) -> Option<Duration> {
@@ -436,6 +612,7 @@ impl Session {
         };
         self.unstick(&st);
         self.release_unacked(&st);
+        self.forget_open(id);
     }
 
     fn xfer_inflight(&self, from: u32, to: u32, n: u64) {
@@ -465,23 +642,6 @@ impl Session {
                 data,
             }),
         )
-    }
-
-    /// Retransmit every unacked chunk on `to`, rehoming inflight.
-    fn retransmit_all_on(&self, st: &StreamState, to: u32) {
-        let mut unacked = st.unacked.lock().unwrap();
-        let mut n = 0u64;
-        for (offset, u) in unacked.iter_mut() {
-            self.rehome_unacked(u, to);
-            self.send_data_frame(st.id, *offset, u.data.clone(), to);
-            n += 1;
-        }
-        if n > 0 {
-            self.inner
-                .metrics
-                .data_retransmit
-                .fetch_add(n, Ordering::Relaxed);
-        }
     }
 
     /// Retransmit unacked still assigned to `from` onto `to`.
@@ -611,10 +771,9 @@ impl Session {
             let _ = st.inbound_tx.try_send(crate::stream::Inbound::Reset(why));
             st.send_wait.notify_waiters();
             if send_frame {
-                let cur = st.sticky.load(Ordering::Relaxed);
-                if self.get_path(cur).is_some_and(|p| p.is_alive()) {
+                if let Some(p) = self.pick_pref(PickPref::Any) {
                     self.send_on_path(
-                        cur,
+                        p,
                         Frame::StreamReset(nya_proto::StreamReset {
                             stream_id: id,
                             reason: why,
@@ -1088,6 +1247,134 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn expired_unacked_retries_other_link() {
+        let client = Session::new_client(SessionConfig::default());
+        inject_named(&client, 1, "akcdn#0", 7);
+        inject_named(&client, 2, "soy#0", 7);
+        let mut tun = client
+            .open_stream(Target {
+                host: "t".into(),
+                port: 1,
+            })
+            .await
+            .unwrap();
+        tun.write_all(b"hello").await.unwrap();
+        let st = {
+            let g = client.inner.streams.lock().unwrap();
+            g.values().next().unwrap().clone()
+        };
+        let deadline = Instant::now() + Duration::from_millis(200);
+        loop {
+            if !st.unacked.lock().unwrap().is_empty() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "write must leave unacked");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let from = {
+            let mut u = st.unacked.lock().unwrap();
+            for x in u.values_mut() {
+                x.last_sent = Instant::now() - Duration::from_millis(100);
+            }
+            u.values().next().unwrap().path_id
+        };
+        let hedge0 = client.snapshot().data_hedge;
+        let rtx0 = client.snapshot().data_retransmit;
+        client.debug_maintain();
+        let to = st.unacked.lock().unwrap().values().next().unwrap().path_id;
+        assert_ne!(to, from, "retry must leave the timed-out path");
+        assert!(client.snapshot().data_hedge + client.snapshot().data_retransmit > hedge0 + rtx0);
+        drop(tun);
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn path_down_rehomes_unacked_immediately() {
+        let client = Session::new_client(SessionConfig::default());
+        inject_named(&client, 1, "akcdn#0", 7);
+        inject_named(&client, 2, "soy#0", 7);
+        let mut tun = client
+            .open_stream(Target {
+                host: "t".into(),
+                port: 1,
+            })
+            .await
+            .unwrap();
+        tun.write_all(b"hello").await.unwrap();
+        let st = {
+            let g = client.inner.streams.lock().unwrap();
+            g.values().next().unwrap().clone()
+        };
+        let deadline = Instant::now() + Duration::from_millis(200);
+        loop {
+            if !st.unacked.lock().unwrap().is_empty() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "write must leave unacked");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let from = st.unacked.lock().unwrap().values().next().unwrap().path_id;
+        client.path_failed(from);
+        let to = st.unacked.lock().unwrap().values().next().unwrap().path_id;
+        assert_ne!(to, from);
+        assert!(client.get_path(from).is_none());
+        drop(tun);
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn duplicate_open_dials_origin_once() {
+        let (server, mut incoming) = Session::new_server(SessionConfig::default());
+        let open = StreamOpen {
+            stream_id: 7,
+            target: Target {
+                host: "t".into(),
+                port: 1,
+            },
+        };
+        server.accept_remote_stream(1, open.clone());
+        server.accept_remote_stream(2, open);
+        let first = incoming.try_recv().expect("one incoming");
+        assert_eq!(first.stream_id, 7);
+        assert!(incoming.try_recv().is_err());
+        assert_eq!(server.inner.streams.lock().unwrap().len(), 1);
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn early_data_delivered_after_open() {
+        let (server, mut incoming) = Session::new_server(SessionConfig::default());
+        inject_named(&server, 1, "akcdn#0", 7);
+        server.handle_frame(
+            1,
+            Frame::StreamData(StreamData {
+                stream_id: 9,
+                offset: 0,
+                data: b"hi!".to_vec(),
+            }),
+        );
+        assert!(server.inner.streams.lock().unwrap().is_empty());
+        server.accept_remote_stream(
+            1,
+            StreamOpen {
+                stream_id: 9,
+                target: Target {
+                    host: "t".into(),
+                    port: 1,
+                },
+            },
+        );
+        let mut inc = incoming.try_recv().expect("incoming");
+        let mut buf = [0u8; 3];
+        tokio::time::timeout(Duration::from_secs(1), inc.io.read_exact(&mut buf))
+            .await
+            .expect("early data")
+            .unwrap();
+        assert_eq!(&buf, b"hi!");
+        server.shutdown();
+    }
+
+    #[tokio::test]
     async fn failover_keeps_stream() {
         let (client, server, incoming) = pair();
         tokio::spawn(echo_server(incoming));
@@ -1242,18 +1529,25 @@ mod tests {
             p.set_congested(true);
         }
         client.debug_maintain();
-        let still = {
-            let streams = client.inner.streams.lock().unwrap();
-            streams
-                .values()
-                .next()
-                .unwrap()
-                .sticky
-                .load(Ordering::Relaxed)
-        };
-        assert_ne!(still, sticky, "DEGRADED must restick to sibling");
         assert_eq!(client.snapshot().path_down, down0);
         tun.write_all(b"ok!").await.unwrap();
+        let deadline = Instant::now() + Duration::from_millis(200);
+        let still = loop {
+            let s = {
+                let streams = client.inner.streams.lock().unwrap();
+                streams
+                    .values()
+                    .next()
+                    .unwrap()
+                    .sticky
+                    .load(Ordering::Relaxed)
+            };
+            if s != sticky || Instant::now() >= deadline {
+                break s;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        assert_ne!(still, sticky, "next send must leave the degraded path");
         tokio::time::timeout(Duration::from_secs(2), tun.read_exact(&mut buf))
             .await
             .expect("read after degrade migrate")
@@ -1375,16 +1669,9 @@ mod tests {
             p.set_congested(true);
         }
         client.debug_maintain();
+        tun.write_all(b"more").await.unwrap();
         let snap1 = client.snapshot();
         assert_eq!(snap1.path_down, snap0.path_down);
-        assert!(
-            snap1.migrates > snap0.migrates,
-            "degrade migrate must count migrates, {snap0:?} -> {snap1:?}"
-        );
-        assert!(
-            snap1.migrates_speculative > snap0.migrates_speculative,
-            "degrade migrate is speculative"
-        );
         assert!(!snap1.links.is_empty(), "snapshot must roll up links");
         client.shutdown();
         server.shutdown();
@@ -1889,17 +2176,11 @@ mod tests {
         let before_m = client.snapshot().migrates_speculative;
         client.debug_maintain();
         assert_eq!(client.snapshot().path_down, before_n);
-        assert!(client.snapshot().migrates_speculative > before_m);
-        let sticky = client
-            .inner
-            .streams
-            .lock()
-            .unwrap()
-            .get(&sid)
-            .unwrap()
-            .sticky
-            .load(Ordering::Relaxed);
-        assert_eq!(sticky, 2);
+        let _ = before_m;
+        assert!(
+            client.inner.paths.lock().unwrap().contains_key(&1),
+            "silent path must be held, not torn, while one peer is still up"
+        );
         drop(tun);
         client.shutdown();
     }
@@ -2118,17 +2399,11 @@ mod tests {
             "A past down_for must be held when B/C are quiet"
         );
         assert_eq!(client.snapshot().correlated_silence, before_c + 1);
-        assert!(client.snapshot().migrates_speculative > before_m);
-        let sticky = client
-            .inner
-            .streams
-            .lock()
-            .unwrap()
-            .get(&sid)
-            .unwrap()
-            .sticky
-            .load(Ordering::Relaxed);
-        assert_eq!(sticky, 2);
+        let _ = before_m;
+        assert!(
+            client.inner.paths.lock().unwrap().contains_key(&1),
+            "A past down_for must remain in the pool while correlated"
+        );
         age_rx(&b0, 400);
         age_rx(&b1, 400);
         client.debug_maintain();

@@ -6,14 +6,14 @@ use std::sync::Arc;
 use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
+use tracing::debug;
 use tracing::Level;
-use tracing::{debug, warn};
 
 use nya_proto::{
     Frame, ResetReason, StreamAck, StreamClose, StreamData, StreamOpen, Target, MAX_STREAM_PAYLOAD,
 };
 
-use crate::scheduler::backup_path;
+use crate::scheduler::PickPref;
 use crate::stream::{Inbound, StreamState, TunnelStream, Unacked};
 
 use super::{IncomingStream, Session, SessionError};
@@ -50,41 +50,57 @@ impl Session {
                 "pick"
             );
         }
-        self.send_on_path(
-            path_id,
-            Frame::StreamOpen(StreamOpen {
-                stream_id: id,
-                target,
-            }),
-        );
+        let open = Frame::StreamOpen(StreamOpen {
+            stream_id: id,
+            target: target.clone(),
+        });
+        if self.send_on_path(path_id, open.clone()) {
+            self.remember_open(id, path_id, target);
+        } else if let Some(alt) = self.pick_retry(path_id) {
+            self.send_on_path(alt, open);
+            self.set_sticky(id, alt);
+            self.remember_open(id, alt, target);
+        } else {
+            self.remember_open(id, path_id, target);
+        }
         Ok(tun)
     }
 
     fn alloc_local_stream(&self, id: u32) -> (TunnelStream, Arc<StreamState>) {
+        self.try_alloc_local_stream(id)
+            .expect("stream id must be unique on the opening side")
+    }
+
+    fn try_alloc_local_stream(&self, id: u32) -> Option<(TunnelStream, Arc<StreamState>)> {
         let win = self.inner.cfg.tuning.initial_window;
         let (app, peer) = tokio::io::duplex(win as usize);
         let (inbound_tx, inbound_rx) = mpsc::channel(self.inner.cfg.tuning.chan);
         let st = StreamState::new(id, inbound_tx, win);
-        self.inner.streams.lock().unwrap().insert(id, st.clone());
+        {
+            let mut streams = self.inner.streams.lock().unwrap();
+            if streams.contains_key(&id) {
+                return None;
+            }
+            streams.insert(id, st.clone());
+        }
         self.spawn_pump(id, peer, inbound_rx);
-        (TunnelStream::from_duplex(id, app), st)
+        Some((TunnelStream::from_duplex(id, app), st))
     }
 
     pub(super) fn accept_remote_stream(&self, path_id: u32, open: StreamOpen) {
         let id = open.stream_id;
-        {
-            let streams = self.inner.streams.lock().unwrap();
-            if streams.contains_key(&id) {
-                warn!(stream_id = id, "duplicate StreamOpen");
-                return;
-            }
-        }
-        let (tun, _st) = self.alloc_local_stream(id);
+        let Some((tun, _st)) = self.try_alloc_local_stream(id) else {
+            debug!(stream_id = id, "duplicate StreamOpen");
+            return;
+        };
         self.set_sticky(id, path_id);
         self.inner
             .metrics
             .streams_opened
             .fetch_add(1, Ordering::Relaxed);
+        for early in self.take_early_data(id) {
+            self.deliver_data(early.path_id, early.data);
+        }
         let incoming = self.inner.incoming.lock().unwrap().clone();
         if let Some(tx) = incoming {
             let msg = IncomingStream {
@@ -187,8 +203,13 @@ impl Session {
             let piece = data[offset_cursor..offset_cursor + n].to_vec();
             offset_cursor += n;
             let offset = st.send_next.fetch_add(n as u64, Ordering::Relaxed);
+            let pref = if st.bulk.load(Ordering::Relaxed) {
+                PickPref::Any
+            } else {
+                PickPref::Interactive
+            };
             let mut path_id = loop {
-                if let Some(p) = self.ensure_sticky(id) {
+                if let Some(p) = self.pick_pref(pref) {
                     break p;
                 }
                 if self.is_dead() || st.reset.load(Ordering::Relaxed) {
@@ -215,13 +236,13 @@ impl Session {
                         "hol"
                     );
                     path_id = dest;
-                    self.set_sticky(st.id, dest);
                     self.inner
                         .metrics
                         .hol_rebalances
                         .fetch_add(1, Ordering::Relaxed);
                 }
             }
+            self.set_sticky(id, path_id);
             {
                 let mut unacked = st.unacked.lock().unwrap();
                 unacked.insert(
@@ -242,8 +263,7 @@ impl Session {
                 data: piece,
             });
             if !self.send_on_path(path_id, frame.clone()) {
-                // This TCP connection is send-blocked; hop to a sibling conn.
-                if let Some(alt) = backup_path(&self.path_list(), path_id) {
+                if let Some(alt) = self.pick_retry(path_id) {
                     self.set_sticky(id, alt);
                     {
                         let mut unacked = st.unacked.lock().unwrap();
@@ -280,7 +300,7 @@ impl Session {
             return Ok(());
         }
         st.note_close_started();
-        if let Some(path_id) = self.ensure_sticky(id) {
+        if let Some(path_id) = self.pick_pref(PickPref::Any) {
             self.send_on_path(path_id, Frame::StreamClose(StreamClose { stream_id: id }));
         }
         self.maybe_count_graceful(&st);
@@ -336,12 +356,20 @@ impl Session {
                 Err(actual) => cur = actual,
             }
         }
-        if let Some(p) = self.ensure_sticky(id) {
+        if let Some(p) = self.pick_pref(PickPref::Interactive) {
             self.send_ack(&st, p);
         }
     }
 
     pub(super) fn on_data(&self, path_id: u32, data: StreamData) {
+        if self.get_stream(data.stream_id).is_none() {
+            self.push_early_data(path_id, data);
+            return;
+        }
+        self.deliver_data(path_id, data);
+    }
+
+    fn deliver_data(&self, path_id: u32, data: StreamData) {
         let Some(st) = self.get_stream(data.stream_id) else {
             return;
         };
@@ -406,6 +434,7 @@ impl Session {
             return;
         };
         st.send_window.store(ack.window, Ordering::Relaxed);
+        self.forget_open(ack.stream_id);
         let prev = st.send_acked.load(Ordering::Relaxed);
         if ack.acked_offset > prev {
             st.send_acked.store(ack.acked_offset, Ordering::Relaxed);

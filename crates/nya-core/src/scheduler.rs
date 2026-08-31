@@ -456,8 +456,34 @@ pub fn failback_target(
     Some((best_id, FailbackReason::ClassEmpty))
 }
 
+#[allow(dead_code)]
 pub fn backup_path(paths: &[Arc<PathState>], avoid: u32) -> Option<u32> {
     pick_backup(paths, avoid, None, None)
+}
+
+/// Timed-out unacked copy: never `avoid`, prefer a different named link.
+pub fn pick_retry_path(paths: &[Arc<PathState>], cfg: &SessionConfig, avoid: u32) -> Option<u32> {
+    let avoid_link = paths
+        .iter()
+        .find(|p| p.id == avoid)
+        .map(|p| p.link().to_string());
+    let pick_with = |pred: fn(&PathState) -> bool| -> Option<u32> {
+        let diverse: Vec<&Arc<PathState>> = paths
+            .iter()
+            .filter(|p| {
+                p.id != avoid
+                    && pred(p)
+                    && avoid_link.as_deref().map(|l| p.link() != l).unwrap_or(true)
+            })
+            .collect();
+        if !diverse.is_empty() {
+            return pick_from(&diverse, cfg, PickPref::Any);
+        }
+        let other: Vec<&Arc<PathState>> =
+            paths.iter().filter(|p| p.id != avoid && pred(p)).collect();
+        pick_from(&other, cfg, PickPref::Any)
+    };
+    pick_with(|p| p.is_schedulable()).or_else(|| pick_with(|p| p.is_alive()))
 }
 
 /// Same-link TCP rebalance: move off a loaded connection onto its sibling
@@ -488,6 +514,7 @@ pub fn backup_path_better(
 
 /// In-class schedulable dest, sibling-first (`avoid_link` from full `paths`).
 /// If none and `cur` is alive, None. If `cur` is not alive, any-alive.
+#[allow(dead_code)]
 pub fn backup_prefer_class(
     paths: &[Arc<PathState>],
     avoid: u32,
@@ -610,6 +637,43 @@ mod tests {
         p.rtt_class_us.store(class_ms * 1000, Ordering::Relaxed);
         *p.up_since.lock().unwrap() = Instant::now() - Duration::from_secs(10);
         p
+    }
+
+    #[test]
+    fn retry_prefers_other_named_link() {
+        let cfg = SessionConfig::default();
+        let a0 = mk_named(1, "akcdn#0".into(), 7);
+        let a1 = mk_named(2, "akcdn#1".into(), 7);
+        let b0 = mk_named(3, "soy#0".into(), 7);
+        let picked = pick_retry_path(&[a0, a1, b0], &cfg, 1).unwrap();
+        assert_eq!(picked, 3, "retry must leave the failed ISP");
+    }
+
+    #[test]
+    fn retry_falls_back_to_sibling_when_only_one_link() {
+        let cfg = SessionConfig::default();
+        let a0 = mk_named(1, "akcdn#0".into(), 7);
+        let a1 = mk_named(2, "akcdn#1".into(), 7);
+        let picked = pick_retry_path(&[a0, a1], &cfg, 1).unwrap();
+        assert_eq!(picked, 2);
+    }
+
+    #[test]
+    fn retry_skips_congested_peer_when_a_free_link_exists() {
+        let cfg = SessionConfig::default();
+        let a0 = mk_named(1, "akcdn#0".into(), 7);
+        let b0 = mk_named(2, "soy#0".into(), 7);
+        let c0 = mk_named(3, "nsix#0".into(), 7);
+        b0.set_congested(true);
+        let picked = pick_retry_path(&[a0, b0, c0], &cfg, 1).unwrap();
+        assert_eq!(picked, 3);
+    }
+
+    #[test]
+    fn retry_none_when_only_avoid_is_alive() {
+        let cfg = SessionConfig::default();
+        let a0 = mk_named(1, "akcdn#0".into(), 7);
+        assert!(pick_retry_path(&[a0], &cfg, 1).is_none());
     }
 
     #[test]

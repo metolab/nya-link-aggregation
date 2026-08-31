@@ -5,14 +5,14 @@
 
 仓库：<https://github.com/metolab/nya-link-aggregation>
 
-多路径 TCP+TLS overlay：把若干独立链路聚合成一条会话。流粘在最快 RTT class 上，路径故障时切换，恢复后再回切。不把字节打散到多条链路上做条带（不是 MPTCP 那种 stripe）。
+多路径 TCP+TLS overlay：把若干独立链路聚合成一条会话。每个 offset 发在此刻最好的活 TCP 上，未 ACK 则按 2×RTT 换路再发；接收端按 offset 重组。不把同一包同时打到多条路上。
 
 适合「同一台出口有多条质量接近的线路、应用层要一条稳定 TCP」的场景。客户端提供 SOCKS5 和 TCP 端口转发。
 
 ## 特性
 
 - 每条链路独立 TCP+TLS（可开多个连接，隔离单连接 HOL）
-- 流级粘滞（sticky-per-stream），新流落在最快 RTT class
+- 路径无关 offset：每包一次发送，超时换路重传（优先不同 named link）
 - RTT 自适应的丢包 / 路径 down / failback 时钟
 - 交互流量走紧急写队列，bulk 不拖高 ACK 采样
 - 服务端 TLS SPKI pin + PSK 握手证明

@@ -648,6 +648,224 @@ pub async fn one_conn_blackhole() -> Result<ScenarioReport> {
     Ok(r)
 }
 
+/// Production shape: three named ISPs × two overlay TCPs, ~10 ms class.
+fn prod_like_spec() -> HarnessSpec {
+    let rtt = Duration::from_millis(10);
+    HarnessSpec {
+        link_cfgs: vec![
+            (
+                "akcdn".into(),
+                ImpairConfig {
+                    rtt,
+                    ..Default::default()
+                },
+            ),
+            (
+                "soy".into(),
+                ImpairConfig {
+                    rtt,
+                    ..Default::default()
+                },
+            ),
+            (
+                "nsix".into(),
+                ImpairConfig {
+                    rtt,
+                    ..Default::default()
+                },
+            ),
+        ],
+        connections: 2,
+        psk: "e2e-psk".into(),
+    }
+}
+
+fn first_byte_sla(p99_ms: u64, min_success: f64) -> Sla {
+    Sla {
+        must_survive: true,
+        p99_ms: Some(p99_ms),
+        failover_ms: None,
+        min_success,
+    }
+}
+
+/// SOCKS CONNECT + first echo byte. Times the production 204/curl path.
+async fn socks_first_byte(h: &Harness, payload: &[u8], to: Duration) -> Result<Duration, ()> {
+    let t0 = Instant::now();
+    let got = tokio::time::timeout(to, async {
+        let mut tcp = h.connect_socks_echo().await?;
+        tcp.write_all(payload).await?;
+        let mut buf = vec![0u8; payload.len()];
+        tcp.read_exact(&mut buf).await?;
+        anyhow::Ok(t0.elapsed())
+    })
+    .await;
+    match got {
+        Ok(Ok(d)) => Ok(d),
+        _ => Err(()),
+    }
+}
+
+async fn collect_first_bytes(h: &Harness, n: usize, payload: &[u8], to: Duration) -> WorkloadStats {
+    let mut stats = WorkloadStats::default();
+    for _ in 0..n {
+        let t0 = Instant::now();
+        match socks_first_byte(h, payload, to).await {
+            Ok(d) => {
+                stats.samples.push(crate::workload::PingSample {
+                    at: t0,
+                    rtt: Some(d),
+                });
+                stats.bytes_ok += payload.len() as u64;
+            }
+            Err(()) => {
+                stats.timeouts += 1;
+                stats
+                    .samples
+                    .push(crate::workload::PingSample { at: t0, rtt: None });
+            }
+        }
+    }
+    stats
+}
+
+fn note_prod_like(r: &mut ScenarioReport, h: &Harness, baseline: Duration) {
+    r.notes.push(format!(
+        "baseline={:?} hedge={} rtx={} alive={}",
+        baseline,
+        r.snap.data_hedge,
+        r.snap.data_retransmit,
+        h.session.alive_path_count()
+    ));
+}
+
+/// Three named links × two overlay TCPs (prod shape). One 5-tuple is
+/// blackholed for many RTTs; new-stream first-byte must recover via
+/// loss_timeout retry, not wait for path-down.
+pub async fn prod_like_one_conn_hole_first_byte() -> Result<ScenarioReport> {
+    let h = start(prod_like_spec()).await?;
+    let payload = vec![0u8; 2048];
+    let mut baseline = Duration::MAX;
+    for _ in 0..3 {
+        baseline = baseline.min(
+            socks_first_byte(&h, &payload, Duration::from_millis(400))
+                .await
+                .map_err(|_| anyhow!("baseline first-byte timed out"))?,
+        );
+    }
+    h.link("akcdn").set_conn_blackhole(0, true);
+    let stats = collect_first_bytes(&h, 16, &payload, Duration::from_millis(250)).await;
+    h.link("akcdn").set_conn_blackhole(0, false);
+    let mut r = finish(
+        "prod_like_one_conn_hole_first_byte",
+        &h,
+        stats,
+        first_byte_sla(120, 0.95),
+        None,
+    );
+    note_prod_like(&mut r, &h, baseline);
+    Ok(r)
+}
+
+/// Whole named link (both 5-tuples) blackholed; the other two ISPs stay up.
+pub async fn prod_like_one_link_hole_first_byte() -> Result<ScenarioReport> {
+    let h = start(prod_like_spec()).await?;
+    let payload = vec![0u8; 2048];
+    let mut baseline = Duration::MAX;
+    for _ in 0..3 {
+        baseline = baseline.min(
+            socks_first_byte(&h, &payload, Duration::from_millis(400))
+                .await
+                .map_err(|_| anyhow!("baseline first-byte timed out"))?,
+        );
+    }
+    h.link("akcdn").set_conn_blackhole(0, true);
+    h.link("akcdn").set_conn_blackhole(1, true);
+    let stats = collect_first_bytes(&h, 16, &payload, Duration::from_millis(250)).await;
+    h.link("akcdn").set_conn_blackhole(0, false);
+    h.link("akcdn").set_conn_blackhole(1, false);
+    let mut r = finish(
+        "prod_like_one_link_hole_first_byte",
+        &h,
+        stats,
+        first_byte_sla(120, 0.95),
+        None,
+    );
+    note_prod_like(&mut r, &h, baseline);
+    Ok(r)
+}
+
+/// Concurrent new SOCKS streams while one 5-tuple is blackholed.
+pub async fn prod_like_concurrent_hole_first_byte() -> Result<ScenarioReport> {
+    let h = start(prod_like_spec()).await?;
+    let payload = vec![0u8; 2048];
+    let mut baseline = Duration::MAX;
+    for _ in 0..3 {
+        baseline = baseline.min(
+            socks_first_byte(&h, &payload, Duration::from_millis(400))
+                .await
+                .map_err(|_| anyhow!("baseline first-byte timed out"))?,
+        );
+    }
+    h.link("akcdn").set_conn_blackhole(0, true);
+    let socks = h.socks;
+    let echo = h.echo;
+    let mut set = tokio::task::JoinSet::new();
+    for _ in 0..12 {
+        let payload = payload.clone();
+        set.spawn(async move {
+            let t0 = Instant::now();
+            let got = tokio::time::timeout(Duration::from_millis(250), async {
+                let mut tcp = crate::harness::socks5_connect(socks, echo).await?;
+                tcp.write_all(&payload).await?;
+                let mut buf = vec![0u8; payload.len()];
+                tcp.read_exact(&mut buf).await?;
+                anyhow::Ok(t0.elapsed())
+            })
+            .await;
+            match got {
+                Ok(Ok(d)) => (t0, Ok(d)),
+                _ => (t0, Err(())),
+            }
+        });
+    }
+    let mut stats = WorkloadStats::default();
+    while let Some(j) = set.join_next().await {
+        match j {
+            Ok((t0, Ok(d))) => {
+                stats.samples.push(crate::workload::PingSample {
+                    at: t0,
+                    rtt: Some(d),
+                });
+                stats.bytes_ok += payload.len() as u64;
+            }
+            Ok((t0, Err(()))) => {
+                stats.timeouts += 1;
+                stats
+                    .samples
+                    .push(crate::workload::PingSample { at: t0, rtt: None });
+            }
+            Err(_) => {
+                stats.timeouts += 1;
+                stats.samples.push(crate::workload::PingSample {
+                    at: Instant::now(),
+                    rtt: None,
+                });
+            }
+        }
+    }
+    h.link("akcdn").set_conn_blackhole(0, false);
+    let mut r = finish(
+        "prod_like_concurrent_hole_first_byte",
+        &h,
+        stats,
+        first_byte_sla(180, 0.90),
+        None,
+    );
+    note_prod_like(&mut r, &h, baseline);
+    Ok(r)
+}
+
 /// Stall client→server on 2 of 3 connections (TCP send buffer / HOL).
 /// Sibling connections must pick up the stream.
 pub async fn one_conn_stall() -> Result<ScenarioReport> {
@@ -1176,6 +1394,21 @@ pub fn catalog() -> Vec<Scenario> {
         sc!("offline_then_return", false, offline_then_return()),
         sc!("multi_conn_baseline", false, multi_conn_baseline()),
         sc!("one_conn_blackhole", false, one_conn_blackhole()),
+        sc!(
+            "prod_like_one_conn_hole_first_byte",
+            false,
+            prod_like_one_conn_hole_first_byte()
+        ),
+        sc!(
+            "prod_like_one_link_hole_first_byte",
+            false,
+            prod_like_one_link_hole_first_byte()
+        ),
+        sc!(
+            "prod_like_concurrent_hole_first_byte",
+            false,
+            prod_like_concurrent_hole_first_byte()
+        ),
         sc!("one_conn_stall", false, one_conn_stall()),
         sc!("one_conn_disconnect", false, one_conn_disconnect()),
         sc!("conn_churn", false, conn_churn()),

@@ -6,15 +6,15 @@ use std::time::{Duration, Instant};
 
 use tracing::{debug, info, warn};
 
-use crate::metrics::{mono_ms, path_state_label};
+use crate::metrics::mono_ms;
 
 use nya_proto::ResetReason;
 
 use crate::health;
 use crate::path::PathState;
 use crate::scheduler::{
-    backup_prefer_class, failback_target, fastest_class_set, hol_place_bulk_fallback,
-    should_rebalance_conn, FailbackReason,
+    failback_target, fastest_class_set, hol_place_bulk_fallback, should_rebalance_conn,
+    FailbackReason,
 };
 use crate::stream::StreamState;
 
@@ -200,6 +200,8 @@ impl Session {
             self.maybe_speculative(st.clone());
             self.maybe_failback(st);
         }
+        self.retry_opens();
+        self.expire_early_data();
 
         let all_down = !self.has_alive_path();
         if all_down {
@@ -310,98 +312,7 @@ impl Session {
     }
 
     fn maybe_speculative(&self, st: Arc<StreamState>) {
-        if !st.is_steerable() {
-            return;
-        }
-        let sticky = st.sticky.load(Ordering::Relaxed);
-        if sticky == 0 {
-            return;
-        }
-        let cur_path = self.get_path(sticky);
-        // Late unacked on a still-live path is usually HOL behind bulk, not
-        // a dead link. Only restick when the path itself looks unhealthy.
-        let path_unhealthy = match &cur_path {
-            Some(p) => !p.is_schedulable(),
-            None => true,
-        };
-        if path_unhealthy {
-            if let Some(alt) = backup_prefer_class(&self.path_list(), sticky, &self.inner.cfg) {
-                if alt != sticky {
-                    let same_link = cur_path
-                        .as_ref()
-                        .and_then(|p| self.get_path(alt).map(|d| d.link() == p.link()))
-                        .unwrap_or(false);
-                    let cool = cur_path
-                        .as_ref()
-                        .map(|p| p.rtt().max(p.class_rtt()))
-                        .unwrap_or(self.inner.cfg.tuning.failback_cooldown);
-                    if same_link
-                        || st.stick_changed_ago_ge(health::failback_cooldown(&self.inner.cfg, cool))
-                    {
-                        self.set_sticky(st.id, alt);
-                        self.retransmit_all_on(&st, alt);
-                        self.note_migrate("speculative");
-                        if let Some(p) = cur_path.as_ref() {
-                            if !p.is_up() {
-                                self.observe_failover(p);
-                            }
-                        }
-                        let from_state = cur_path
-                            .as_ref()
-                            .map(|p| path_state_label(p.state.load(Ordering::Relaxed)))
-                            .unwrap_or("gone");
-                        debug!(
-                            stream_id = st.id,
-                            from = sticky,
-                            to = alt,
-                            same_link,
-                            from_state,
-                            reason = "speculative",
-                            "speculative migrate"
-                        );
-                        return;
-                    }
-                }
-            }
-        }
-        {
-            let mut unacked = st.unacked.lock().unwrap();
-            for (offset, u) in unacked.iter_mut() {
-                let thresh = self
-                    .get_path(u.path_id)
-                    .map(|p| self.degrade_for(&p))
-                    .unwrap_or(self.inner.cfg.tuning.loss_timeout_floor);
-                if u.last_sent.elapsed() < thresh {
-                    continue;
-                }
-                let path_ok = self
-                    .get_path(u.path_id)
-                    .map(|p| p.is_schedulable())
-                    .unwrap_or(false);
-                let alt = backup_prefer_class(&self.path_list(), u.path_id, &self.inner.cfg);
-                // Correlated silence / all DEGRADED: nowhere useful to send.
-                if !path_ok && alt.is_none() {
-                    continue;
-                }
-                // Retry in place. At most one hedge copy on the next-best
-                // live path — never fan-out to every connection.
-                u.last_sent = Instant::now();
-                if path_ok {
-                    self.send_data_frame(st.id, *offset, u.data.clone(), u.path_id);
-                    self.inner
-                        .metrics
-                        .data_retransmit
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-                if let Some(alt) = alt {
-                    self.send_data_frame(st.id, *offset, u.data.clone(), alt);
-                    self.inner
-                        .metrics
-                        .data_hedge
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-            }
-        }
+        self.retry_expired_unacked(&st);
     }
 
     fn conn_has_interactive(&self, path_id: u32) -> bool {
@@ -463,7 +374,6 @@ impl Session {
         let from_sticky = cur.sticky_count();
         let to_sticky = to_path.as_ref().map(|p| p.sticky_count()).unwrap_or(0);
         self.set_sticky(st.id, dest);
-        self.retransmit_all_on(st, dest);
         self.inner
             .metrics
             .hol_rebalances
@@ -517,7 +427,6 @@ impl Session {
             return;
         };
         self.set_sticky(st.id, best_id);
-        self.retransmit_all_on(&st, best_id);
         let cross_link = cur.link() != best.link();
         if cross_link {
             self.inner.metrics.failbacks.fetch_add(1, Ordering::Relaxed);
@@ -561,46 +470,19 @@ impl Session {
         );
     }
 
-    pub(super) fn migrate_from_path(&self, dead_path: u32) {
-        let streams: Vec<_> = self
-            .inner
-            .streams
-            .lock()
-            .unwrap()
-            .values()
-            .filter(|st| st.is_steerable())
-            .cloned()
-            .collect();
-        let backup = {
-            let paths = self.path_list();
-            backup_prefer_class(&paths, dead_path, &self.inner.cfg)
-        };
-        let Some(backup) = backup else { return };
-        for st in streams {
-            if st.sticky.load(Ordering::Relaxed) != dead_path {
-                continue;
-            }
-            self.set_sticky(st.id, backup);
-            self.retransmit_from_on(&st, dead_path, backup);
-            debug!(
-                stream_id = st.id,
-                from = dead_path,
-                to = backup,
-                reason = "path_down",
-                "stream migrated"
-            );
-            self.note_migrate("path_down");
-        }
-    }
-
     fn scan_stall(&self, st: &StreamState) {
         if !st.is_steerable() {
             return;
         }
         let now = mono_ms();
-        let thresh = match self.get_path(st.sticky.load(Ordering::Relaxed)) {
-            Some(p) => self.degrade_for(&p),
-            None => self.inner.cfg.tuning.loss_timeout_floor,
+        let thresh = {
+            let unacked = st.unacked.lock().unwrap();
+            unacked
+                .values()
+                .filter_map(|u| self.get_path(u.path_id))
+                .map(|p| health::loss_timeout(&self.inner.cfg, p.rtt()))
+                .min()
+                .unwrap_or(self.inner.cfg.tuning.loss_timeout_floor)
         };
         let thresh_ms = thresh.as_millis() as u64;
 

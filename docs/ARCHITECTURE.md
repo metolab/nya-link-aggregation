@@ -1,6 +1,6 @@
 # 架构
 
-nya 是一条 overlay 会话：客户端把多条 TCP+TLS 路径接到同一个 session，上面再多路复用若干条应用流。每条应用流粘在一条路径上；路径变差时把流迁走，路径恢复后再迁回来。数据不在多条链路上做条带。
+nya 是一条 overlay 会话：客户端把多条 TCP+TLS 路径接到同一个 session，上面再多路复用若干条应用流。路径是池，不是流的家。每个 offset **只先发一次**（当前最好的活 TCP）；未 ACK 则按发出那条路的 `loss_timeout`（2×RTT）**换路再发**，禁止原地再打同一条 5-tuple。接收端按 offset 重组，先到的一份交付。不把同一包同时打到多条路上。
 
 ## Crate
 
@@ -12,7 +12,7 @@ nya-server ──┘
 nya-e2e（测试，同时拉 client + server）
 ```
 
-- **nya-proto**：`u32be length || u8 type || body`，最大 payload 16 KiB。ALPN `nya/1`。TLS exporter 标签 `nya-link-aggregation`。
+- **nya-proto**：`u32be length || u8 type || body`，最大 payload 16 KiB。`PROTOCOL_VERSION = 2`，ALPN `nya/2`。TLS exporter 标签 `nya-link-aggregation`。
 - **nya-core**：会话、路径 IO、健康时钟、调度、握手、SPKI pin。`Tuning` 不进 TOML。
 - **nya-client**：按 `[[links]]` 各开 `connections` 条 TCP+TLS；第一条 `CreateSession`，其余 `JoinSession`。入站是 SOCKS5 CONNECT 或固定目标 forward。
 - **nya-server**：TLS 接受 → 握手 → `SessionTable`。`CreateSession` 建会话并 spawn outbound；`JoinSession` 把路径挂到已有会话。
@@ -24,10 +24,11 @@ nya-e2e（测试，同时拉 client + server）
 应用 inbound
     │  SOCKS5 / TCP forward
     ▼
-Session::open_stream          选最快 class 里一条路径，sticky
+Session::open_stream          选最快 class 里一条路径发 Open（一次）
     │
     ▼
 STREAM_OPEN / STREAM_DATA / ACK / CLOSE / RESET
+    │                         每 offset 重新 pick；超时换路重传
     │
     ▼
 PathState 双写队列            ≤ interactive_max 走 urgent，其余 bulk
@@ -81,17 +82,17 @@ PSK 证明「谁能加入这条会话」；pin 证明「TLS 对端是这张证�
 
 1. 活着的路径里去掉 backup（class RTT > 最快 × 2 + 20ms）
 2. 限制在最快 class（`should_failback(候选, 最好)` 为假的那些）
-3. 打分 `class_rtt × load × 1024 + fast_rtt × load`，`load = 1 + inflight/bias + sticky`
+3. 打分 `class_rtt × load × 1024 + fast_rtt × load`，`load = 1 + inflight/bias + last-send`
 
 交互流用更重的 inflight 权重，避免和 bulk 抢同一条连接。
 
-粘滞流的维护（`session::steer`，5ms tick）：
+offset 进度（`session::{streams,steer}`，5ms tick）：
 
-- **speculative migrate**：当前路径变差，先迁到 backup（优先同链路的另一条 TCP，隔离 HOL）
-- **failback**：更好路径稳定约 2 RTT 且过了 cooldown 再迁回
-- **same-link rebalance**：同一 `link.name` 下两条连接负载差过大时把 bulk 挪到姐妹连接；不会把 bulk 推到更高 class
+- **换路重传**：unacked / StreamOpen 超过 `loss_timeout(发出路径 RTT)` 则避开原 `path_id`、优先不同 `link_key` 再发一次。不是并发双发。
+- **路径 down**：那条 TCP 上的 unacked / Open **立刻**换到仍活的路上；路径拆/重拨是池卫生，不挡 TTFB。
+- **failback / same-link rebalance**：更新 last-send 诊断与 HOL 放置；发送本身每帧重新 pick。
 
-HOL 隔离靠「每链路多连接 + 姐妹优先 backup」，不是按 ISP 钉死。
+HOL 隔离靠「每链路多连接 + bulk 避开交互连接」，不是把流钉死在一条 TCP 上。
 
 ## 流控制
 
@@ -106,7 +107,7 @@ HOL 隔离靠「每链路多连接 + 姐妹优先 backup」，不是按 ISP 钉�
 
 线路状态按 `link_key` 汇总（`a#0`/`a#1` → `a`）：up/deg 连接数、RTT 范围、sticky、inflight、队列、rx 新鲜/最旧。`paths=` 可带 ` bak`。迁移原因拆成 speculative / path_down / ensure_sticky / send-blocked；另有 retransmit/hedge、probe_miss、未知 RTT pick。snapshot 带压缩 `streams=`（不进 Prometheus 标签）。
 
-业务计分卡：流完成比、send-unacked ∪ recv-hole stall、每路径一次 `failover_ms`（`last_rx_ago`）、跨 link `failbacks`、overlay goodput（`path.rs::send_frame` / decode）。e2e SLA 仍用应用 ping；overlay p99 只进 notes。见 [OBSERVABILITY.md](OBSERVABILITY.md)。
+业务计分卡：流完成比、send-unacked ∪ recv-hole stall（进入钟是 `loss_timeout`）、每路径一次 `failover_ms`（`last_rx_ago`）、跨 link `failbacks`、overlay goodput（`path.rs::send_frame` / decode）。换路重传计入 `data_retransmit` / `data_hedge`（跨 `link_key` 为 hedge）。e2e 产品门是 **新流 first-byte**（`prod_like_*_first_byte`），不是 ping 1500 ms。见 [OBSERVABILITY.md](OBSERVABILITY.md)。
 
 ## 配置分层
 
@@ -120,7 +121,7 @@ HOL 隔离靠「每链路多连接 + 姐妹优先 backup」，不是按 ISP 钉�
 | --- | --- | --- |
 | 单元 | `nya-proto` / `nya-core` 模块内 | 帧编解码、Tuning、握手 duplex、单测调度 |
 | 会话 | `nya-core::session` tests | 单路径 echo、多路径 failover |
-| 短 matrix | `cargo test -p nya-e2e` | 时延、异构、blackhole、failback、多连接 HOL… |
+| 短 matrix | `cargo test -p nya-e2e` | 时延、异构、blackhole、failback、多连接 HOL、prod-like 新流 first-byte… |
 | 长 blackhole | `nya-e2e --long` | 30s / 60s / 5m |
 | 混合 soak | `nya-e2e --mixed` | near 11–16ms / mid 60–100 / high 120–150 / far 160–200 |
 
