@@ -111,7 +111,7 @@ PSK 两端必须一致。客户端 `pinned_spki_sha256` 填上一步打印的值
 
 ## 远程 OTLP
 
-默认关，不配 `[obs.otel].enabled = true` 就不会连 collector。打开时 **必须** 有非空 `instance_name`（或环境变量 `NYA_INSTANCE_NAME`），否则进程拒绝启动。完整键表、信号开关、PII、span 清单见 [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md)「远程 OTLP」。示例 collector：[`examples/otel-collector.yaml`](examples/otel-collector.yaml)。
+默认关，不配 `[obs.otel].enabled = true` 就不会连 collector。打开时 **必须** 有非空 `instance_name`（或环境变量 `NYA_INSTANCE_NAME`），否则进程拒绝启动。每次启动还会生成 `nya.instance.run_id`（`YYYYMMDDTHHMMSSZ` + 8 hex），用来区分同实例的不同进程生命周期；`instance_name` / `service.instance.id` 不随重启变。完整键表、信号开关、PII、span 清单见 [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md)「远程 OTLP」。示例 collector：[`examples/otel-collector.yaml`](examples/otel-collector.yaml)。
 
 `[obs.otel]`（未知键是解析错误）：
 
@@ -166,7 +166,7 @@ Authorization = "Basic dXNlcjpwYXNz"
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | TOML `endpoint` 为空时使用 |
 | `OTEL_EXPORTER_OTLP_PROTOCOL` | TOML `protocol` 为空时：`http/protobuf` / `http` / `grpc` |
 | `OTEL_EXPORTER_OTLP_HEADERS` | 逗号分隔 `k=v`，与 TOML headers 合并，同名 TOML 赢 |
-| `OTEL_RESOURCE_ATTRIBUTES` | 追加 Resource；不能覆盖 `service.namespace` / `service.name` / `service.instance.id` / `nya.project` / `nya.instance.name` |
+| `OTEL_RESOURCE_ATTRIBUTES` | 追加 Resource；不能覆盖 `service.namespace` / `service.name` / `service.instance.id` / `nya.project` / `nya.instance.name` / `nya.instance.run_id` |
 | `NYA_INSTANCE_NAME` | TOML `instance_name` 为空时使用 |
 | `NYA_OTEL_LOG_LEVEL` | TOML `[obs.otel.logs].level` 为空时使用 |
 

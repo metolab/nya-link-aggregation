@@ -74,6 +74,7 @@ pub fn install(role: &'static str, version: &'static str, obs: &ObsOpts) -> Resu
 
     validate_signal_keys(&obs.otel)?;
     let instance = resolve_instance_name(obs)?;
+    let run_id = resource::new_run_id();
     let protocol = resolve_protocol(&obs.otel)?;
     if matches!(protocol, OtelProtocol::Grpc) && !cfg!(feature = "grpc") {
         bail!("rebuild with --features otel-grpc");
@@ -117,7 +118,7 @@ pub fn install(role: &'static str, version: &'static str, obs: &ObsOpts) -> Resu
     let timeout = Duration::from_millis(obs.otel.timeout_ms.unwrap_or(5000).max(1));
     let gzip = obs.otel.gzip.unwrap_or(true);
     let headers = merge_headers(&obs.otel);
-    let resource = build_resource(role, version, &instance, obs);
+    let resource = build_resource(role, version, &instance, &run_id, obs);
     let ratio = obs.otel.sample_ratio.unwrap_or(1.0);
     if !(0.0..=1.0).contains(&ratio) {
         bail!("obs.otel.sample_ratio must be in [0.0, 1.0]");
@@ -201,6 +202,7 @@ pub fn install(role: &'static str, version: &'static str, obs: &ObsOpts) -> Resu
     };
     info!(
         instance_name = %instance,
+        run_id = %run_id,
         endpoint = parent_log,
         traces_endpoint = traces_url.as_deref().unwrap_or("-"),
         metrics_endpoint = metrics_url.as_deref().unwrap_or("-"),
@@ -658,13 +660,34 @@ mod tests {
             instance_name: Some("edge-sh-03".into()),
             ..Default::default()
         };
-        let r = build_resource("client", "0.1.0", "edge-sh-03", &obs);
+        let r = build_resource(
+            "client",
+            "0.1.0",
+            "edge-sh-03",
+            "20260831T000000Z-deadbeef",
+            &obs,
+        );
         let s = format!("{r:?}");
         assert!(s.contains("edge-sh-03"), "{s}");
+        assert!(s.contains("20260831T000000Z-deadbeef"), "{s}");
         assert!(
             s.contains("nya-link-aggregation") || s.contains("nya.project"),
             "{s}"
         );
+    }
+
+    #[test]
+    fn run_id_is_utc_prefix_plus_hex() {
+        let id = resource::new_run_id();
+        let (ts, suffix) = id.split_once('-').expect(&id);
+        assert_eq!(ts.len(), 16, "{id}");
+        assert!(ts.as_bytes()[8] == b'T' && ts.ends_with('Z'), "{id}");
+        assert!(ts[..8].bytes().all(|c| c.is_ascii_digit()), "{id}");
+        assert!(ts[9..15].bytes().all(|c| c.is_ascii_digit()), "{id}");
+        assert_eq!(suffix.len(), 8, "{id}");
+        assert!(suffix.bytes().all(|c| c.is_ascii_hexdigit()), "{id}");
+        let again = resource::new_run_id();
+        assert_ne!(id, again, "run id must differ across calls");
     }
 
     #[test]

@@ -1107,17 +1107,18 @@ pub sessions_live: AtomicU64, // gauge
 | `service.namespace` | `nya-link-aggregation` |
 | `service.name` | `nya-client` 或 `nya-server` |
 | `service.version` | `CARGO_PKG_VERSION` |
-| `service.instance.id` | 与 `nya.instance.name` **相同**（必填实例名，无 UUID） |
+| `service.instance.id` | 与 `nya.instance.name` **相同**（稳定实例名，不随重启变） |
 | `nya.project` | `nya-link-aggregation` |
 | `nya.role` | `client` / `server` |
 | `nya.instance.name` | `[obs].instance_name` 或 `NYA_INSTANCE_NAME` |
+| `nya.instance.run_id` | 每次 `install()` 生成：`YYYYMMDDTHHMMSSZ` + 8 hex，标识这一次进程运行 |
 | `process.pid` | pid |
 | `host.name` | `HOSTNAME`，否则 `gethostname`，否则 `unknown` |
 | `deployment.environment` | `[obs.otel].environment`；空则省略 |
 
 不读 `OTEL_SERVICE_NAME`。`OTEL_RESOURCE_ATTRIBUTES` 可追加，但不能覆盖上表里的身份键。
 
-Prometheus 点号 → 下划线（`nya_instance_name`）。Tempo TraceQL 保留点。Loki 不会自动把 Resource 当 stream label，必须在 collector 里映射（`examples/otel-collector.yaml`）。Prometheus exporter 要 `resource_to_telemetry_conversion.enabled = true`，且 `translation_strategy: UnderscoreEscapingWithoutSuffixes`（catalog 名已带 `_total`，不要再加后缀）。
+Prometheus 点号 → 下划线（`nya_instance_name`、`nya_instance_run_id`）。Tempo TraceQL 保留点。Loki 不会自动把 Resource 当 stream label，必须在 collector 里映射（`examples/otel-collector.yaml` 只映射稳定身份，**不要**把 `run_id` 做成 stream label）。Prometheus exporter 要 `resource_to_telemetry_conversion.enabled = true`，且 `translation_strategy: UnderscoreEscapingWithoutSuffixes`（catalog 名已带 `_total`，不要再加后缀）。重启后 `nya_instance_run_id` 会换，旧 series 靠 scrape stale 过期。
 
 ### `[obs.otel]` 键
 

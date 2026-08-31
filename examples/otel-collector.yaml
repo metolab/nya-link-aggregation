@@ -28,6 +28,7 @@ exporters:
       resource:
         nya.project: nya_project
         nya.instance.name: nya_instance_name
+        # nya.instance.run_id is per-process; do not promote it to a stream label.
         service.name: service_name
         service.namespace: service_namespace
   otlp/tempo:
