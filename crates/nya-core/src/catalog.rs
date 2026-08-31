@@ -161,6 +161,11 @@ pub fn visit_metrics(ps: &ProcessSnapshot, sink: &mut impl MetricSink) {
         s.data_hedge,
     );
     sink.counter(
+        "nya_close_retry_total",
+        "STREAM_CLOSE rehomes onto another path",
+        s.close_retry,
+    );
+    sink.counter(
         "nya_probe_miss_total",
         "pings expired without pong",
         s.probe_miss,
@@ -210,6 +215,11 @@ pub fn visit_metrics(ps: &ProcessSnapshot, sink: &mut impl MetricSink) {
         "nya_streams_closed_total",
         "streams closed gracefully",
         s.streams_closed,
+    );
+    sink.counter(
+        "nya_stream_reaps_linger_total",
+        "half-close linger reaps; not a TTFB timeout",
+        s.stream_reaps_linger,
     );
     sink.counter("nya_stream_resets_total", "streams reset", s.stream_resets);
     sink.counter(

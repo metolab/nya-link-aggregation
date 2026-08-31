@@ -166,6 +166,7 @@ pub struct Counters {
     pub migrates_send_blocked: AtomicU64,
     pub data_retransmit: AtomicU64,
     pub data_hedge: AtomicU64,
+    pub close_retry: AtomicU64,
     pub probe_miss: AtomicU64,
     pub window_blocks: AtomicU64,
     pub picks_unknown_rtt: AtomicU64,
@@ -177,6 +178,7 @@ pub struct Counters {
     pub hol_rebalances: AtomicU64,
     pub streams_opened: AtomicU64,
     pub streams_closed: AtomicU64,
+    pub stream_reaps_linger: AtomicU64,
     pub stream_resets: AtomicU64,
     pub stream_resets_dial_failed: AtomicU64,
     pub stream_resets_timeout: AtomicU64,
@@ -211,6 +213,7 @@ impl Default for Counters {
             migrates_send_blocked: AtomicU64::new(0),
             data_retransmit: AtomicU64::new(0),
             data_hedge: AtomicU64::new(0),
+            close_retry: AtomicU64::new(0),
             probe_miss: AtomicU64::new(0),
             window_blocks: AtomicU64::new(0),
             picks_unknown_rtt: AtomicU64::new(0),
@@ -222,6 +225,7 @@ impl Default for Counters {
             hol_rebalances: AtomicU64::new(0),
             streams_opened: AtomicU64::new(0),
             streams_closed: AtomicU64::new(0),
+            stream_reaps_linger: AtomicU64::new(0),
             stream_resets: AtomicU64::new(0),
             stream_resets_dial_failed: AtomicU64::new(0),
             stream_resets_timeout: AtomicU64::new(0),
@@ -383,6 +387,7 @@ pub struct Snapshot {
     pub migrates_send_blocked: u64,
     pub data_retransmit: u64,
     pub data_hedge: u64,
+    pub close_retry: u64,
     pub probe_miss: u64,
     pub window_blocks: u64,
     pub picks_unknown_rtt: u64,
@@ -394,6 +399,7 @@ pub struct Snapshot {
     pub hol_rebalances: u64,
     pub streams_opened: u64,
     pub streams_closed: u64,
+    pub stream_reaps_linger: u64,
     pub stream_resets: u64,
     pub stream_resets_dial_failed: u64,
     pub stream_resets_timeout: u64,
@@ -433,6 +439,7 @@ impl Snapshot {
         self.migrates_send_blocked += other.migrates_send_blocked;
         self.data_retransmit += other.data_retransmit;
         self.data_hedge += other.data_hedge;
+        self.close_retry += other.close_retry;
         self.probe_miss += other.probe_miss;
         self.window_blocks += other.window_blocks;
         self.picks_unknown_rtt += other.picks_unknown_rtt;
@@ -444,6 +451,7 @@ impl Snapshot {
         self.hol_rebalances += other.hol_rebalances;
         self.streams_opened += other.streams_opened;
         self.streams_closed += other.streams_closed;
+        self.stream_reaps_linger += other.stream_reaps_linger;
         self.stream_resets += other.stream_resets;
         self.stream_resets_dial_failed += other.stream_resets_dial_failed;
         self.stream_resets_timeout += other.stream_resets_timeout;
@@ -480,6 +488,7 @@ impl Counters {
             migrates_send_blocked: self.migrates_send_blocked.load(Ordering::Relaxed),
             data_retransmit: self.data_retransmit.load(Ordering::Relaxed),
             data_hedge: self.data_hedge.load(Ordering::Relaxed),
+            close_retry: self.close_retry.load(Ordering::Relaxed),
             probe_miss: self.probe_miss.load(Ordering::Relaxed),
             window_blocks: self.window_blocks.load(Ordering::Relaxed),
             picks_unknown_rtt: self.picks_unknown_rtt.load(Ordering::Relaxed),
@@ -491,6 +500,7 @@ impl Counters {
             hol_rebalances: self.hol_rebalances.load(Ordering::Relaxed),
             streams_opened: self.streams_opened.load(Ordering::Relaxed),
             streams_closed: self.streams_closed.load(Ordering::Relaxed),
+            stream_reaps_linger: self.stream_reaps_linger.load(Ordering::Relaxed),
             stream_resets: self.stream_resets.load(Ordering::Relaxed),
             stream_resets_dial_failed: self.stream_resets_dial_failed.load(Ordering::Relaxed),
             stream_resets_timeout: self.stream_resets_timeout.load(Ordering::Relaxed),

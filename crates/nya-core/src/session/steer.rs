@@ -198,9 +198,9 @@ impl Session {
             .store(stalled, Ordering::Relaxed);
         for st in bulk.into_iter().chain(rest) {
             self.maybe_speculative(st.clone());
-            self.maybe_failback(st);
         }
         self.retry_opens();
+        self.retry_closes();
         self.expire_early_data();
 
         let all_down = !self.has_alive_path();
@@ -333,6 +333,7 @@ impl Session {
             p.id != cur.id
                 && p.link() == cur.link()
                 && p.is_schedulable()
+                && crate::scheduler::is_loss_fresh(&self.inner.cfg, p)
                 && !self.conn_has_interactive(p.id)
         }) {
             return Some(sib.id);
@@ -396,6 +397,7 @@ impl Session {
         );
     }
 
+    #[allow(dead_code)]
     fn maybe_failback(&self, st: Arc<StreamState>) {
         if !st.is_steerable() {
             return;

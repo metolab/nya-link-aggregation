@@ -88,9 +88,10 @@ PSK 证明「谁能加入这条会话」；pin 证明「TLS 对端是这张证�
 
 offset 进度（`session::{streams,steer}`，5ms tick）：
 
-- **换路重传**：unacked / StreamOpen 超过 `loss_timeout(发出路径 RTT)` 则避开原 `path_id`、优先不同 `link_key` 再发一次。不是并发双发。
-- **路径 down**：那条 TCP 上的 unacked / Open **立刻**换到仍活的路上；路径拆/重拨是池卫生，不挡 TTFB。
-- **failback / same-link rebalance**：更新 last-send 诊断与 HOL 放置；发送本身每帧重新 pick。
+- **换路重传**：unacked / StreamOpen / StreamClose 超过 `loss_timeout(发出路径 RTT)` 则避开已试过的 `path_id`、优先不同 `link_key` 再发一次。不是并发双发。
+- **选路跳过静默但 UP 的 TCP**：`last_rx_ago >= loss_timeout` 时不当最好路径（不必等 `mark_degraded`）。
+- **路径 down**：那条 TCP 上的 unacked / Open / Close **立刻**换到仍活的路上；路径拆/重拨是池卫生，不挡 TTFB。
+- **HOL**：same-link bulk vs interactive；last-send 只是诊断和 HOL 放置，不是发送契约。`maybe_failback` 已从 maintain 去掉。
 
 HOL 隔离靠「每链路多连接 + bulk 避开交互连接」，不是把流钉死在一条 TCP 上。
 
@@ -107,7 +108,7 @@ HOL 隔离靠「每链路多连接 + bulk 避开交互连接」，不是把流�
 
 线路状态按 `link_key` 汇总（`a#0`/`a#1` → `a`）：up/deg 连接数、RTT 范围、sticky、inflight、队列、rx 新鲜/最旧。`paths=` 可带 ` bak`。迁移原因拆成 speculative / path_down / ensure_sticky / send-blocked；另有 retransmit/hedge、probe_miss、未知 RTT pick。snapshot 带压缩 `streams=`（不进 Prometheus 标签）。
 
-业务计分卡：流完成比、send-unacked ∪ recv-hole stall（进入钟是 `loss_timeout`）、每路径一次 `failover_ms`（`last_rx_ago`）、跨 link `failbacks`、overlay goodput（`path.rs::send_frame` / decode）。换路重传计入 `data_retransmit` / `data_hedge`（跨 `link_key` 为 hedge）。e2e 产品门是 **新流 first-byte**（`prod_like_*_first_byte`），不是 ping 1500 ms。见 [OBSERVABILITY.md](OBSERVABILITY.md)。
+业务计分卡：流完成比、send-unacked ∪ recv-hole stall（进入钟是 `loss_timeout`）、每路径一次 `failover_ms`（`last_rx_ago`）、overlay goodput。换路重传计入 `data_retransmit` / `data_hedge`（跨 `link_key` 为 hedge）；Close 换路计 `close_retry`。半关闭 linger 计 `stream_reaps_linger`，**不是**产品 `stream_resets_timeout`。Soak 看 `(closed - linger) / opened`。e2e 产品门是 **新流 first-byte** 与 Close-swallowed（`prod_like_*`），不是 ping 1500 ms。见 [OBSERVABILITY.md](OBSERVABILITY.md)。
 
 ## 配置分层
 

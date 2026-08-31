@@ -25,6 +25,7 @@ pub struct Unacked {
     pub data: Vec<u8>,
     pub path_id: u32,
     pub last_sent: Instant,
+    pub tried: Vec<u32>,
 }
 
 pub struct StreamState {

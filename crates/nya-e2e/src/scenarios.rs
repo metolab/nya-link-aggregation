@@ -764,6 +764,13 @@ pub async fn prod_like_one_conn_hole_first_byte() -> Result<ScenarioReport> {
         None,
     );
     note_prod_like(&mut r, &h, baseline);
+    if r.snap.session_all_down_resets != 0 || r.snap.stream_resets_timeout > 2 {
+        r.sla.min_success = 2.0;
+        r.notes.push(format!(
+            "hygiene all_down={} timeout={}",
+            r.snap.session_all_down_resets, r.snap.stream_resets_timeout
+        ));
+    }
     Ok(r)
 }
 
@@ -792,6 +799,13 @@ pub async fn prod_like_one_link_hole_first_byte() -> Result<ScenarioReport> {
         None,
     );
     note_prod_like(&mut r, &h, baseline);
+    if r.snap.session_all_down_resets != 0 || r.snap.stream_resets_timeout > 2 {
+        r.sla.min_success = 2.0;
+        r.notes.push(format!(
+            "hygiene all_down={} timeout={}",
+            r.snap.session_all_down_resets, r.snap.stream_resets_timeout
+        ));
+    }
     Ok(r)
 }
 
@@ -863,6 +877,179 @@ pub async fn prod_like_concurrent_hole_first_byte() -> Result<ScenarioReport> {
         None,
     );
     note_prod_like(&mut r, &h, baseline);
+    Ok(r)
+}
+
+/// Close queued into a silent-but-UP 5-tuple; FIN must arrive without linger Timeout.
+pub async fn prod_like_close_swallowed() -> Result<ScenarioReport> {
+    let h = start(prod_like_spec()).await?;
+    let payload = vec![0u8; 256];
+    let mut tcp = h.connect_socks_echo().await?;
+    tcp.write_all(&payload).await?;
+    let mut buf = vec![0u8; payload.len()];
+    tcp.read_exact(&mut buf).await?;
+    let to0 = h.session.snapshot().stream_resets_timeout;
+    for (link, idx) in [
+        ("akcdn", 0),
+        ("akcdn", 1),
+        ("soy", 0),
+        ("soy", 1),
+        ("nsix", 0),
+    ] {
+        h.link(link).set_conn_blackhole(idx, true);
+    }
+    tcp.write_all(&payload).await?;
+    tcp.read_exact(&mut buf).await?;
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    h.link("nsix").set_conn_blackhole(1, true);
+    let t0 = Instant::now();
+    tcp.shutdown().await?;
+    for (link, idx) in [
+        ("akcdn", 0),
+        ("akcdn", 1),
+        ("soy", 0),
+        ("soy", 1),
+        ("nsix", 0),
+        ("nsix", 1),
+    ] {
+        h.link(link).set_conn_blackhole(idx, false);
+    }
+    let eof = tokio::time::timeout(Duration::from_millis(400), async {
+        let mut one = [0u8; 1];
+        tcp.read(&mut one).await
+    })
+    .await;
+    let ok0 = matches!(eof, Ok(Ok(0)));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let snap = h.session.snapshot();
+    let mut stats = WorkloadStats::default();
+    if ok0 {
+        stats.samples.push(crate::workload::PingSample {
+            at: t0,
+            rtt: Some(t0.elapsed()),
+        });
+        stats.bytes_ok = 1;
+    } else {
+        stats.timeouts = 1;
+        stats
+            .samples
+            .push(crate::workload::PingSample { at: t0, rtt: None });
+    }
+    let mut r = finish(
+        "prod_like_close_swallowed",
+        &h,
+        stats,
+        Sla {
+            must_survive: true,
+            p99_ms: Some(400),
+            failover_ms: None,
+            min_success: 1.0,
+        },
+        None,
+    );
+    r.notes.push(format!(
+        "eof={ok0} close_retry={} timeout_delta={} all_down={}",
+        snap.close_retry,
+        snap.stream_resets_timeout.saturating_sub(to0),
+        snap.session_all_down_resets
+    ));
+    if snap.stream_resets_timeout.saturating_sub(to0) != 0 || snap.session_all_down_resets != 0 {
+        r.sla.min_success = 2.0;
+    }
+    Ok(r)
+}
+
+/// Both akcdn and soy blackholed; nsix stays up (no A↔B ping-pong).
+pub async fn prod_like_two_isp_hole_first_byte() -> Result<ScenarioReport> {
+    let h = start(prod_like_spec()).await?;
+    let payload = vec![0u8; 2048];
+    let mut baseline = Duration::MAX;
+    for _ in 0..3 {
+        baseline = baseline.min(
+            socks_first_byte(&h, &payload, Duration::from_millis(400))
+                .await
+                .map_err(|_| anyhow!("baseline first-byte timed out"))?,
+        );
+    }
+    h.link("akcdn").set_conn_blackhole(0, true);
+    h.link("akcdn").set_conn_blackhole(1, true);
+    h.link("soy").set_conn_blackhole(0, true);
+    h.link("soy").set_conn_blackhole(1, true);
+    let stats = collect_first_bytes(&h, 16, &payload, Duration::from_millis(250)).await;
+    h.link("akcdn").set_conn_blackhole(0, false);
+    h.link("akcdn").set_conn_blackhole(1, false);
+    h.link("soy").set_conn_blackhole(0, false);
+    h.link("soy").set_conn_blackhole(1, false);
+    let mut r = finish(
+        "prod_like_two_isp_hole_first_byte",
+        &h,
+        stats,
+        first_byte_sla(180, 0.95),
+        None,
+    );
+    note_prod_like(&mut r, &h, baseline);
+    if r.snap.session_all_down_resets != 0 {
+        r.sla.min_success = 2.0;
+    }
+    Ok(r)
+}
+
+/// All six overlay TCPs blackholed < all_down_timeout; session must not reset all streams.
+pub async fn prod_like_all_path_blackhole() -> Result<ScenarioReport> {
+    let h = start(prod_like_spec()).await?;
+    let payload = vec![0u8; 256];
+    socks_first_byte(&h, &payload, Duration::from_millis(400))
+        .await
+        .map_err(|_| anyhow!("baseline first-byte timed out"))?;
+    for name in ["akcdn", "soy", "nsix"] {
+        h.link(name).set_conn_blackhole(0, true);
+        h.link(name).set_conn_blackhole(1, true);
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let during = h.session.snapshot();
+    for name in ["akcdn", "soy", "nsix"] {
+        h.link(name).set_conn_blackhole(0, false);
+        h.link(name).set_conn_blackhole(1, false);
+    }
+    let recovered = socks_first_byte(&h, &payload, Duration::from_millis(400)).await;
+    let mut stats = WorkloadStats::default();
+    match recovered {
+        Ok(d) => {
+            stats.samples.push(crate::workload::PingSample {
+                at: Instant::now(),
+                rtt: Some(d),
+            });
+            stats.bytes_ok = 1;
+        }
+        Err(()) => {
+            stats.timeouts = 1;
+            stats.samples.push(crate::workload::PingSample {
+                at: Instant::now(),
+                rtt: None,
+            });
+        }
+    }
+    let mut r = finish(
+        "prod_like_all_path_blackhole",
+        &h,
+        stats,
+        Sla {
+            must_survive: true,
+            p99_ms: Some(400),
+            failover_ms: None,
+            min_success: 1.0,
+        },
+        None,
+    );
+    r.notes.push(format!(
+        "during_all_down={} corr={} recovered={}",
+        during.session_all_down_resets,
+        during.correlated_silence,
+        recovered.is_ok()
+    ));
+    if during.session_all_down_resets != 0 {
+        r.sla.min_success = 2.0;
+    }
     Ok(r)
 }
 
@@ -1408,6 +1595,21 @@ pub fn catalog() -> Vec<Scenario> {
             "prod_like_concurrent_hole_first_byte",
             false,
             prod_like_concurrent_hole_first_byte()
+        ),
+        sc!(
+            "prod_like_close_swallowed",
+            false,
+            prod_like_close_swallowed()
+        ),
+        sc!(
+            "prod_like_two_isp_hole_first_byte",
+            false,
+            prod_like_two_isp_hole_first_byte()
+        ),
+        sc!(
+            "prod_like_all_path_blackhole",
+            false,
+            prod_like_all_path_blackhole()
         ),
         sc!("one_conn_stall", false, one_conn_stall()),
         sc!("one_conn_disconnect", false, one_conn_disconnect()),

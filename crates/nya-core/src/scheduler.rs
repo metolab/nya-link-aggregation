@@ -169,7 +169,28 @@ fn path_score(p: &PathState, cfg: &SessionConfig, pref: PickPref) -> (u64, bool)
     (score, p.rtt_known())
 }
 
-pub(crate) fn pick_from(
+/// Receive-fresh vs the DATA/Open retry clock (`loss_timeout` on fast EWMA).
+pub fn is_loss_fresh(cfg: &SessionConfig, p: &PathState) -> bool {
+    p.last_rx_ago() < health::loss_timeout(cfg, p.rtt())
+}
+
+fn loss_fresh_or_all<'a>(
+    cfg: &SessionConfig,
+    cands: &[&'a Arc<PathState>],
+) -> Vec<&'a Arc<PathState>> {
+    let fresh: Vec<_> = cands
+        .iter()
+        .copied()
+        .filter(|p| is_loss_fresh(cfg, p))
+        .collect();
+    if fresh.is_empty() {
+        cands.to_vec()
+    } else {
+        fresh
+    }
+}
+
+fn pick_from_scored(
     candidates: &[&Arc<PathState>],
     cfg: &SessionConfig,
     pref: PickPref,
@@ -194,18 +215,29 @@ pub(crate) fn pick_from(
     Some(best_id)
 }
 
+pub(crate) fn pick_from(
+    candidates: &[&Arc<PathState>],
+    cfg: &SessionConfig,
+    pref: PickPref,
+) -> Option<u32> {
+    let subset = loss_fresh_or_all(cfg, candidates);
+    pick_from_scored(&subset, cfg, pref)
+}
+
 /// Like [`pick_from`], but exact `(score, known)` ties rotate by `stream_id`.
 /// Failback / HOL / backup keep [`pick_from`] (min id) so equal peers do not chatter.
+/// Ties are rotated only inside the loss-fresh subset (same as [`pick_from`]).
 pub(crate) fn pick_from_spread(
     candidates: &[&Arc<PathState>],
     cfg: &SessionConfig,
     pref: PickPref,
     stream_id: u32,
 ) -> Option<u32> {
-    let best_id = pick_from(candidates, cfg, pref)?;
-    let best = candidates.iter().find(|p| p.id == best_id)?;
+    let subset = loss_fresh_or_all(cfg, candidates);
+    let best_id = pick_from_scored(&subset, cfg, pref)?;
+    let best = subset.iter().find(|p| p.id == best_id)?;
     let (best_score, best_known) = path_score(best, cfg, pref);
-    let mut tied: Vec<u32> = candidates
+    let mut tied: Vec<u32> = subset
         .iter()
         .filter(|p| path_score(p, cfg, pref) == (best_score, best_known))
         .map(|p| p.id)
@@ -461,35 +493,78 @@ pub fn backup_path(paths: &[Arc<PathState>], avoid: u32) -> Option<u32> {
     pick_backup(paths, avoid, None, None)
 }
 
-/// Timed-out unacked copy: never `avoid`, prefer a different named link.
-pub fn pick_retry_path(paths: &[Arc<PathState>], cfg: &SessionConfig, avoid: u32) -> Option<u32> {
-    let avoid_link = paths
-        .iter()
-        .find(|p| p.id == avoid)
-        .map(|p| p.link().to_string());
-    let pick_with = |pred: fn(&PathState) -> bool| -> Option<u32> {
-        let diverse: Vec<&Arc<PathState>> = paths
+/// Timed-out unacked copy: never the current in-flight id, prefer untried
+/// and a different named link. `tried` is oldest→newest; last is current.
+pub fn pick_retry_path(
+    paths: &[Arc<PathState>],
+    cfg: &SessionConfig,
+    tried: &[u32],
+) -> Option<u32> {
+    let current = tried.last().copied();
+    let avoid_link = current.and_then(|id| {
+        paths
+            .iter()
+            .find(|p| p.id == id)
+            .map(|p| p.link().to_string())
+    });
+    let not_tried = |p: &PathState| !tried.contains(&p.id);
+    let pick_rung = |pred: &dyn Fn(&PathState) -> bool, other_link: bool| -> Option<u32> {
+        let cands: Vec<&Arc<PathState>> = paths
             .iter()
             .filter(|p| {
-                p.id != avoid
-                    && pred(p)
-                    && avoid_link.as_deref().map(|l| p.link() != l).unwrap_or(true)
+                pred(p)
+                    && (!other_link || avoid_link.as_deref().map(|l| p.link() != l).unwrap_or(true))
             })
             .collect();
-        if !diverse.is_empty() {
-            return pick_from(&diverse, cfg, PickPref::Any);
-        }
-        let other: Vec<&Arc<PathState>> =
-            paths.iter().filter(|p| p.id != avoid && pred(p)).collect();
-        pick_from(&other, cfg, PickPref::Any)
+        pick_min_rx(&cands, cfg)
     };
-    pick_with(|p| p.is_schedulable()).or_else(|| pick_with(|p| p.is_alive()))
+    pick_rung(
+        &|p| not_tried(p) && is_loss_fresh(cfg, p) && p.is_schedulable(),
+        true,
+    )
+    .or_else(|| {
+        pick_rung(
+            &|p| not_tried(p) && is_loss_fresh(cfg, p) && p.is_schedulable(),
+            false,
+        )
+    })
+    .or_else(|| pick_rung(&|p| not_tried(p) && p.is_schedulable(), false))
+    .or_else(|| pick_rung(&|p| not_tried(p) && p.is_alive(), false))
+    .or_else(|| {
+        pick_rung(
+            &|p| p.is_alive() && current.map(|id| p.id != id).unwrap_or(true),
+            false,
+        )
+    })
+}
+
+fn pick_min_rx(cands: &[&Arc<PathState>], cfg: &SessionConfig) -> Option<u32> {
+    if cands.is_empty() {
+        return None;
+    }
+    let mut best = cands[0];
+    let mut best_ago = best.last_rx_ago();
+    let mut best_score = path_score(best, cfg, PickPref::Any);
+    for p in cands.iter().skip(1) {
+        let ago = p.last_rx_ago();
+        let score = path_score(p, cfg, PickPref::Any);
+        let better = ago < best_ago
+            || (ago == best_ago && score.0 < best_score.0)
+            || (ago == best_ago && score.0 == best_score.0 && score.1 && !best_score.1)
+            || (ago == best_ago && score == best_score && p.id < best.id);
+        if better {
+            best = p;
+            best_ago = ago;
+            best_score = score;
+        }
+    }
+    Some(best.id)
 }
 
 /// Same-link TCP rebalance: move off a loaded connection onto its sibling
 /// even when RTTs are equal (bulk vs ping HOL isolation).
 pub fn should_rebalance_conn(cur: &PathState, alt: &PathState, cfg: &SessionConfig) -> bool {
-    if cur.id == alt.id || !alt.is_schedulable() {
+    if cur.id == alt.id || !alt.is_schedulable() || !is_loss_fresh(cfg, alt) {
         return false;
     }
     if cur.link() != alt.link() {
@@ -645,7 +720,7 @@ mod tests {
         let a0 = mk_named(1, "akcdn#0".into(), 7);
         let a1 = mk_named(2, "akcdn#1".into(), 7);
         let b0 = mk_named(3, "soy#0".into(), 7);
-        let picked = pick_retry_path(&[a0, a1, b0], &cfg, 1).unwrap();
+        let picked = pick_retry_path(&[a0, a1, b0], &cfg, &[1]).unwrap();
         assert_eq!(picked, 3, "retry must leave the failed ISP");
     }
 
@@ -654,7 +729,7 @@ mod tests {
         let cfg = SessionConfig::default();
         let a0 = mk_named(1, "akcdn#0".into(), 7);
         let a1 = mk_named(2, "akcdn#1".into(), 7);
-        let picked = pick_retry_path(&[a0, a1], &cfg, 1).unwrap();
+        let picked = pick_retry_path(&[a0, a1], &cfg, &[1]).unwrap();
         assert_eq!(picked, 2);
     }
 
@@ -665,7 +740,7 @@ mod tests {
         let b0 = mk_named(2, "soy#0".into(), 7);
         let c0 = mk_named(3, "nsix#0".into(), 7);
         b0.set_congested(true);
-        let picked = pick_retry_path(&[a0, b0, c0], &cfg, 1).unwrap();
+        let picked = pick_retry_path(&[a0, b0, c0], &cfg, &[1]).unwrap();
         assert_eq!(picked, 3);
     }
 
@@ -673,7 +748,91 @@ mod tests {
     fn retry_none_when_only_avoid_is_alive() {
         let cfg = SessionConfig::default();
         let a0 = mk_named(1, "akcdn#0".into(), 7);
-        assert!(pick_retry_path(&[a0], &cfg, 1).is_none());
+        assert!(pick_retry_path(&[a0], &cfg, &[1]).is_none());
+    }
+
+    fn age_rx(p: &PathState, ms: u64) {
+        *p.last_rx.lock().unwrap() = Instant::now() - Duration::from_millis(ms);
+    }
+
+    #[test]
+    fn pick_skips_silent_but_up_when_a_fresh_peer_exists() {
+        let cfg = SessionConfig::default();
+        let a = mk_named(1, "akcdn#0".into(), 7);
+        let b = mk_named(2, "soy#0".into(), 7);
+        let c = mk_named(3, "nsix#0".into(), 7);
+        age_rx(&a, 30);
+        let picked = pick_path(&[a.clone(), b.clone(), c.clone()], &cfg).unwrap();
+        assert_ne!(picked, 1);
+    }
+
+    #[test]
+    fn pick_falls_back_when_all_class_peers_are_stale() {
+        let cfg = SessionConfig::default();
+        let a = mk_named(1, "akcdn#0".into(), 7);
+        let b = mk_named(2, "soy#0".into(), 7);
+        age_rx(&a, 30);
+        age_rx(&b, 30);
+        assert!(pick_path(&[a, b], &cfg).is_some());
+    }
+
+    #[test]
+    fn spread_does_not_rotate_onto_silent_equal_score_sibling() {
+        let cfg = SessionConfig::default();
+        let a = mk_named(1, "akcdn#0".into(), 7);
+        let b = mk_named(2, "akcdn#1".into(), 7);
+        age_rx(&a, 30);
+        let paths = vec![a, b];
+        for sid in 1..=8 {
+            let picked = pick_path_pref_spread(&paths, &cfg, PickPref::Any, sid).unwrap();
+            assert_eq!(picked, 2, "sid={sid}");
+        }
+    }
+
+    #[test]
+    fn rebalance_skips_silent_sibling() {
+        let cfg = SessionConfig::default();
+        let a0 = mk_named(1, "a#0".into(), 9);
+        let a1 = mk_named(2, "a#1".into(), 9);
+        a0.inflight.store(100 * 1024, Ordering::Relaxed);
+        a1.inflight.store(0, Ordering::Relaxed);
+        age_rx(&a1, 30);
+        assert!(!should_rebalance_conn(&a0, &a1, &cfg));
+    }
+
+    #[test]
+    fn unknown_rtt_loss_timeout_is_40ms() {
+        let cfg = SessionConfig::default();
+        let unk = mk_named(1, "a#0".into(), 0);
+        unk.rtt_ewma_us.store(0, Ordering::Relaxed);
+        age_rx(&unk, 25);
+        assert!(
+            is_loss_fresh(&cfg, &unk),
+            "25ms unknown still fresh (loss_timeout=40ms)"
+        );
+        age_rx(&unk, 45);
+        assert!(!is_loss_fresh(&cfg, &unk));
+        let u2 = mk_named(2, "b#0".into(), 0);
+        u2.rtt_ewma_us.store(0, Ordering::Relaxed);
+        age_rx(&unk, 25);
+        age_rx(&u2, 45);
+        assert_eq!(
+            pick_path(&[unk.clone(), u2.clone()], &cfg).unwrap(),
+            1,
+            "45ms unknown skipped when a fresher unknown peer exists"
+        );
+        age_rx(&unk, 45);
+        assert!(pick_path(&[unk, u2], &cfg).is_some());
+    }
+
+    #[test]
+    fn retry_tried_two_isps_lands_on_third() {
+        let cfg = SessionConfig::default();
+        let a0 = mk_named(1, "akcdn#0".into(), 7);
+        let b0 = mk_named(2, "soy#0".into(), 7);
+        let c0 = mk_named(3, "nsix#0".into(), 7);
+        let picked = pick_retry_path(&[a0, b0, c0], &cfg, &[1, 2]).unwrap();
+        assert_eq!(picked, 3);
     }
 
     #[test]

@@ -150,13 +150,15 @@ impl ScenarioReport {
                 self.snap.streams_live
             ),
             format!(
-                "links={links} mig spec={} down={} ens={} blk={} retransmit={} hedge={} probe_miss={} unk_pick={}/{}",
+                "links={links} mig spec={} down={} ens={} blk={} retransmit={} hedge={} close_retry={} linger={} probe_miss={} unk_pick={}/{}",
                 self.snap.migrates_speculative,
                 self.snap.migrates_path_down,
                 self.snap.migrates_ensure_sticky,
                 self.snap.migrates_send_blocked,
                 self.snap.data_retransmit,
                 self.snap.data_hedge,
+                self.snap.close_retry,
+                self.snap.stream_reaps_linger,
                 self.snap.probe_miss,
                 self.snap.picks_unknown_over_known,
                 self.snap.picks_unknown_rtt,

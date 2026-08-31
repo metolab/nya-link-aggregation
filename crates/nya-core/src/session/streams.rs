@@ -54,14 +54,13 @@ impl Session {
             stream_id: id,
             target: target.clone(),
         });
-        if self.send_on_path(path_id, open.clone()) {
-            self.remember_open(id, path_id, target);
-        } else if let Some(alt) = self.pick_retry(path_id) {
-            self.send_on_path(alt, open);
-            self.set_sticky(id, alt);
-            self.remember_open(id, alt, target);
-        } else {
-            self.remember_open(id, path_id, target);
+        self.remember_open(id, path_id, target.clone());
+        if !self.send_on_path(path_id, open.clone()) {
+            if let Some(alt) = self.pick_retry(path_id) {
+                self.send_on_path(alt, open);
+                self.set_sticky(id, alt);
+                self.remember_open(id, alt, target);
+            }
         }
         Ok(tun)
     }
@@ -251,6 +250,7 @@ impl Session {
                         data: piece.clone(),
                         path_id,
                         last_sent: std::time::Instant::now(),
+                        tried: vec![path_id],
                     },
                 );
             }
@@ -270,6 +270,7 @@ impl Session {
                         if let Some(u) = unacked.get_mut(&offset) {
                             u.path_id = alt;
                             u.last_sent = std::time::Instant::now();
+                            Session::push_tried(&mut u.tried, alt);
                         }
                     }
                     self.xfer_inflight(path_id, alt, n as u64);
@@ -300,8 +301,16 @@ impl Session {
             return Ok(());
         }
         st.note_close_started();
-        if let Some(path_id) = self.pick_pref(PickPref::Any) {
-            self.send_on_path(path_id, Frame::StreamClose(StreamClose { stream_id: id }));
+        let second = st.recv_fin.load(Ordering::Relaxed);
+        let path_id = self.pick_pref(PickPref::Any);
+        if let Some(path_id) = path_id {
+            self.remember_close(id, path_id, second);
+            if !self.send_on_path(path_id, Frame::StreamClose(StreamClose { stream_id: id })) {
+                if let Some(alt) = self.pick_retry(path_id) {
+                    self.remember_close(id, alt, second);
+                    self.send_on_path(alt, Frame::StreamClose(StreamClose { stream_id: id }));
+                }
+            }
         }
         self.maybe_count_graceful(&st);
         Ok(())
@@ -478,6 +487,7 @@ impl Session {
         if !st.recv_fin.swap(true, Ordering::SeqCst) {
             let _ = st.inbound_tx.try_send(Inbound::Close);
         }
+        self.forget_close(id);
         self.maybe_count_graceful(&st);
     }
 

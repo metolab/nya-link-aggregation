@@ -17,7 +17,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, Notify};
 use tracing::{debug, info, warn};
 
-use nya_proto::{Frame, Pong, ResetReason, StreamData, StreamOpen, Target};
+use nya_proto::{Frame, Pong, ResetReason, StreamClose, StreamData, StreamOpen, Target};
 
 use crate::cfg::SessionConfig;
 use crate::health;
@@ -34,6 +34,15 @@ struct OpenUnacked {
     path_id: u32,
     sent_at: Instant,
     target: Target,
+    tried: Vec<u32>,
+}
+
+struct CloseUnacked {
+    path_id: u32,
+    sent_at: Instant,
+    started_at: Instant,
+    tried: Vec<u32>,
+    second_closer: bool,
 }
 
 struct PendingEarly {
@@ -81,6 +90,7 @@ pub(crate) struct Inner {
     process: Arc<ProcessCounters>,
     last_rtt_us: Mutex<HashMap<String, u64>>,
     opens: Mutex<HashMap<u32, OpenUnacked>>,
+    closes: Mutex<HashMap<u32, CloseUnacked>>,
     pending_early: Mutex<HashMap<u32, Vec<PendingEarly>>>,
 }
 
@@ -125,6 +135,7 @@ impl Session {
             process,
             last_rtt_us: Mutex::new(HashMap::new()),
             opens: Mutex::new(HashMap::new()),
+            closes: Mutex::new(HashMap::new()),
             pending_early: Mutex::new(HashMap::new()),
         });
         let session = Self { inner };
@@ -180,6 +191,7 @@ impl Session {
             reason = if send_frame { "shutdown" } else { "drop" },
             "session dead"
         );
+        self.inner.closes.lock().unwrap().clear();
         let ids: Vec<u32> = self.inner.streams.lock().unwrap().keys().copied().collect();
         for id in ids {
             self.finish_stream(id, Some(ResetReason::SessionDead), send_frame);
@@ -319,6 +331,7 @@ impl Session {
         self.observe_failover(&path);
         self.rehome_unacked_from(path_id);
         self.retry_open_from(path_id);
+        self.retry_close_from(path_id);
         self.inner.paths.lock().unwrap().remove(&path_id);
         if !self.has_alive_path() {
             *self.inner.all_down_since.lock().unwrap() = Some(Instant::now());
@@ -366,7 +379,11 @@ impl Session {
     }
 
     fn pick_retry(&self, avoid: u32) -> Option<u32> {
-        pick_retry_path(&self.path_list(), &self.inner.cfg, avoid)
+        pick_retry_path(&self.path_list(), &self.inner.cfg, &[avoid])
+    }
+
+    fn pick_retry_tried(&self, tried: &[u32]) -> Option<u32> {
+        pick_retry_path(&self.path_list(), &self.inner.cfg, tried)
     }
 
     fn retry_after(&self, path_id: u32) -> Duration {
@@ -402,7 +419,8 @@ impl Session {
             if u.last_sent.elapsed() < self.retry_after(u.path_id) {
                 continue;
             }
-            let Some(alt) = self.pick_retry(u.path_id) else {
+            Self::push_tried(&mut u.tried, u.path_id);
+            let Some(alt) = self.pick_retry_tried(&u.tried) else {
                 continue;
             };
             let from = u.path_id;
@@ -429,19 +447,64 @@ impl Session {
         }
     }
 
+    fn push_tried(tried: &mut Vec<u32>, id: u32) {
+        if tried.last() == Some(&id) {
+            return;
+        }
+        tried.retain(|x| *x != id);
+        if tried.len() == 8 {
+            tried.remove(0);
+        }
+        tried.push(id);
+    }
+
     fn remember_open(&self, id: u32, path_id: u32, target: Target) {
-        self.inner.opens.lock().unwrap().insert(
+        let mut g = self.inner.opens.lock().unwrap();
+        if let Some(o) = g.get_mut(&id) {
+            o.path_id = path_id;
+            o.sent_at = Instant::now();
+            o.target = target;
+            Self::push_tried(&mut o.tried, path_id);
+            return;
+        }
+        g.insert(
             id,
             OpenUnacked {
                 path_id,
                 sent_at: Instant::now(),
                 target,
+                tried: vec![path_id],
             },
         );
     }
 
     fn forget_open(&self, id: u32) {
         self.inner.opens.lock().unwrap().remove(&id);
+    }
+
+    fn remember_close(&self, id: u32, path_id: u32, second_closer: bool) {
+        let mut g = self.inner.closes.lock().unwrap();
+        if let Some(c) = g.get_mut(&id) {
+            c.path_id = path_id;
+            c.sent_at = Instant::now();
+            Self::push_tried(&mut c.tried, path_id);
+            return;
+        }
+        let now = Instant::now();
+        g.insert(
+            id,
+            CloseUnacked {
+                path_id,
+                sent_at: now,
+                started_at: now,
+                tried: vec![path_id],
+                second_closer,
+            },
+        );
+    }
+
+    fn forget_close(&self, id: u32) {
+        self.inner.closes.lock().unwrap().remove(&id);
     }
 
     fn retry_opens(&self) {
@@ -455,7 +518,15 @@ impl Session {
             .map(|(id, o)| (*id, o.path_id, o.target.clone()))
             .collect();
         for (id, from, target) in snapshot {
-            let Some(alt) = self.pick_retry(from) else {
+            let tried = self
+                .inner
+                .opens
+                .lock()
+                .unwrap()
+                .get(&id)
+                .map(|o| o.tried.clone())
+                .unwrap_or_else(|| vec![from]);
+            let Some(alt) = self.pick_retry_tried(&tried) else {
                 continue;
             };
             if self.send_on_path(
@@ -469,6 +540,7 @@ impl Session {
                     o.path_id = alt;
                     o.sent_at = Instant::now();
                     o.target = target;
+                    Self::push_tried(&mut o.tried, alt);
                 }
                 self.note_retry(from, alt);
             }
@@ -486,7 +558,15 @@ impl Session {
             .map(|(id, o)| (*id, o.target.clone()))
             .collect();
         for (id, target) in snapshot {
-            let Some(alt) = self.pick_retry(dead) else {
+            let tried = self
+                .inner
+                .opens
+                .lock()
+                .unwrap()
+                .get(&id)
+                .map(|o| o.tried.clone())
+                .unwrap_or_else(|| vec![dead]);
+            let Some(alt) = self.pick_retry_tried(&tried) else {
                 continue;
             };
             if self.send_on_path(
@@ -499,10 +579,124 @@ impl Session {
                 if let Some(o) = self.inner.opens.lock().unwrap().get_mut(&id) {
                     o.path_id = alt;
                     o.sent_at = Instant::now();
+                    Self::push_tried(&mut o.tried, alt);
                 }
                 self.note_retry(dead, alt);
             }
         }
+    }
+
+    fn reap_closes(&self) {
+        let linger = self.inner.cfg.tuning.close_linger;
+        let drop: Vec<u32> = self
+            .inner
+            .closes
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, c)| c.started_at.elapsed() >= linger)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in drop {
+            self.forget_close(id);
+        }
+    }
+
+    fn close_rx_after_send(&self, path_id: u32, sent_at: Instant) -> bool {
+        let Some(p) = self.get_path(path_id) else {
+            return false;
+        };
+        let last = *p.last_rx.lock().unwrap();
+        last > sent_at
+    }
+
+    fn retry_closes(&self) {
+        self.reap_closes();
+        let snapshot: Vec<(u32, u32, bool, Vec<u32>, Instant)> = self
+            .inner
+            .closes
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, c)| (*id, c.path_id, c.second_closer, c.tried.clone(), c.sent_at))
+            .collect();
+        for (id, from, second, tried, sent_at) in snapshot {
+            if !second {
+                if let Some(st) = self.get_stream(id) {
+                    if st.recv_fin.load(Ordering::Relaxed) {
+                        self.forget_close(id);
+                        continue;
+                    }
+                }
+            }
+            if sent_at.elapsed() < self.retry_after(from) {
+                continue;
+            }
+            if self.close_rx_after_send(from, sent_at) {
+                self.forget_close(id);
+                continue;
+            }
+            let Some(alt) = self.pick_retry_tried(&tried) else {
+                continue;
+            };
+            if self.send_on_path(alt, Frame::StreamClose(StreamClose { stream_id: id })) {
+                if let Some(c) = self.inner.closes.lock().unwrap().get_mut(&id) {
+                    c.path_id = alt;
+                    c.sent_at = Instant::now();
+                    Self::push_tried(&mut c.tried, alt);
+                }
+                self.inner
+                    .metrics
+                    .close_retry
+                    .fetch_add(1, Ordering::Relaxed);
+                debug!(stream_id = id, from, to = alt, "close_retry");
+            }
+        }
+    }
+
+    fn retry_close_from(&self, dead: u32) {
+        let snapshot: Vec<(u32, Vec<u32>)> = self
+            .inner
+            .closes
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, c)| c.path_id == dead)
+            .map(|(id, c)| (*id, c.tried.clone()))
+            .collect();
+        for (id, tried) in snapshot {
+            let Some(alt) = self.pick_retry_tried(&tried) else {
+                continue;
+            };
+            if self.send_on_path(alt, Frame::StreamClose(StreamClose { stream_id: id })) {
+                if let Some(c) = self.inner.closes.lock().unwrap().get_mut(&id) {
+                    c.path_id = alt;
+                    c.sent_at = Instant::now();
+                    Self::push_tried(&mut c.tried, alt);
+                }
+                self.inner
+                    .metrics
+                    .close_retry
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn overlay_progress_fine(&self, st: &StreamState) -> bool {
+        let send_fin = st.send_fin_sent.load(Ordering::Relaxed);
+        let recv_fin = st.recv_fin.load(Ordering::Relaxed);
+        let acked = st.send_acked.load(Ordering::Relaxed);
+        let next = st.send_next.load(Ordering::Relaxed);
+        if acked < next {
+            return false;
+        }
+        if recv_fin {
+            return true;
+        }
+        if !send_fin {
+            return false;
+        }
+        !self.inner.opens.lock().unwrap().contains_key(&st.id)
     }
 
     fn min_known_rtt(&self) -> Duration {
@@ -631,6 +825,7 @@ impl Session {
         self.xfer_inflight(u.path_id, to, u.data.len() as u64);
         u.path_id = to;
         u.last_sent = Instant::now();
+        Self::push_tried(&mut u.tried, to);
     }
 
     fn send_data_frame(&self, stream_id: u32, offset: u64, data: Vec<u8>, path_id: u32) -> bool {
@@ -819,6 +1014,19 @@ impl Session {
                     .streams_closed
                     .fetch_add(1, Ordering::Relaxed);
             }
+            Some(ResetReason::Timeout) if self.overlay_progress_fine(st) => {
+                self.inner
+                    .metrics
+                    .streams_closed
+                    .fetch_add(1, Ordering::Relaxed);
+                self.inner
+                    .metrics
+                    .stream_reaps_linger
+                    .fetch_add(1, Ordering::Relaxed);
+                debug!(stream_id = st.id, reason = "linger", "stream end");
+                self.forget_close(st.id);
+                return;
+            }
             Some(reason) => {
                 self.inner
                     .metrics
@@ -835,6 +1043,7 @@ impl Session {
                 c.fetch_add(1, Ordering::Relaxed);
             }
         }
+        self.forget_close(st.id);
         debug!(stream_id = st.id, ?reset_reason, "stream end");
     }
 
@@ -1289,6 +1498,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn close_retry_rehomes_first_closer() {
+        let (client, server) = pair_echo(&["akcdn#0", "soy#0"]).await;
+        let mut tun = client
+            .open_stream(Target {
+                host: "t".into(),
+                port: 1,
+            })
+            .await
+            .unwrap();
+        tun.write_all(b"hello").await.unwrap();
+        let mut buf = [0u8; 5];
+        tun.read_exact(&mut buf).await.unwrap();
+        let (sid, from) = {
+            let g = client.inner.streams.lock().unwrap();
+            let st = g.values().next().unwrap();
+            (st.id, st.sticky.load(Ordering::Relaxed))
+        };
+        client.remember_close(sid, from, false);
+        if let Some(p) = client.get_path(from) {
+            *p.last_rx.lock().unwrap() = Instant::now() - Duration::from_millis(400);
+        }
+        {
+            let mut g = client.inner.closes.lock().unwrap();
+            for c in g.values_mut() {
+                c.sent_at = Instant::now() - Duration::from_millis(400);
+            }
+        }
+        let r0 = client.snapshot().close_retry;
+        client.debug_maintain();
+        assert!(
+            client.snapshot().close_retry > r0,
+            "first closer must rehome Close"
+        );
+        drop(tun);
+        client.shutdown();
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn linger_without_stream_empties_closes() {
+        let mut cfg = SessionConfig::default();
+        cfg.tuning.close_linger = Duration::from_millis(20);
+        let client = Session::new_client(cfg);
+        inject_named(&client, 1, "akcdn#0", 7);
+        client.remember_close(7, 1, true);
+        {
+            let mut g = client.inner.closes.lock().unwrap();
+            for c in g.values_mut() {
+                c.started_at = Instant::now() - Duration::from_millis(50);
+            }
+        }
+        client.debug_maintain();
+        assert!(
+            client.inner.closes.lock().unwrap().is_empty(),
+            "reap_closes must not need streams"
+        );
+        client.shutdown();
+    }
+
+    #[tokio::test]
     async fn path_down_rehomes_unacked_immediately() {
         let client = Session::new_client(SessionConfig::default());
         inject_named(&client, 1, "akcdn#0", 7);
@@ -1711,6 +1980,7 @@ mod tests {
                     data: vec![1, 2, 3],
                     path_id,
                     last_sent: Instant::now(),
+                    tried: vec![path_id],
                 },
             );
         }
@@ -1766,6 +2036,7 @@ mod tests {
                     data: vec![9],
                     path_id,
                     last_sent: Instant::now(),
+                    tried: vec![path_id],
                 },
             );
         }
