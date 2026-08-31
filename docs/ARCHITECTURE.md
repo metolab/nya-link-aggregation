@@ -82,14 +82,15 @@ PSK 证明「谁能加入这条会话」；pin 证明「TLS 对端是这张证�
 
 1. 活着的路径里去掉 backup（class RTT > 最快 × 2 + 20ms）
 2. 限制在最快 class（`should_failback(候选, 最好)` 为假的那些）
-3. 打分 `class_rtt × load × 1024 + fast_rtt × load`，`load = 1 + inflight/bias + last-send`
+3. 打分 `class_rtt × load × 1024 + fast_rtt × load`，`load = 1 + inflight/bias + last-send`；同分取最小 `path_id`
+4. 交互 DATA 在 last-send 仍是 class、schedulable、loss-fresh 时复用 Open 的 5-tuple（避免 Open 落在 ping-only 瘦 TCP 上撞 200 ms min-RTO）
 
 交互流用更重的 inflight 权重，避免和 bulk 抢同一条连接。
 
 offset 进度（`session::{streams,steer}`，5ms tick）：
 
-- **换路重传**：unacked / StreamOpen / StreamClose 超过 `loss_timeout(发出路径 RTT)` 则避开已试过的 `path_id`、优先不同 `link_key` 再发一次。不是并发双发。
-- **选路跳过静默但 UP 的 TCP**：`last_rx_ago >= loss_timeout` 时不当最好路径（不必等 `mark_degraded`）。
+- **换路重传**：unacked / StreamOpen / StreamClose 超过 `loss_timeout(min 活 dest 的 fast RTT)` 则避开已试过的 `path_id`、优先不同 `link_key` 再发一次。不是并发双发。不是 2× 那条病 5-tuple。
+- **选路跳过静默但 UP 的 TCP**：`last_rx_ago >= loss_timeout(min(fast, class))` 时不当最好路径（不必等 `mark_degraded`）。
 - **路径 down**：那条 TCP 上的 unacked / Open / Close **立刻**换到仍活的路上；路径拆/重拨是池卫生，不挡 TTFB。
 - **HOL**：same-link bulk vs interactive；last-send 只是诊断和 HOL 放置，不是发送契约。`maybe_failback` 已从 maintain 去掉。
 

@@ -13,6 +13,7 @@ use nya_proto::{
     Frame, ResetReason, StreamAck, StreamClose, StreamData, StreamOpen, Target, MAX_STREAM_PAYLOAD,
 };
 
+use crate::health;
 use crate::scheduler::PickPref;
 use crate::stream::{Inbound, StreamState, TunnelStream, Unacked};
 
@@ -26,7 +27,7 @@ impl Session {
         self.wait_ready(self.inner.cfg.all_down_timeout).await?;
         let id = self.inner.next_stream_id.fetch_add(1, Ordering::Relaxed);
         let path_id = self
-            .pick_pref_spread(crate::scheduler::PickPref::Interactive, id)
+            .pick_pref(crate::scheduler::PickPref::Interactive)
             .ok_or(SessionError::NoPath)?;
         let (tun, _st) = self.alloc_local_stream(id);
         self.set_sticky(id, path_id);
@@ -208,7 +209,13 @@ impl Session {
                 PickPref::Interactive
             };
             let mut path_id = loop {
-                if let Some(p) = self.pick_pref(pref) {
+                let picked = if pref == PickPref::Interactive {
+                    self.interactive_affinity(st.sticky.load(Ordering::Relaxed))
+                        .or_else(|| self.pick_pref(pref))
+                } else {
+                    self.pick_pref(pref)
+                };
+                if let Some(p) = picked {
                     break p;
                 }
                 if self.is_dead() || st.reset.load(Ordering::Relaxed) {
@@ -465,9 +472,14 @@ impl Session {
                         // when the sample waited behind bulk inflight.
                         let sample = u.last_sent.elapsed();
                         let t = &self.inner.cfg.tuning;
+                        let cap = health::loss_timeout(
+                            &self.inner.cfg,
+                            self.min_alive_fast_rtt().unwrap_or(p.class_rtt()),
+                        );
                         if u.data.len() <= t.interactive_max
                             && sample > t.ack_rtt_min
                             && sample < t.ack_rtt_max
+                            && sample <= cap
                             && loaded < t.inflight_bias
                         {
                             p.record_rtt(sample);

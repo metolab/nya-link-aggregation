@@ -51,6 +51,7 @@ pub async fn serve_socks5_listener(listener: TcpListener, session: Session) -> R
             _ = session.wait_dead() => break,
             acc = listener.accept() => {
                 let (tcp, peer) = acc?;
+                configure_inbound_tcp(&tcp);
                 let session = session.clone();
                 tokio::spawn(async move {
                     if let Err(e) = serve_socks5(tcp, session).await {
@@ -75,6 +76,7 @@ pub async fn serve_forward_listener(
             _ = session.wait_dead() => break,
             acc = listener.accept() => {
                 let (tcp, peer) = acc?;
+                configure_inbound_tcp(&tcp);
                 let session = session.clone();
                 let dest = dest.clone();
                 tokio::spawn(async move {
@@ -273,8 +275,28 @@ async fn copy_with_hop(
     });
 }
 
+fn configure_inbound_tcp(tcp: &TcpStream) {
+    let _ = tcp.set_nodelay(true);
+}
+
 async fn reply(tcp: &mut TcpStream, rep: u8) -> Result<()> {
     tcp.write_all(&[0x05, rep, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn configure_inbound_tcp_sets_nodelay() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::spawn(async move { TcpStream::connect(addr).await.unwrap() });
+        let (server, _) = listener.accept().await.unwrap();
+        configure_inbound_tcp(&server);
+        assert!(server.nodelay().unwrap());
+        drop(client.await.unwrap());
+    }
 }

@@ -4,10 +4,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{Sink, SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
-use tokio_util::codec::{Framed, LengthDelimitedCodec};
+use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
 use tracing::{debug, warn};
 
 use nya_proto::{Frame, Ping, MAX_FRAME_SIZE};
@@ -494,6 +494,11 @@ impl PathState {
 
     /// Always clear the pending ping (degrade clocks). Skip `record_rtt`
     /// when the sample rode behind bulk inflight.
+    ///
+    /// Instant sample is preferred. If `expire_stale_pings` already dropped
+    /// the Instant: a **known** path ignores the wall-clock (TCP min-RTO
+    /// late Pong must not poison EWMA); an **unknown** path still takes a
+    /// capped first sample so a 60–200 ms dest can freeze class.
     pub fn on_pong_record(&self, seq: u64, sent_at_ms: u64, record: bool) {
         let started = self.pending_ping.lock().unwrap().remove(&seq);
         if !record {
@@ -503,9 +508,16 @@ impl PathState {
             self.record_rtt(t0.elapsed());
             return;
         }
+        if self.rtt_known() {
+            return;
+        }
         let now = now_ms();
         if now >= sent_at_ms {
-            self.record_rtt(Duration::from_millis(now - sent_at_ms));
+            let sample = Duration::from_millis(now - sent_at_ms);
+            let t = &Tuning::STANDARD;
+            if sample > t.ack_rtt_min && sample < t.ack_rtt_max {
+                self.record_rtt(sample);
+            }
         }
     }
 }
@@ -517,14 +529,14 @@ pub fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-async fn send_frame<T>(
-    framed: &mut Framed<T, LengthDelimitedCodec>,
+async fn send_frame<S>(
+    framed: &mut S,
     session: &Session,
     path: &PathState,
     frame: Frame,
 ) -> std::io::Result<()>
 where
-    T: AsyncRead + AsyncWrite + Unpin,
+    S: Sink<Bytes, Error = std::io::Error> + Unpin,
 {
     path.note_tx();
     let encoded = frame.encode();
@@ -534,6 +546,9 @@ where
     Ok(())
 }
 
+/// Split the TLS stream with `tokio::io::split`, not `Framed::split()`.
+/// `Framed::split` holds a BiLock across `send().await` flush, so a blocked
+/// write still starves `next()`. `tokio::io::split` releases on `Pending`.
 pub fn spawn_path_io<T>(
     session: Session,
     path: Arc<PathState>,
@@ -552,95 +567,146 @@ pub fn spawn_path_io<T>(
             let _ = done.send(());
             return;
         }
+        let (rd, wr) = tokio::io::split(io);
         let codec = LengthDelimitedCodec::builder()
             .max_frame_length(MAX_FRAME_SIZE)
             .new_codec();
-        let mut framed = Framed::new(io, codec);
-        if let Err(e) = framed.flush().await {
+        let mut reader = FramedRead::new(rd, codec.clone());
+        let mut writer = FramedWrite::new(wr, codec);
+        if let Err(e) = writer.flush().await {
             warn!(path = %path.name, error = %e, "path flush after handshake failed");
             session.path_failed(path.id);
             let _ = done.send(());
             return;
         }
 
-        let mut next_ping = tokio::time::Instant::now();
-        loop {
-            if session.is_dead() || !path.is_alive() {
-                break;
+        let (close_tx, mut close_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let session_r = session.clone();
+        let path_r = path.clone();
+        let mut read_task = tokio::spawn(async move {
+            loop {
+                match reader.next().await {
+                    None => {
+                        debug!(path = %path_r.name, "path eof");
+                        return Ok(());
+                    }
+                    Some(Err(e)) => {
+                        warn!(path = %path_r.name, error = %e, "path read failed");
+                        return Err(e);
+                    }
+                    Some(Ok(bytes)) => match Frame::decode(&bytes) {
+                        Ok(frame) => {
+                            session_r.account_overlay_frame(&frame, bytes.len(), false);
+                            path_r.touch_rx();
+                            session_r.handle_frame(path_r.id, frame);
+                        }
+                        Err(e) => {
+                            warn!(path = %path_r.name, error = %e, "bad frame");
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                e.to_string(),
+                            ));
+                        }
+                    },
+                }
             }
-            let ping_every = session.probe_interval_for(&path);
-            tokio::select! {
-                biased;
-                out = urgent.recv() => {
-                    let Some(frame) = out else { break; };
-                    path.note_dequeue(true);
-                    if let Err(e) = send_frame(&mut framed, &session, &path, frame).await {
-                        warn!(path = %path.name, error = %e, "path write failed");
-                        break;
-                    }
+        });
+
+        let session_w = session.clone();
+        let path_w = path.clone();
+        let mut write_task = tokio::spawn(async move {
+            let mut next_ping = tokio::time::Instant::now();
+            loop {
+                if session_w.is_dead() || !path_w.is_alive() {
+                    return Ok(());
                 }
-                incoming = framed.next() => {
-                    match incoming {
-                        None => {
-                            debug!(path = %path.name, "path eof");
-                            break;
+                let ping_every = session_w.probe_interval_for(&path_w);
+                tokio::select! {
+                    biased;
+                    _ = &mut close_rx => {
+                        let _ = writer.close().await;
+                        return Ok(());
+                    }
+                    out = urgent.recv() => {
+                        let Some(frame) = out else { return Ok(()); };
+                        path_w.note_dequeue(true);
+                        if let Err(e) = send_frame(&mut writer, &session_w, &path_w, frame).await {
+                            warn!(path = %path_w.name, error = %e, "path write failed");
+                            return Err(e);
                         }
-                        Some(Err(e)) => {
-                            warn!(path = %path.name, error = %e, "path read failed");
-                            break;
+                    }
+                    out = rx.recv() => {
+                        let Some(frame) = out else { return Ok(()); };
+                        path_w.note_dequeue(false);
+                        if let Err(e) = send_frame(&mut writer, &session_w, &path_w, frame).await {
+                            warn!(path = %path_w.name, error = %e, "path write failed");
+                            return Err(e);
                         }
-                        Some(Ok(bytes)) => {
-                            match Frame::decode(&bytes) {
-                                Ok(frame) => {
-                                    session.account_overlay_frame(&frame, bytes.len(), false);
-                                    path.touch_rx();
-                                    session.handle_frame(path.id, frame);
-                                }
-                                Err(e) => {
-                                    warn!(path = %path.name, error = %e, "bad frame");
-                                    break;
-                                }
+                    }
+                    _ = tokio::time::sleep_until(next_ping) => {
+                        if session_w.is_dead() || !path_w.is_alive() {
+                            return Ok(());
+                        }
+                        let ago = path_w.last_rx_ago();
+                        if path_w.should_send_ping(ago, ping_every) {
+                            let ping = path_w.next_ping();
+                            if let Err(e) = send_frame(
+                                &mut writer,
+                                &session_w,
+                                &path_w,
+                                Frame::Ping(ping),
+                            )
+                            .await
+                            {
+                                warn!(path = %path_w.name, error = %e, "path ping failed");
+                                return Err(e);
                             }
+                            next_ping = tokio::time::Instant::now() + ping_every;
+                        } else if ago < ping_every {
+                            next_ping = tokio::time::Instant::now()
+                                + ping_every.saturating_sub(ago);
+                        } else {
+                            next_ping = tokio::time::Instant::now() + ping_every;
                         }
                     }
                 }
-                out = rx.recv() => {
-                    let Some(frame) = out else { break; };
-                    path.note_dequeue(false);
-                    if let Err(e) = send_frame(&mut framed, &session, &path, frame).await {
-                        warn!(path = %path.name, error = %e, "path write failed");
+            }
+        });
+
+        enum Exit {
+            Idle,
+            Down,
+            Child,
+        }
+        let ping_max = session.config().ping_interval_max;
+        let maintain = session.config().tuning.maintain_interval;
+        let exit = tokio::select! {
+            biased;
+            _ = &mut read_task => Exit::Child,
+            _ = &mut write_task => Exit::Child,
+            _ = session.wait_dead() => Exit::Idle,
+            _ = async {
+                loop {
+                    if !path.is_alive() {
                         break;
                     }
+                    tokio::time::sleep(maintain).await;
                 }
-                _ = tokio::time::sleep_until(next_ping) => {
-                    if session.is_dead() || !path.is_alive() {
-                        break;
-                    }
-                    let ago = path.last_rx_ago();
-                    if path.should_send_ping(ago, ping_every) {
-                        let ping = path.next_ping();
-                        if let Err(e) =
-                            send_frame(&mut framed, &session, &path, Frame::Ping(ping)).await
-                        {
-                            warn!(path = %path.name, error = %e, "path ping failed");
-                            break;
-                        }
-                        next_ping = tokio::time::Instant::now() + ping_every;
-                    } else if ago < ping_every {
-                        // Idle-gate the send; keep the deadline on last_rx.
-                        next_ping = tokio::time::Instant::now()
-                            + ping_every.saturating_sub(ago);
-                    } else {
-                        // pending > 0 (or DOWN, which already broke the loop).
-                        // Must wait a non-zero interval — saturating_sub(ago)
-                        // is 0 here and would busy-loop sleep_until(now).
-                        next_ping = tokio::time::Instant::now() + ping_every;
-                    }
-                }
-                _ = session.wait_dead() => break,
+            } => Exit::Down,
+        };
+        match exit {
+            Exit::Idle => {
+                let _ = close_tx.send(());
+                let _ = tokio::time::timeout(ping_max, &mut write_task).await;
+                read_task.abort();
+                write_task.abort();
+            }
+            Exit::Down | Exit::Child => {
+                read_task.abort();
+                write_task.abort();
             }
         }
-        let _ = framed.close().await;
         session.path_failed(path.id);
         let _ = done.send(());
         debug!(path = %path.name, "path io exit");
@@ -667,6 +733,49 @@ mod tests {
         assert!(
             age >= Duration::from_millis(12),
             "oldest ping age {age:?} must be the first insert, not ~0"
+        );
+    }
+
+    #[test]
+    fn expired_pong_does_not_raise_ewma() {
+        let p = path();
+        p.record_rtt(Duration::from_millis(7));
+        let before = p.rtt_ewma_us.load(Ordering::Relaxed);
+        p.on_pong_record(99, 0, true);
+        assert_eq!(
+            p.rtt_ewma_us.load(Ordering::Relaxed),
+            before,
+            "seq not in pending must not record wall-clock RTT"
+        );
+    }
+
+    #[test]
+    fn expired_pong_unknown_path_records_first_sample() {
+        let p = path();
+        assert!(!p.rtt_known());
+        p.on_pong_record(1, now_ms().saturating_sub(80), true);
+        let us = p.rtt_ewma_us.load(Ordering::Relaxed);
+        assert!(
+            (60_000..120_000).contains(&us),
+            "unknown first sample must land near 80 ms, got {us}"
+        );
+    }
+
+    #[test]
+    fn in_pending_pong_still_records_instant() {
+        let p = path();
+        p.record_rtt(Duration::from_millis(7));
+        let ping = p.next_ping();
+        std::thread::sleep(Duration::from_millis(12));
+        p.on_pong_record(ping.seq, ping.sent_at_ms, true);
+        let after = p.rtt_ewma_us.load(Ordering::Relaxed);
+        assert!(
+            after > 7_000,
+            "in-pending Instant Pong must move EWMA, got {after}"
+        );
+        assert!(
+            after < 45_000,
+            "12 ms Instant must not look like a 200 ms RTO, got {after}"
         );
     }
 

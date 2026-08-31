@@ -1,9 +1,9 @@
 //! Path pick, backup selection, and same-link TCP rebalance.
 //!
-//! New streams stay on the fastest RTT class, then spread across named
-//! links in that class by `rtt * (1 + inflight/bias + sticky)`. HOL
-//! isolation is same-link rebalance (`should_rebalance_conn`) and
-//! sibling-first `backup_path`, not ISP pinning.
+//! New streams stay on the fastest RTT class; exact score ties pick min
+//! `path_id`. Interactive DATA may reuse last-send while that dest is
+//! still the class dest. HOL isolation is same-link rebalance
+//! (`should_rebalance_conn`) and sibling-first `backup_path`, not ISP pinning.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -169,9 +169,18 @@ fn path_score(p: &PathState, cfg: &SessionConfig, pref: PickPref) -> (u64, bool)
     (score, p.rtt_known())
 }
 
-/// Receive-fresh vs the DATA/Open retry clock (`loss_timeout` on fast EWMA).
+/// Per-path input to [`health::loss_timeout`] for pick freshness.
+/// `min(fast, class)` so a poisoned fast EWMA cannot hide a silent path
+/// while class is still the healthy one. Slow-only freeze (class 7 ms,
+/// fast 180 ms): skip at the 20 ms floor; [`loss_fresh_or_all`] already
+/// falls back to the same candidate list when every member looks stale.
+pub(crate) fn path_loss_rtt(p: &PathState) -> Duration {
+    p.rtt().min(p.class_rtt())
+}
+
+/// Receive-fresh vs the DATA/Open retry clock.
 pub fn is_loss_fresh(cfg: &SessionConfig, p: &PathState) -> bool {
-    p.last_rx_ago() < health::loss_timeout(cfg, p.rtt())
+    p.last_rx_ago() < health::loss_timeout(cfg, path_loss_rtt(p))
 }
 
 fn loss_fresh_or_all<'a>(
@@ -222,42 +231,6 @@ pub(crate) fn pick_from(
 ) -> Option<u32> {
     let subset = loss_fresh_or_all(cfg, candidates);
     pick_from_scored(&subset, cfg, pref)
-}
-
-/// Like [`pick_from`], but exact `(score, known)` ties rotate by `stream_id`.
-/// Failback / HOL / backup keep [`pick_from`] (min id) so equal peers do not chatter.
-/// Ties are rotated only inside the loss-fresh subset (same as [`pick_from`]).
-pub(crate) fn pick_from_spread(
-    candidates: &[&Arc<PathState>],
-    cfg: &SessionConfig,
-    pref: PickPref,
-    stream_id: u32,
-) -> Option<u32> {
-    let subset = loss_fresh_or_all(cfg, candidates);
-    let best_id = pick_from_scored(&subset, cfg, pref)?;
-    let best = subset.iter().find(|p| p.id == best_id)?;
-    let (best_score, best_known) = path_score(best, cfg, pref);
-    let mut tied: Vec<u32> = subset
-        .iter()
-        .filter(|p| path_score(p, cfg, pref) == (best_score, best_known))
-        .map(|p| p.id)
-        .collect();
-    if tied.is_empty() {
-        return Some(best_id);
-    }
-    tied.sort_unstable();
-    let n = tied.len() as u32;
-    let idx = stream_id.wrapping_sub(1) % n;
-    Some(tied[idx as usize])
-}
-
-pub fn pick_path_pref_spread(
-    paths: &[Arc<PathState>],
-    cfg: &SessionConfig,
-    pref: PickPref,
-    stream_id: u32,
-) -> Option<u32> {
-    pick_from_spread(&fastest_class_set(paths, cfg), cfg, pref, stream_id)
 }
 
 /// Frozen candidate dump for debug logs. Same score as [`pick_from`].
@@ -777,16 +750,14 @@ mod tests {
     }
 
     #[test]
-    fn spread_does_not_rotate_onto_silent_equal_score_sibling() {
+    fn pick_skips_silent_equal_score_sibling() {
         let cfg = SessionConfig::default();
         let a = mk_named(1, "akcdn#0".into(), 7);
         let b = mk_named(2, "akcdn#1".into(), 7);
         age_rx(&a, 30);
         let paths = vec![a, b];
-        for sid in 1..=8 {
-            let picked = pick_path_pref_spread(&paths, &cfg, PickPref::Any, sid).unwrap();
-            assert_eq!(picked, 2, "sid={sid}");
-        }
+        let picked = pick_path_pref(&paths, &cfg, PickPref::Any).unwrap();
+        assert_eq!(picked, 2);
     }
 
     #[test]
@@ -846,51 +817,41 @@ mod tests {
     }
 
     #[test]
-    fn zero_load_sequential_spreads() {
+    fn zero_load_ties_pick_min_id() {
         let cfg = SessionConfig::default();
         let paths = vec![
             mk_named(1, "a#0".into(), 7),
             mk_named(2, "a#1".into(), 7),
             mk_named(3, "b#0".into(), 7),
             mk_named(4, "b#1".into(), 7),
+            mk_named(5, "c#0".into(), 7),
+            mk_named(6, "c#1".into(), 7),
         ];
-        let mut ids = Vec::new();
-        for sid in 1..=8 {
-            ids.push(pick_path_pref_spread(&paths, &cfg, PickPref::Any, sid).unwrap());
+        for _ in 0..8 {
+            let picked = pick_path_pref(&paths, &cfg, PickPref::Interactive).unwrap();
+            assert_eq!(picked, 1, "exact-score ties must stay on min path_id");
         }
-        let uniq: std::collections::BTreeSet<_> = ids.iter().copied().collect();
-        assert!(uniq.len() >= 2, "exact-score ties must spread, got {ids:?}");
-        assert_eq!(ids[0], 1, "stream 1 maps to lowest path_id");
-        assert_eq!(ids[1], 2);
-        assert_eq!(ids[4], 1, "repeats after n");
     }
 
     #[test]
-    fn load_beats_spread() {
+    fn load_beats_min_id() {
         let cfg = SessionConfig::default();
         let a = mk_named(1, "a#0".into(), 7);
         let b = mk_named(2, "a#1".into(), 7);
         a.sticky_streams.store(3, Ordering::Relaxed);
         let paths = vec![a, b];
-        for sid in 1..=6 {
-            let picked = pick_path_pref_spread(&paths, &cfg, PickPref::Any, sid).unwrap();
-            assert_eq!(
-                picked, 2,
-                "loaded sibling must lose every stream_id, sid={sid}"
-            );
-        }
+        let picked = pick_path_pref(&paths, &cfg, PickPref::Any).unwrap();
+        assert_eq!(picked, 2, "loaded sibling must lose");
     }
 
     #[test]
-    fn in_class_6_vs_7_does_not_spread() {
+    fn in_class_6_vs_7_picks_faster() {
         let cfg = SessionConfig::default();
         let a = mk_named(1, "a#0".into(), 6);
         let b = mk_named(2, "a#1".into(), 7);
         let paths = vec![a, b];
-        for sid in 1..=4 {
-            let picked = pick_path_pref_spread(&paths, &cfg, PickPref::Any, sid).unwrap();
-            assert_eq!(picked, 1, "6ms vs 7ms is not an exact score tie, sid={sid}");
-        }
+        let picked = pick_path_pref(&paths, &cfg, PickPref::Any).unwrap();
+        assert_eq!(picked, 1, "6ms vs 7ms is not an exact score tie");
     }
 
     #[test]

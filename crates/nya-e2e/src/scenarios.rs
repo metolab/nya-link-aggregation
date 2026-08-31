@@ -994,6 +994,57 @@ pub async fn prod_like_two_isp_hole_first_byte() -> Result<ScenarioReport> {
     Ok(r)
 }
 
+/// Five of six 5-tuples blackholed (same idx convention as close_swallowed).
+/// Interactive 204-byte first-byte must stay in the 120 ms family while one
+/// warm TCP remains. Does not emulate kernel min-RTO.
+pub async fn prod_like_thin_tcp_rto_first_byte() -> Result<ScenarioReport> {
+    let h = start(prod_like_spec()).await?;
+    let payload = vec![0u8; 204];
+    let mut baseline = Duration::MAX;
+    for _ in 0..3 {
+        baseline = baseline.min(
+            socks_first_byte(&h, &payload, Duration::from_millis(400))
+                .await
+                .map_err(|_| anyhow!("baseline first-byte timed out"))?,
+        );
+    }
+    for (link, idx) in [
+        ("akcdn", 0),
+        ("akcdn", 1),
+        ("soy", 0),
+        ("soy", 1),
+        ("nsix", 0),
+    ] {
+        h.link(link).set_conn_blackhole(idx, true);
+    }
+    let stats = collect_first_bytes(&h, 16, &payload, Duration::from_millis(250)).await;
+    for (link, idx) in [
+        ("akcdn", 0),
+        ("akcdn", 1),
+        ("soy", 0),
+        ("soy", 1),
+        ("nsix", 0),
+    ] {
+        h.link(link).set_conn_blackhole(idx, false);
+    }
+    let mut r = finish(
+        "prod_like_thin_tcp_rto_first_byte",
+        &h,
+        stats,
+        first_byte_sla(120, 0.95),
+        None,
+    );
+    note_prod_like(&mut r, &h, baseline);
+    if r.snap.session_all_down_resets != 0 || r.snap.stream_resets_timeout > 2 {
+        r.sla.min_success = 2.0;
+        r.notes.push(format!(
+            "hygiene all_down={} timeout={}",
+            r.snap.session_all_down_resets, r.snap.stream_resets_timeout
+        ));
+    }
+    Ok(r)
+}
+
 /// All six overlay TCPs blackholed < all_down_timeout; session must not reset all streams.
 pub async fn prod_like_all_path_blackhole() -> Result<ScenarioReport> {
     let h = start(prod_like_spec()).await?;
@@ -1610,6 +1661,11 @@ pub fn catalog() -> Vec<Scenario> {
             "prod_like_all_path_blackhole",
             false,
             prod_like_all_path_blackhole()
+        ),
+        sc!(
+            "prod_like_thin_tcp_rto_first_byte",
+            false,
+            prod_like_thin_tcp_rto_first_byte()
         ),
         sc!("one_conn_stall", false, one_conn_stall()),
         sc!("one_conn_disconnect", false, one_conn_disconnect()),

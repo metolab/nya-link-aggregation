@@ -27,7 +27,7 @@ use crate::metrics::{
     LIFETIME_MS_BOUNDS, STALL_MS_BOUNDS,
 };
 use crate::path::{spawn_path_io, PathState, STATE_DOWN};
-use crate::scheduler::{pick_path_pref, pick_path_pref_spread, pick_retry_path, PickPref};
+use crate::scheduler::{pick_path_pref, pick_retry_path, PickPref};
 use crate::stream::{StreamState, Unacked};
 
 struct OpenUnacked {
@@ -378,6 +378,27 @@ impl Session {
         pick_path_pref(&paths, &self.inner.cfg, pref)
     }
 
+    /// Reuse last-send for Interactive DATA while that dest is still the
+    /// class dest. Not sticky-as-home for bulk, failback, or retry.
+    fn interactive_affinity(&self, sticky: u32) -> Option<u32> {
+        if sticky == 0 {
+            return None;
+        }
+        let p = self.get_path(sticky)?;
+        if !p.is_schedulable() {
+            return None;
+        }
+        if !crate::scheduler::is_loss_fresh(&self.inner.cfg, &p) {
+            return None;
+        }
+        let paths = self.path_list();
+        let class = crate::scheduler::fastest_class_set(&paths, &self.inner.cfg);
+        if !class.iter().any(|q| q.id == sticky) {
+            return None;
+        }
+        Some(sticky)
+    }
+
     fn pick_retry(&self, avoid: u32) -> Option<u32> {
         pick_retry_path(&self.path_list(), &self.inner.cfg, &[avoid])
     }
@@ -386,10 +407,25 @@ impl Session {
         pick_retry_path(&self.path_list(), &self.inner.cfg, tried)
     }
 
+    /// Min **fast** EWMA among alive, RTT-known dests. Honest dest RTT, not
+    /// frozen class. Shared by [`Self::retry_after`] and StreamAck sample cap.
+    pub(super) fn min_alive_fast_rtt(&self) -> Option<Duration> {
+        self.path_list()
+            .iter()
+            .filter(|p| p.is_alive() && p.rtt_known())
+            .map(|p| p.rtt())
+            .min()
+    }
+
+    /// Late vs dests we could still send to. Not 2× this path's poisoned
+    /// fast EWMA and not 2× frozen class.
     fn retry_after(&self, path_id: u32) -> Duration {
-        match self.get_path(path_id) {
-            Some(p) => health::loss_timeout(&self.inner.cfg, p.rtt()),
-            None => self.inner.cfg.tuning.loss_timeout_floor,
+        match self.min_alive_fast_rtt() {
+            Some(d) => health::loss_timeout(&self.inner.cfg, d),
+            None => match self.get_path(path_id) {
+                Some(p) => health::loss_timeout(&self.inner.cfg, p.rtt()),
+                None => self.inner.cfg.tuning.loss_timeout_floor,
+            },
         }
     }
 
@@ -739,11 +775,6 @@ impl Session {
             v.retain(|e| e.at.elapsed() < thresh);
         }
         g.retain(|_, v| !v.is_empty());
-    }
-
-    fn pick_pref_spread(&self, pref: PickPref, stream_id: u32) -> Option<u32> {
-        let paths = self.path_list();
-        pick_path_pref_spread(&paths, &self.inner.cfg, pref, stream_id)
     }
 
     pub fn last_known_rtt(&self, name: &str) -> Option<Duration> {
@@ -1379,7 +1410,7 @@ impl SessionTable {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nya_proto::Target;
+    use nya_proto::{StreamAck, Target};
     use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
 
     fn pair() -> (Session, Session, mpsc::Receiver<IncomingStream>) {
@@ -1427,6 +1458,20 @@ mod tests {
                 }
             });
         }
+    }
+
+    #[tokio::test]
+    async fn path_failed_completes_add_path() {
+        let client = Session::new_client(SessionConfig::default());
+        let (a, _peer) = duplex(64 * 1024);
+        let done = client.start_path("p1".into(), a);
+        let id = *client.inner.paths.lock().unwrap().keys().next().unwrap();
+        client.path_failed(id);
+        tokio::time::timeout(Duration::from_millis(500), done)
+            .await
+            .expect("add_path must complete after path_failed")
+            .expect("oneshot");
+        client.shutdown();
     }
 
     #[tokio::test]
@@ -2304,6 +2349,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stream_ack_200ms_does_not_raise_ewma() {
+        let client = Session::new_client(SessionConfig::default());
+        let p = inject_named(&client, 1, "a#0", 7);
+        let before = p.rtt_ewma_us.load(Ordering::Relaxed);
+        let mut tun = client
+            .open_stream(Target {
+                host: "t".into(),
+                port: 1,
+            })
+            .await
+            .unwrap();
+        tun.write_all(b"hello").await.unwrap();
+        let st = {
+            let g = client.inner.streams.lock().unwrap();
+            g.values().next().unwrap().clone()
+        };
+        let deadline = Instant::now() + Duration::from_millis(200);
+        loop {
+            if !st.unacked.lock().unwrap().is_empty() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "write must leave unacked");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        {
+            let mut u = st.unacked.lock().unwrap();
+            for x in u.values_mut() {
+                x.last_sent = Instant::now() - Duration::from_millis(200);
+            }
+        }
+        let acked = st.send_next.load(Ordering::Relaxed);
+        client.on_ack(StreamAck {
+            stream_id: st.id,
+            acked_offset: acked,
+            window: 128 * 1024,
+        });
+        assert_eq!(
+            p.rtt_ewma_us.load(Ordering::Relaxed),
+            before,
+            "200 ms ACK must not raise EWMA on a 7 ms dest pool"
+        );
+        drop(tun);
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn stream_ack_10ms_may_record() {
+        let client = Session::new_client(SessionConfig::default());
+        let p = inject_named(&client, 1, "a#0", 7);
+        let before = p.rtt_ewma_us.load(Ordering::Relaxed);
+        let mut tun = client
+            .open_stream(Target {
+                host: "t".into(),
+                port: 1,
+            })
+            .await
+            .unwrap();
+        tun.write_all(b"hello").await.unwrap();
+        let st = {
+            let g = client.inner.streams.lock().unwrap();
+            g.values().next().unwrap().clone()
+        };
+        let deadline = Instant::now() + Duration::from_millis(200);
+        loop {
+            if !st.unacked.lock().unwrap().is_empty() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "write must leave unacked");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        {
+            let mut u = st.unacked.lock().unwrap();
+            for x in u.values_mut() {
+                x.last_sent = Instant::now() - Duration::from_millis(10);
+            }
+        }
+        let acked = st.send_next.load(Ordering::Relaxed);
+        client.on_ack(StreamAck {
+            stream_id: st.id,
+            acked_offset: acked,
+            window: 128 * 1024,
+        });
+        let after = p.rtt_ewma_us.load(Ordering::Relaxed);
+        assert_ne!(after, before, "~10 ms ACK may still move EWMA");
+        assert!(
+            after < 20_000,
+            "10 ms ACK must stay well under 20 ms, got {after}"
+        );
+        drop(tun);
+        client.shutdown();
+    }
+
+    #[tokio::test]
     async fn silence_without_ping_marks_degraded() {
         let client = Session::new_client(SessionConfig::default());
         let p = inject_known_path(&client, 1);
@@ -2342,39 +2480,167 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sequential_open_spreads_sticky() {
-        let client = Session::new_client(SessionConfig::default());
-        inject_named(&client, 1, "a#0", 7);
-        inject_named(&client, 2, "a#1", 7);
-        inject_named(&client, 3, "b#0", 7);
-        inject_named(&client, 4, "b#1", 7);
-        let mut tuns = Vec::new();
-        for _ in 0..8 {
-            tuns.push(
-                client
-                    .open_stream(Target {
-                        host: "t".into(),
-                        port: 1,
-                    })
-                    .await
-                    .unwrap(),
-            );
+    async fn open_then_interactive_data_share_path() {
+        let (client, server) = pair_echo(&["a#0", "a#1", "b#0", "b#1", "c#0", "c#1"]).await;
+        let mut tun = client
+            .open_stream(Target {
+                host: "t".into(),
+                port: 1,
+            })
+            .await
+            .unwrap();
+        let st = {
+            let g = client.inner.streams.lock().unwrap();
+            g.values().next().unwrap().clone()
+        };
+        let open_pid = st.sticky.load(Ordering::Relaxed);
+        assert_ne!(open_pid, 0, "Open must set sticky");
+        tun.write_all(&[0u8; 200]).await.unwrap();
+        let deadline = Instant::now() + Duration::from_millis(400);
+        loop {
+            if st.send_next.load(Ordering::Relaxed) > 0 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "write must advance send_next");
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        let stickies: Vec<u32> = client
-            .inner
-            .streams
-            .lock()
-            .unwrap()
-            .values()
-            .map(|st| st.sticky.load(Ordering::Relaxed))
-            .filter(|id| *id != 0)
-            .collect();
-        let uniq: std::collections::BTreeSet<_> = stickies.iter().copied().collect();
-        assert!(
-            uniq.len() >= 2,
-            "zero-load sequential opens must spread, stickies={stickies:?}"
+        assert_eq!(
+            st.sticky.load(Ordering::Relaxed),
+            open_pid,
+            "first Interactive DATA must share Open's 5-tuple"
         );
-        drop(tuns);
+        drop(tun);
+        client.shutdown();
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn retry_after_poisoned_path_with_live_fast_dest_is_floor() {
+        let client = Session::new_client(SessionConfig::default());
+        let sick = inject_named(&client, 1, "nsix#0", 7);
+        inject_named(&client, 2, "soy#0", 7);
+        sick.rtt_ewma_us.store(200_000, Ordering::Relaxed);
+        let mut tun = client
+            .open_stream(Target {
+                host: "t".into(),
+                port: 1,
+            })
+            .await
+            .unwrap();
+        tun.write_all(b"hello").await.unwrap();
+        let st = {
+            let g = client.inner.streams.lock().unwrap();
+            g.values().next().unwrap().clone()
+        };
+        let deadline = Instant::now() + Duration::from_millis(200);
+        loop {
+            if !st.unacked.lock().unwrap().is_empty() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "write must leave unacked");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        {
+            let mut u = st.unacked.lock().unwrap();
+            for x in u.values_mut() {
+                x.last_sent = Instant::now() - Duration::from_millis(25);
+                x.path_id = 1;
+                x.tried = vec![1];
+            }
+        }
+        let from = st.unacked.lock().unwrap().values().next().unwrap().path_id;
+        client.debug_maintain();
+        let to = st.unacked.lock().unwrap().values().next().unwrap().path_id;
+        assert_ne!(
+            to, from,
+            "20 ms floor must rehome off poisoned nsix onto soy"
+        );
+        drop(tun);
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn retry_after_only_dest_does_not_replace() {
+        let client = Session::new_client(SessionConfig::default());
+        let p = inject_named(&client, 1, "only#0", 7);
+        p.rtt_ewma_us.store(180_000, Ordering::Relaxed);
+        let mut tun = client
+            .open_stream(Target {
+                host: "t".into(),
+                port: 1,
+            })
+            .await
+            .unwrap();
+        tun.write_all(b"hello").await.unwrap();
+        let st = {
+            let g = client.inner.streams.lock().unwrap();
+            g.values().next().unwrap().clone()
+        };
+        let deadline = Instant::now() + Duration::from_millis(200);
+        loop {
+            if !st.unacked.lock().unwrap().is_empty() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "write must leave unacked");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        {
+            let mut u = st.unacked.lock().unwrap();
+            for x in u.values_mut() {
+                x.last_sent = Instant::now() - Duration::from_millis(30);
+            }
+        }
+        let from = st.unacked.lock().unwrap().values().next().unwrap().path_id;
+        let hedge0 = client.snapshot().data_hedge;
+        client.debug_maintain();
+        let to = st.unacked.lock().unwrap().values().next().unwrap().path_id;
+        assert_eq!(to, from, "only dest must keep the in-flight copy");
+        assert_eq!(client.snapshot().data_hedge, hedge0);
+        drop(tun);
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn retry_after_two_slow_does_not_rotate_at_floor() {
+        let client = Session::new_client(SessionConfig::default());
+        let a = inject_named(&client, 1, "a#0", 7);
+        let b = inject_named(&client, 2, "b#0", 7);
+        a.rtt_ewma_us.store(180_000, Ordering::Relaxed);
+        b.rtt_ewma_us.store(180_000, Ordering::Relaxed);
+        let mut tun = client
+            .open_stream(Target {
+                host: "t".into(),
+                port: 1,
+            })
+            .await
+            .unwrap();
+        tun.write_all(b"hello").await.unwrap();
+        let st = {
+            let g = client.inner.streams.lock().unwrap();
+            g.values().next().unwrap().clone()
+        };
+        let deadline = Instant::now() + Duration::from_millis(200);
+        loop {
+            if !st.unacked.lock().unwrap().is_empty() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "write must leave unacked");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        {
+            let mut u = st.unacked.lock().unwrap();
+            for x in u.values_mut() {
+                x.last_sent = Instant::now() - Duration::from_millis(30);
+            }
+        }
+        let from = st.unacked.lock().unwrap().values().next().unwrap().path_id;
+        client.debug_maintain();
+        let to = st.unacked.lock().unwrap().values().next().unwrap().path_id;
+        assert_eq!(
+            to, from,
+            "two 180 ms dests must wait loss_timeout(180ms), not rotate at 20 ms"
+        );
+        drop(tun);
         client.shutdown();
     }
 
