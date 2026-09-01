@@ -1432,7 +1432,7 @@ pub enum SessionError {
 
 pub struct SessionTable {
     cfg: SessionConfig,
-    sessions: Mutex<HashMap<[u8; 16], Session>>,
+    sessions: Arc<Mutex<HashMap<[u8; 16], Session>>>,
     closed: AtomicBool,
     process: Arc<ProcessCounters>,
 }
@@ -1441,7 +1441,7 @@ impl SessionTable {
     pub fn new(cfg: SessionConfig) -> Self {
         Self {
             cfg,
-            sessions: Mutex::new(HashMap::new()),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
             closed: AtomicBool::new(false),
             process: Arc::new(ProcessCounters::default()),
         }
@@ -1483,9 +1483,13 @@ impl SessionTable {
             })
             .take(crate::metrics::STREAM_SNAP_CAP)
             .collect();
+        let mut session_fps: Vec<String> =
+            handles.iter().filter_map(|(_, s)| s.session_fp()).collect();
+        session_fps.sort();
         ProcessSnapshot {
             process: self.process.snap(),
             session: acc,
+            session_fps,
         }
     }
 
@@ -1531,6 +1535,15 @@ impl SessionTable {
             .lock()
             .unwrap()
             .insert(session_id, session.clone());
+        // Drop the HashMap slot when the session dies. get() / snapshot
+        // already skip dead entries; without this the slot sits until the
+        // next 10 s tick, and hop-tail sfp is the only leftover identity.
+        let slots = self.sessions.clone();
+        let reap = session.clone();
+        tokio::spawn(async move {
+            reap.wait_dead().await;
+            slots.lock().unwrap().remove(&session_id);
+        });
         Some((session, rx))
     }
 
@@ -1551,6 +1564,11 @@ impl SessionTable {
 
     pub fn remove(&self, session_id: &[u8; 16]) {
         self.sessions.lock().unwrap().remove(session_id);
+    }
+
+    #[cfg(test)]
+    pub fn debug_len(&self) -> usize {
+        self.sessions.lock().unwrap().len()
     }
 }
 
@@ -1639,6 +1657,48 @@ mod tests {
         assert!(table.get(&[9u8; 16]).is_none());
         assert!(table.get(&live_id).is_some());
         live.shutdown();
+        table.shutdown_all();
+    }
+
+    #[tokio::test]
+    async fn aggregate_snapshot_lists_live_session_fp() {
+        let table = SessionTable::new(SessionConfig::default());
+        let mut live_id = [0u8; 16];
+        live_id[0] = 0x34;
+        live_id[1] = 0x94;
+        live_id[2] = 0x57;
+        live_id[3] = 0xb6;
+        let (live, _rx1) = table.create_with_incoming(live_id).unwrap();
+        let (dead, _rx2) = table.create_with_incoming([9u8; 16]).unwrap();
+        dead.shutdown();
+        let snap = table.aggregate_snapshot();
+        assert_eq!(snap.session_fps, vec!["349457b6".to_string()]);
+        live.shutdown();
+        let snap = table.aggregate_snapshot();
+        assert!(
+            snap.session_fps.is_empty(),
+            "dead live-id must not stay in sfp"
+        );
+        table.shutdown_all();
+    }
+
+    #[tokio::test]
+    async fn table_reaps_dead_session_without_get_or_snapshot() {
+        let table = SessionTable::new(SessionConfig::default());
+        let id = [0x11u8; 16];
+        let (s, _rx) = table.create_with_incoming(id).unwrap();
+        assert_eq!(table.debug_len(), 1);
+        s.shutdown();
+        tokio::time::timeout(Duration::from_millis(500), async {
+            loop {
+                if table.debug_len() == 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dead session must leave the table without get/snapshot");
         table.shutdown_all();
     }
 

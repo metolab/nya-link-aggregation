@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use tokio::sync::Notify;
-use tracing::{debug, info, warn, Instrument};
+use tracing::{info, warn, Instrument};
 
 use nya_core::{
     client_create_session, client_join_session, connect_pinned, export_from_client, parse_pin_hex,
@@ -124,7 +124,7 @@ async fn run_link(
                         if session.path_lived_stable(&path_name) {
                             backoff = backoff_min;
                         } else {
-                            debug!(
+                            info!(
                                 path = %path_name,
                                 lived_ms = session
                                     .last_path_lived(&path_name)

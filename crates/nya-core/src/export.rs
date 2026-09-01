@@ -40,6 +40,7 @@ pub fn spawn_obs_session(session: Session, obs: ObsOpts) {
             move || ProcessSnapshot {
                 process: session.process().snap(),
                 session: session.snapshot(),
+                session_fps: session.session_fp().into_iter().collect(),
             }
         };
         let take_tail = {
@@ -162,8 +163,10 @@ fn emit_snapshot(ps: &ProcessSnapshot, tail: Option<HopSample>) {
     let origin_first_p99_ms = hop_p99(&p.hop_origin_first_ms);
     let origin_last_p99_ms = hop_p99(&p.hop_origin_last_ms);
     let tail = tail.as_ref().map(|t| t.format_tail());
+    let sfp = format_session_fps(&ps.session_fps);
     info!(
         target: "nya_core::obs",
+        sfp = %sfp,
         stall_p99_ms = stall_p99,
         failover_p99_ms = failover_p99,
         stall_count = s.stall_ms.count,
@@ -204,6 +207,14 @@ fn emit_snapshot(ps: &ProcessSnapshot, tail: Option<HopSample>) {
         metrics = %format_snapshot_metrics(ps),
         "snapshot metrics"
     );
+}
+
+fn format_session_fps(fps: &[String]) -> String {
+    if fps.is_empty() {
+        "-".to_string()
+    } else {
+        fps.join(",")
+    }
 }
 
 fn format_paths(paths: &[crate::metrics::PathSnap]) -> String {
@@ -371,6 +382,7 @@ mod tests {
         let body = render_prometheus(&ProcessSnapshot {
             process: Default::default(),
             session: s,
+            session_fps: Vec::new(),
         });
         assert!(body.contains("# TYPE nya_failover_ms histogram"));
         assert!(body.contains("nya_failover_ms_bucket{le=\"5\"} 2"));
@@ -400,6 +412,7 @@ mod tests {
         let ps = ProcessSnapshot {
             process: Default::default(),
             session: s,
+            session_fps: Vec::new(),
         };
         let names = prometheus_metric_names(&ps);
         assert!(names.contains("nya_streams_held"));
@@ -468,5 +481,14 @@ mod tests {
         assert!(s.contains(" bak"), "{s}");
         assert!(s.contains(" unk"), "{s}");
         assert!(s.len() < 2048, "paths= {} bytes", s.len());
+    }
+
+    #[test]
+    fn format_session_fps_dash_when_empty() {
+        assert_eq!(format_session_fps(&[]), "-");
+        assert_eq!(
+            format_session_fps(&["349457b6".into(), "b8ee067f".into()]),
+            "349457b6,b8ee067f"
+        );
     }
 }

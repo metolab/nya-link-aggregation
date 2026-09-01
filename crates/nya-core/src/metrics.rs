@@ -724,6 +724,10 @@ pub struct ProcessCountersSnap {
 pub struct ProcessSnapshot {
     pub process: ProcessCountersSnap,
     pub session: Snapshot,
+    /// Live overlay session fingerprints (first 4 bytes hex). Distinct from
+    /// hop-tail `sfp=`, which is the interval-max hop and can outlive the
+    /// session that produced it.
+    pub session_fps: Vec<String>,
 }
 
 pub fn flatten_paths(sessions: &[([u8; 16], Snapshot)]) -> Vec<PathSnap> {

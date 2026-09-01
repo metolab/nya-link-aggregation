@@ -221,6 +221,7 @@ pub fn try_attach_session(session: &Session) {
     attach_source(Arc::new(move || ProcessSnapshot {
         process: session.process().snap(),
         session: session.snapshot(),
+        session_fps: session.session_fp().into_iter().collect(),
     }));
 }
 

@@ -753,6 +753,7 @@ sequenceDiagram
 info 行是紧凑计分卡（**不再**带 `metrics=` 全量 catalog；catalog 在同 target 的 `debug`「snapshot metrics」以及 `/metrics` / OTLP metrics）：
 
 ```text
+sfp,                                                    # live session fps, "-" if none; not hop-tail sfp
 stall_p99_ms, failover_p99_ms, stall_count, failover_count,
 paths_alive, streams_live, streams_closed, stream_resets,
 path_down, path_degraded, probe_miss, failbacks, session_all_down_resets,
@@ -760,7 +761,7 @@ bytes_data_tx, bytes_ctrl_tx,
 mig, hol, hedge, rtx, fb_slink, picks_unk, recycle, corr,
 open_p99_ms, first_rx_p99_ms, last_rx_p99_ms,           # client; omit when count=0
 dial_p99_ms, origin_first_p99_ms, origin_last_p99_ms,   # server; omit when count=0
-tail = "<host> copy=<us|-> … sid=<id>",                 # omit if no hop this interval
+tail = "<host> copy=<us|-> … [sfp=<fp>] sid=<id>",      # omit if no hop this interval
 paths = "<压缩串>",
 links = "<线路汇总>",
 streams = "<粘滞表，最多 64 条，多出 +N>"
