@@ -2,13 +2,13 @@
 //!
 //! No tracing in poll. Missing hops are `None`, never 0.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -507,6 +507,8 @@ pub struct OriginDialMeta {
     pub lookup_aaaa_us: Option<u64>,
     pub n_v4: Option<u32>,
     pub n_v6: Option<u32>,
+    pub cache_v4: u32,
+    pub cache_v6: u32,
     pub winner: &'static str,
 }
 
@@ -526,12 +528,81 @@ fn is_family_empty(e: &dns_lookup::LookupError) -> bool {
     )
 }
 
+/// SOCKS/origin hostnames are FQDNs. A trailing dot skips resolv search
+/// (`ndots` / `search`), so a hanging search-domain A query cannot sit
+/// in front of a working AAAA (or the reverse).
+fn origin_lookup_name(host: &str) -> String {
+    if host.ends_with('.') {
+        host.to_string()
+    } else {
+        let mut s = String::with_capacity(host.len() + 1);
+        s.push_str(host);
+        s.push('.');
+        s
+    }
+}
+
+#[derive(Clone, Default)]
+struct CachedOrigin {
+    v4: Vec<IpAddr>,
+    v6: Vec<IpAddr>,
+}
+
+const ORIGIN_CACHE_HOSTS: usize = 4096;
+const ORIGIN_CACHE_PER_FAMILY: usize = 8;
+
+fn origin_addr_cache() -> &'static Mutex<HashMap<(String, u16), CachedOrigin>> {
+    static CACHE: OnceLock<Mutex<HashMap<(String, u16), CachedOrigin>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn cache_lock() -> std::sync::MutexGuard<'static, HashMap<(String, u16), CachedOrigin>> {
+    origin_addr_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+fn cached_origin_addrs(host: &str, port: u16) -> (Vec<SocketAddr>, Vec<SocketAddr>) {
+    let key = (host.to_ascii_lowercase(), port);
+    let g = cache_lock();
+    match g.get(&key) {
+        Some(c) => (
+            c.v4.iter().map(|ip| SocketAddr::new(*ip, port)).collect(),
+            c.v6.iter().map(|ip| SocketAddr::new(*ip, port)).collect(),
+        ),
+        None => (Vec::new(), Vec::new()),
+    }
+}
+
+fn remember_origin_addr(host: &str, port: u16, addr: SocketAddr) {
+    let key = (host.to_ascii_lowercase(), port);
+    let mut g = cache_lock();
+    if g.len() >= ORIGIN_CACHE_HOSTS && !g.contains_key(&key) {
+        g.clear();
+    }
+    let e = g.entry(key).or_default();
+    let ip = addr.ip();
+    let slot = if ip.is_ipv4() { &mut e.v4 } else { &mut e.v6 };
+    if !slot.contains(&ip) {
+        slot.push(ip);
+        if slot.len() > ORIGIN_CACHE_PER_FAMILY {
+            slot.remove(0);
+        }
+    }
+}
+
+#[cfg(test)]
+pub fn clear_origin_addr_cache() {
+    cache_lock().clear();
+}
+
 fn lookup_family_blocking(
     host: &str,
     port: u16,
     family: OriginFamily,
 ) -> io::Result<Vec<SocketAddr>> {
     use dns_lookup::{getaddrinfo, AddrFamily, AddrInfoHints, SockType};
+    let host = origin_lookup_name(host);
     let hints = AddrInfoHints {
         socktype: SockType::Stream.into(),
         address: match family {
@@ -540,7 +611,7 @@ fn lookup_family_blocking(
         },
         ..AddrInfoHints::default()
     };
-    match getaddrinfo(Some(host), Some(&port.to_string()), Some(hints)) {
+    match getaddrinfo(Some(&host), Some(&port.to_string()), Some(hints)) {
         Ok(iter) => Ok(iter
             .filter_map(Result::ok)
             .map(|a| a.sockaddr)
@@ -565,7 +636,9 @@ async fn lookup_family(
 }
 
 /// Literal IP: one connect, nodelay. Hostname: split A/AAAA, connect as soon as
-/// one family returns. Do not wait for dual-stack `lookup_host`.
+/// one family returns. Last origin IP that actually connected is retried
+/// immediately so a hanging family lookup cannot sit in front of a known-good
+/// 5-tuple. Do not wait for dual-stack `lookup_host`.
 pub async fn connect_origin(host: &str, port: u16, cad: Duration) -> io::Result<TcpStream> {
     Ok(connect_origin_meta(host, port, cad).await?.stream)
 }
@@ -583,13 +656,20 @@ pub async fn connect_origin_meta(host: &str, port: u16, cad: Duration) -> io::Re
     }
     let host_v4 = host.to_string();
     let host_v6 = host.to_string();
-    race_origin_lookups_meta(
+    let (seed_v4, seed_v6) = cached_origin_addrs(host, port);
+    let dial = race_origin_lookups_seeded(
         Box::pin(lookup_family(host_v4, port, OriginFamily::V4)),
         Box::pin(lookup_family(host_v6, port, OriginFamily::V6)),
         cad,
         |addr| Box::pin(connect_and_nodelay(addr)) as OriginConnect,
+        seed_v4,
+        seed_v6,
     )
-    .await
+    .await?;
+    if let Ok(peer) = dial.stream.peer_addr() {
+        remember_origin_addr(host, port, peer);
+    }
+    Ok(dial)
 }
 
 type OriginConnect = Pin<Box<dyn Future<Output = io::Result<TcpStream>> + Send>>;
@@ -613,21 +693,40 @@ pub async fn race_origin_lookups_meta(
     v4: FamilyLookup,
     v6: FamilyLookup,
     cad: Duration,
+    connect: impl FnMut(SocketAddr) -> OriginConnect,
+) -> io::Result<OriginDial> {
+    race_origin_lookups_seeded(v4, v6, cad, connect, Vec::new(), Vec::new()).await
+}
+
+/// Like `race_origin_lookups_meta`, plus last-good addresses that may start
+/// before either lookup completes. First address of a family that just
+/// arrived starts immediately; CAD spaces later attempts.
+pub async fn race_origin_lookups_seeded(
+    v4: FamilyLookup,
+    v6: FamilyLookup,
+    cad: Duration,
     mut connect: impl FnMut(SocketAddr) -> OriginConnect,
+    seed_v4: Vec<SocketAddr>,
+    seed_v6: Vec<SocketAddr>,
 ) -> io::Result<OriginDial> {
     let t0 = Instant::now();
     let mut v4 = v4;
     let mut v6 = v6;
     let mut v4_pending = true;
     let mut v6_pending = true;
-    let mut q4: VecDeque<SocketAddr> = VecDeque::new();
-    let mut q6: VecDeque<SocketAddr> = VecDeque::new();
+    let mut q4: VecDeque<SocketAddr> = seed_v4.into();
+    let mut q6: VecDeque<SocketAddr> = seed_v6.into();
     let mut last_err: Option<io::Error> = None;
     let mut last_start: Option<Instant> = None;
     let mut last_family: Option<OriginFamily> = None;
     let mut prefer: Option<OriginFamily> = None;
     let mut started_any = false;
-    let mut meta = OriginDialMeta::default();
+    let mut started: HashSet<SocketAddr> = HashSet::new();
+    let mut meta = OriginDialMeta {
+        cache_v4: q4.len() as u32,
+        cache_v6: q6.len() as u32,
+        ..OriginDialMeta::default()
+    };
     let mut set: JoinSet<(OriginFamily, io::Result<TcpStream>)> = JoinSet::new();
 
     let start_one = |set: &mut JoinSet<_>,
@@ -637,48 +736,54 @@ pub async fn race_origin_lookups_meta(
                      last_family: &mut Option<OriginFamily>,
                      last_start: &mut Option<Instant>,
                      started_any: &mut bool,
+                     started: &mut HashSet<SocketAddr>,
                      connect: &mut dyn FnMut(SocketAddr) -> OriginConnect|
      -> bool {
-        let pick = if let Some(f) = *prefer {
-            let got = match f {
-                OriginFamily::V4 => q4.pop_front().map(|a| (OriginFamily::V4, a)),
-                OriginFamily::V6 => q6.pop_front().map(|a| (OriginFamily::V6, a)),
-            };
-            if got.is_none() {
-                *prefer = None;
-            } else {
-                let empty = match f {
-                    OriginFamily::V4 => q4.is_empty(),
-                    OriginFamily::V6 => q6.is_empty(),
+        loop {
+            let pick = if let Some(f) = *prefer {
+                let got = match f {
+                    OriginFamily::V4 => q4.pop_front().map(|a| (OriginFamily::V4, a)),
+                    OriginFamily::V6 => q6.pop_front().map(|a| (OriginFamily::V6, a)),
                 };
-                if empty {
+                if got.is_none() {
                     *prefer = None;
+                } else {
+                    let empty = match f {
+                        OriginFamily::V4 => q4.is_empty(),
+                        OriginFamily::V6 => q6.is_empty(),
+                    };
+                    if empty {
+                        *prefer = None;
+                    }
                 }
+                got
+            } else {
+                None
+            };
+            let pick = pick.or_else(|| match *last_family {
+                Some(OriginFamily::V4) if !q6.is_empty() => {
+                    q6.pop_front().map(|a| (OriginFamily::V6, a))
+                }
+                Some(OriginFamily::V6) if !q4.is_empty() => {
+                    q4.pop_front().map(|a| (OriginFamily::V4, a))
+                }
+                _ if !q4.is_empty() => q4.pop_front().map(|a| (OriginFamily::V4, a)),
+                _ if !q6.is_empty() => q6.pop_front().map(|a| (OriginFamily::V6, a)),
+                _ => None,
+            });
+            let Some((family, addr)) = pick else {
+                return false;
+            };
+            if !started.insert(addr) {
+                continue;
             }
-            got
-        } else {
-            None
-        };
-        let pick = pick.or_else(|| match *last_family {
-            Some(OriginFamily::V4) if !q6.is_empty() => {
-                q6.pop_front().map(|a| (OriginFamily::V6, a))
-            }
-            Some(OriginFamily::V6) if !q4.is_empty() => {
-                q4.pop_front().map(|a| (OriginFamily::V4, a))
-            }
-            _ if !q4.is_empty() => q4.pop_front().map(|a| (OriginFamily::V4, a)),
-            _ if !q6.is_empty() => q6.pop_front().map(|a| (OriginFamily::V6, a)),
-            _ => None,
-        });
-        let Some((family, addr)) = pick else {
-            return false;
-        };
-        let fut = connect(addr);
-        set.spawn(async move { (family, fut.await) });
-        *last_start = Some(Instant::now());
-        *last_family = Some(family);
-        *started_any = true;
-        true
+            let fut = connect(addr);
+            set.spawn(async move { (family, fut.await) });
+            *last_start = Some(Instant::now());
+            *last_family = Some(family);
+            *started_any = true;
+            return true;
+        }
     };
 
     loop {
@@ -691,6 +796,7 @@ pub async fn race_origin_lookups_meta(
                 &mut last_family,
                 &mut last_start,
                 &mut started_any,
+                &mut started,
                 &mut connect,
             )
             && !v4_pending
@@ -720,11 +826,14 @@ pub async fn race_origin_lookups_meta(
                             prefer = Some(OriginFamily::V4);
                         }
                         q4.extend(addrs);
-                        if !started_any {
+                        // First address of this family, or first address at all:
+                        // start now. CAD spaces later attempts of a family
+                        // already in flight.
+                        if !started_any || prefer == Some(OriginFamily::V4) {
                             let _ = start_one(
                                 &mut set, &mut q4, &mut q6, &mut prefer,
                                 &mut last_family, &mut last_start, &mut started_any,
-                                &mut connect,
+                                &mut started, &mut connect,
                             );
                         }
                     }
@@ -744,11 +853,11 @@ pub async fn race_origin_lookups_meta(
                             prefer = Some(OriginFamily::V6);
                         }
                         q6.extend(addrs);
-                        if !started_any {
+                        if !started_any || prefer == Some(OriginFamily::V6) {
                             let _ = start_one(
                                 &mut set, &mut q4, &mut q6, &mut prefer,
                                 &mut last_family, &mut last_start, &mut started_any,
-                                &mut connect,
+                                &mut started, &mut connect,
                             );
                         }
                     }
@@ -774,7 +883,7 @@ pub async fn race_origin_lookups_meta(
                         let _ = start_one(
                             &mut set, &mut q4, &mut q6, &mut prefer,
                             &mut last_family, &mut last_start, &mut started_any,
-                            &mut connect,
+                            &mut started, &mut connect,
                         );
                     }
                     Err(_) => {}
@@ -784,7 +893,7 @@ pub async fn race_origin_lookups_meta(
                 let _ = start_one(
                     &mut set, &mut q4, &mut q6, &mut prefer,
                     &mut last_family, &mut last_start, &mut started_any,
-                    &mut connect,
+                    &mut started, &mut connect,
                 );
             }
         }
@@ -1382,5 +1491,128 @@ mod tests {
             .await
             .unwrap();
         drop(tcp);
+    }
+
+    #[test]
+    fn origin_lookup_name_is_fqdn() {
+        assert_eq!(origin_lookup_name("www.youtube.com"), "www.youtube.com.");
+        assert_eq!(origin_lookup_name("www.youtube.com."), "www.youtube.com.");
+    }
+
+    #[test]
+    fn origin_addr_cache_roundtrip() {
+        clear_origin_addr_cache();
+        let addr: SocketAddr = "192.0.2.8:443".parse().unwrap();
+        remember_origin_addr("Www.Example.Test", 443, addr);
+        let (v4, v6) = cached_origin_addrs("www.example.test", 443);
+        assert_eq!(v4, vec![addr]);
+        assert!(v6.is_empty());
+        clear_origin_addr_cache();
+    }
+
+    #[tokio::test]
+    async fn cached_v4_used_while_a_lookup_hangs() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+        let cad = Duration::from_millis(20);
+        let t0 = Instant::now();
+        let v4: FamilyLookup = Box::pin(async {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            Ok(Vec::new())
+        });
+        let v6: FamilyLookup = Box::pin(async { Ok(vec!["[2001:db8::1]:443".parse().unwrap()]) });
+        let tcp = race_origin_lookups_seeded(
+            v4,
+            v6,
+            cad,
+            |a| {
+                if a.is_ipv6() {
+                    Box::pin(std::future::pending()) as OriginConnect
+                } else {
+                    Box::pin(TcpStream::connect(a)) as OriginConnect
+                }
+            },
+            vec![addr],
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        drop(tcp.stream);
+        assert!(
+            t0.elapsed() < Duration::from_millis(80),
+            "cached v4 must not wait for hanging A or blackholed v6, elapsed={:?}",
+            t0.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn second_family_starts_without_remaining_cad() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ok = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+        let v4a: SocketAddr = "192.0.2.1:443".parse().unwrap();
+        let v6a: SocketAddr = "[2001:db8::1]:443".parse().unwrap();
+        let cad = Duration::from_millis(80);
+        let t0 = Instant::now();
+        let v4: FamilyLookup = Box::pin(async move { Ok(vec![v4a]) });
+        let v6: FamilyLookup = Box::pin(async move {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            Ok(vec![v6a])
+        });
+        let tcp = race_origin_lookups_meta(v4, v6, cad, move |addr| {
+            if addr.is_ipv6() {
+                Box::pin(TcpStream::connect(ok)) as OriginConnect
+            } else {
+                Box::pin(std::future::pending()) as OriginConnect
+            }
+        })
+        .await
+        .unwrap();
+        drop(tcp.stream);
+        assert!(
+            t0.elapsed() < Duration::from_millis(40),
+            "first address of the newly arrived family must not wait remaining CAD, elapsed={:?}",
+            t0.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn seed_does_not_double_connect_same_addr() {
+        use std::sync::atomic::AtomicUsize;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let _ = listener.accept().await;
+            }
+        });
+        let n = Arc::new(AtomicUsize::new(0));
+        let n2 = n.clone();
+        let v4: FamilyLookup = Box::pin(async move { Ok(vec![addr]) });
+        let v6: FamilyLookup = Box::pin(async { Ok(Vec::new()) });
+        let tcp = race_origin_lookups_seeded(
+            v4,
+            v6,
+            Duration::from_millis(20),
+            move |a| {
+                n2.fetch_add(1, Ordering::SeqCst);
+                Box::pin(TcpStream::connect(a)) as OriginConnect
+            },
+            vec![addr],
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+        drop(tcp.stream);
+        assert_eq!(
+            n.load(Ordering::SeqCst),
+            1,
+            "same addr from seed and lookup must connect once"
+        );
     }
 }

@@ -29,6 +29,8 @@ pub async fn handle_incoming(mut incoming: mpsc::Receiver<IncomingStream>) {
                 nya.lookup_aaaa_us = tracing::field::Empty,
                 nya.n_v4 = tracing::field::Empty,
                 nya.n_v6 = tracing::field::Empty,
+                nya.cache_v4 = tracing::field::Empty,
+                nya.cache_v6 = tracing::field::Empty,
                 nya.winner = tracing::field::Empty,
             );
             if let Some(fp) = inc.session_fp() {
@@ -60,15 +62,24 @@ pub async fn handle_incoming(mut incoming: mpsc::Receiver<IncomingStream>) {
             if let Some(n) = meta.n_v6 {
                 span.record("nya.n_v6", n);
             }
+            if meta.cache_v4 != 0 {
+                span.record("nya.cache_v4", meta.cache_v4);
+            }
+            if meta.cache_v6 != 0 {
+                span.record("nya.cache_v6", meta.cache_v6);
+            }
             if !meta.winner.is_empty() {
                 span.record("nya.winner", meta.winner);
             }
             if dial_us >= 100_000 {
                 info!(
-                    lookup_a_us = ?meta.lookup_a_us,
-                    lookup_aaaa_us = ?meta.lookup_aaaa_us,
-                    n_v4 = ?meta.n_v4,
-                    n_v6 = ?meta.n_v6,
+                    peer = %target,
+                    lookup_a_us = meta.lookup_a_us,
+                    lookup_aaaa_us = meta.lookup_aaaa_us,
+                    n_v4 = meta.n_v4,
+                    n_v6 = meta.n_v6,
+                    cache_v4 = meta.cache_v4,
+                    cache_v6 = meta.cache_v6,
                     winner = meta.winner,
                     dial_us,
                     "outbound dial slow"

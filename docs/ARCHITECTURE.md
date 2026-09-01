@@ -37,7 +37,7 @@ PathState 双写队列            ≤ interactive_max 走 urgent，其余 bulk
 TLS framed IO                 对端 session::handle_frame
     │
     ▼
-服务端 IncomingStream         TcpStream::connect(target) 后双向 copy
+服务端 IncomingStream         出站：字面 IP 直连；主机名拆 A/AAAA，谁先到谁先连（CAD 20ms）。上一轮真正连上的 origin 地址立刻再试，不等待这一次 lookup。lookup 按 FQDN（尾点），不走 resolv search。
 ```
 
 对端接受 `STREAM_OPEN` 后分配本地 `TunnelStream`（tokio duplex + 窗口 / 乱序缓冲）。应用读写 duplex；pump 把字节变成带 offset 的 `STREAM_DATA`，对端按 offset 重排。
