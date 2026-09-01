@@ -282,6 +282,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn join_dead_session_is_unknown_session() {
+        let psk = b"psk";
+        let exp = [7u8; 32];
+        let table = SessionTable::new(SessionConfig::default());
+        let (mut c0, mut s0) = duplex(16 * 1024);
+        let (mut c1, mut s1) = duplex(16 * 1024);
+
+        let server = async {
+            let a = server_accept_handshake(&mut s0, psk, &exp, &table)
+                .await
+                .unwrap();
+            let HandshakeResult::Created {
+                session,
+                session_id,
+                ..
+            } = a
+            else {
+                panic!("expected create");
+            };
+            session.shutdown();
+            let b = server_accept_handshake(&mut s1, psk, &exp, &table).await;
+            assert!(matches!(b, Err(HandshakeError::UnknownSession)));
+            session_id
+        };
+
+        let client = async {
+            let sid = client_create_session(&mut c0, psk, &exp, "default", "soy#0")
+                .await
+                .unwrap();
+            let jr = client_join_session(&mut c1, psk, &exp, sid, "b").await;
+            assert!(matches!(jr, Err(HandshakeError::UnknownSession)));
+            sid
+        };
+
+        let (sid_s, sid_c) = tokio::join!(server, client);
+        assert_eq!(sid_s, sid_c);
+        table.shutdown_all();
+    }
+
+    #[tokio::test]
     async fn join_unknown_session_is_unknown_session() {
         let psk = b"psk";
         let exp = [7u8; 32];

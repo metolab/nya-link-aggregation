@@ -97,6 +97,9 @@ pub(crate) struct Inner {
     closes: Mutex<HashMap<u32, CloseUnacked>>,
     pending_early: Mutex<HashMap<u32, Vec<PendingEarly>>>,
     session_fp: Mutex<String>,
+    /// Table-owned server sessions only. e2e duplex pairs stay alive so a
+    /// long blackhole can Join back; production leftover cannot.
+    reap_on_all_down: AtomicBool,
 }
 
 #[derive(Clone)]
@@ -143,6 +146,7 @@ impl Session {
             closes: Mutex::new(HashMap::new()),
             pending_early: Mutex::new(HashMap::new()),
             session_fp: Mutex::new(String::new()),
+            reap_on_all_down: AtomicBool::new(false),
         });
         let session = Self { inner };
         session.spawn_maintenance();
@@ -1391,13 +1395,11 @@ impl SessionTable {
     }
 
     pub fn aggregate_snapshot(&self) -> ProcessSnapshot {
-        let handles: Vec<([u8; 16], Session)> = self
-            .sessions
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(id, s)| (*id, s.clone()))
-            .collect();
+        let handles: Vec<([u8; 16], Session)> = {
+            let mut g = self.sessions.lock().unwrap();
+            g.retain(|_, s| !s.is_dead());
+            g.iter().map(|(id, s)| (*id, s.clone())).collect()
+        };
         let sessions: Vec<([u8; 16], Snapshot)> =
             handles.iter().map(|(id, s)| (*id, s.snapshot())).collect();
         let mut acc = Snapshot {
@@ -1464,6 +1466,10 @@ impl SessionTable {
             Some(self.process.clone()),
         );
         session.set_session_id(&session_id);
+        session
+            .inner
+            .reap_on_all_down
+            .store(true, Ordering::Relaxed);
         self.sessions
             .lock()
             .unwrap()
@@ -1475,7 +1481,15 @@ impl SessionTable {
         if self.is_closed() {
             return None;
         }
-        self.sessions.lock().unwrap().get(session_id).cloned()
+        let mut g = self.sessions.lock().unwrap();
+        match g.get(session_id) {
+            Some(s) if s.is_dead() => {
+                g.remove(session_id);
+                None
+            }
+            Some(s) => Some(s.clone()),
+            None => None,
+        }
     }
 
     pub fn remove(&self, session_id: &[u8; 16]) {
@@ -1509,6 +1523,65 @@ mod tests {
         s.set_session_id(&id2);
         assert_eq!(s.session_fp().as_deref(), Some("4ccd3913"));
         s.shutdown();
+        table.shutdown_all();
+    }
+
+    #[tokio::test]
+    async fn table_get_drops_dead_session() {
+        let table = SessionTable::new(SessionConfig::default());
+        let id = [7u8; 16];
+        let (s, _rx) = table.create_with_incoming(id).unwrap();
+        assert!(table.get(&id).is_some());
+        s.shutdown();
+        assert!(table.get(&id).is_none());
+        assert!(table.get(&id).is_none());
+        table.shutdown_all();
+    }
+
+    #[tokio::test]
+    async fn table_session_all_down_reaps() {
+        let mut cfg = SessionConfig::default();
+        cfg.all_down_timeout = Duration::ZERO;
+        let table = SessionTable::new(cfg);
+        let id = [8u8; 16];
+        let (s, _rx) = table.create_with_incoming(id).unwrap();
+        s.debug_maintain();
+        assert!(s.is_dead(), "table-owned server session must reap");
+        assert_eq!(s.snapshot().session_all_down_resets, 1);
+        assert!(table.get(&id).is_none());
+        table.shutdown_all();
+    }
+
+    #[tokio::test]
+    async fn standalone_server_all_down_does_not_reap() {
+        let cfg = SessionConfig {
+            all_down_timeout: Duration::ZERO,
+            ..SessionConfig::default()
+        };
+        let (server, _rx) = Session::new_server(cfg);
+        server.debug_maintain();
+        assert!(
+            !server.is_dead(),
+            "e2e duplex server must survive all-down so blackhole can recover"
+        );
+        assert_eq!(server.snapshot().session_all_down_resets, 0);
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn aggregate_snapshot_drops_dead_session() {
+        let table = SessionTable::new(SessionConfig::default());
+        let mut live_id = [0u8; 16];
+        live_id[0] = 0x34;
+        live_id[1] = 0x94;
+        let (live, _rx1) = table.create_with_incoming(live_id).unwrap();
+        let (dead, _rx2) = table.create_with_incoming([9u8; 16]).unwrap();
+        dead.shutdown();
+        let snap = table.aggregate_snapshot();
+        assert_eq!(snap.session.links.len(), 0);
+        assert!(table.get(&[9u8; 16]).is_none());
+        assert!(table.get(&live_id).is_some());
+        live.shutdown();
         table.shutdown_all();
     }
 

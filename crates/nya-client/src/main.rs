@@ -55,7 +55,7 @@ async fn main() -> Result<()> {
     {
         let s = session.clone();
         tokio::spawn(async move {
-            let _ = tokio::signal::ctrl_c().await;
+            wait_shutdown_signal().await;
             s.shutdown();
         });
     }
@@ -65,4 +65,20 @@ async fn main() -> Result<()> {
     #[cfg(feature = "otel")]
     guard.shutdown();
     r
+}
+
+async fn wait_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("install SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = sigterm.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }

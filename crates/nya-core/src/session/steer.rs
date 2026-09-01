@@ -214,18 +214,29 @@ impl Session {
                 g.unwrap()
             };
             if since.elapsed() >= self.inner.cfg.all_down_timeout {
-                let ids: Vec<u32> = self.inner.streams.lock().unwrap().keys().copied().collect();
-                if !ids.is_empty() {
-                    warn!(
-                        count = ids.len(),
-                        "all paths down past timeout, resetting streams"
-                    );
+                if self.inner.reap_on_all_down.load(Ordering::Relaxed) {
+                    let n = self.inner.streams.lock().unwrap().len();
+                    warn!(count = n, "all paths down past timeout, ending session");
                     self.inner
                         .metrics
                         .session_all_down_resets
                         .fetch_add(1, Ordering::Relaxed);
-                    for id in ids {
-                        self.reset_stream(id, ResetReason::Timeout);
+                    self.shutdown();
+                } else {
+                    let ids: Vec<u32> =
+                        self.inner.streams.lock().unwrap().keys().copied().collect();
+                    if !ids.is_empty() {
+                        warn!(
+                            count = ids.len(),
+                            "all paths down past timeout, resetting streams"
+                        );
+                        self.inner
+                            .metrics
+                            .session_all_down_resets
+                            .fetch_add(1, Ordering::Relaxed);
+                        for id in ids {
+                            self.reset_stream(id, ResetReason::Timeout);
+                        }
                     }
                 }
             }

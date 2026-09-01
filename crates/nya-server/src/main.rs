@@ -87,7 +87,7 @@ async fn main() -> Result<()> {
             let table = new_session_table(&cfg);
             let (stop_tx, stop_rx) = watch::channel(false);
             tokio::spawn(async move {
-                let _ = tokio::signal::ctrl_c().await;
+                wait_shutdown_signal().await;
                 let _ = stop_tx.send(true);
             });
             let r = run_on_table(listener, cfg, stop_rx, table).await;
@@ -95,5 +95,21 @@ async fn main() -> Result<()> {
             guard.shutdown();
             r
         }
+    }
+}
+
+async fn wait_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("install SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = sigterm.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
     }
 }
