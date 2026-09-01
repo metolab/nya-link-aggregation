@@ -521,10 +521,16 @@ fn pick_min_rx(cands: &[&Arc<PathState>], cfg: &SessionConfig) -> Option<u32> {
     for p in cands.iter().skip(1) {
         let ago = p.last_rx_ago();
         let score = path_score(p, cfg, PickPref::Any);
-        let better = ago < best_ago
-            || (ago == best_ago && score.0 < best_score.0)
-            || (ago == best_ago && score.0 == best_score.0 && score.1 && !best_score.1)
-            || (ago == best_ago && score == best_score && p.id < best.id);
+        // Known RTT beats unknown before last_rx. Just-joined dests init
+        // last_rx at construction, so they look freshest and would otherwise
+        // take the rehome dump before the first pong.
+        let better = (score.1 && !best_score.1)
+            || (score.1 == best_score.1 && ago < best_ago)
+            || (score.1 == best_score.1 && ago == best_ago && score.0 < best_score.0)
+            || (score.1 == best_score.1
+                && ago == best_ago
+                && score == best_score
+                && p.id < best.id);
         if better {
             best = p;
             best_ago = ago;
@@ -804,6 +810,20 @@ mod tests {
         let c0 = mk_named(3, "nsix#0".into(), 7);
         let picked = pick_retry_path(&[a0, b0, c0], &cfg, &[1, 2]).unwrap();
         assert_eq!(picked, 3);
+    }
+
+    #[test]
+    fn retry_prefers_known_rtt_over_fresher_unknown() {
+        let cfg = SessionConfig::default();
+        let known = mk_named(1, "akcdn#0".into(), 7);
+        let unk = mk_named(2, "soy#0".into(), 0);
+        unk.rtt_ewma_us.store(0, Ordering::Relaxed);
+        age_rx(&known, 15);
+        let picked = pick_retry_path(&[known, unk], &cfg, &[9]).unwrap();
+        assert_eq!(
+            picked, 1,
+            "rehome must not dump onto a dest that has not ponged"
+        );
     }
 
     #[test]

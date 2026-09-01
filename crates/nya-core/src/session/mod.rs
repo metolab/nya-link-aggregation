@@ -952,6 +952,13 @@ impl Session {
         }
     }
 
+    pub(crate) fn note_send_drop(&self) {
+        self.inner
+            .metrics
+            .frame_send_drop
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     fn send_on_path(&self, path_id: u32, frame: Frame) -> bool {
         let Some(p) = self.get_path(path_id) else {
             return false;
@@ -959,8 +966,18 @@ impl Session {
         if !p.is_alive() {
             return false;
         }
+        let data = matches!(&frame, Frame::StreamData(_));
+        if data && p.is_write_stalled() {
+            return false;
+        }
         p.note_tx();
-        let urgent = self.frame_is_interactive(&frame);
+        // Unknown dests keep STREAM_DATA off urgent so ping/control can
+        // complete the first RTT before DATA pins FramedWrite.
+        let urgent = if data && !p.rtt_known() {
+            false
+        } else {
+            self.frame_is_interactive(&frame)
+        };
         let tx = if urgent { &p.urgent } else { &p.writer };
         p.note_enqueue(urgent);
         if tx.try_send(frame).is_ok() {
@@ -974,10 +991,7 @@ impl Session {
             if urgent {
                 p.set_congested(true);
             }
-            self.inner
-                .metrics
-                .frame_send_drop
-                .fetch_add(1, Ordering::Relaxed);
+            self.note_send_drop();
             if urgent {
                 debug!(path = %p.name, urgent = true, "send dropped");
             }
@@ -3379,6 +3393,72 @@ mod tests {
             !p.is_write_stalled(),
             "just-joined dest keeps 300ms write_deadline after first pong"
         );
+        assert_eq!(client.snapshot().path_down, 0);
+        drop(done);
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn unknown_dest_parks_stream_data_and_does_not_stall() {
+        let client = Session::new_client(SessionConfig::default());
+        let (a, _peer) = duplex(8);
+        let done = client.start_path("new".into(), a);
+        let id = *client.inner.paths.lock().unwrap().keys().next().unwrap();
+        let _live = inject_live(&client, 99, "live#0", 7);
+        let data = Frame::StreamData(StreamData {
+            stream_id: 1,
+            offset: 0,
+            data: vec![0; 64],
+        });
+        for _ in 0..80 {
+            let _ = client.send_on_path(id, data.clone());
+        }
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let p = client.get_path(id).expect("unknown dest stays up");
+        assert!(p.is_alive());
+        assert!(
+            !p.is_write_stalled(),
+            "STREAM_DATA must not pin a dest before first pong"
+        );
+        assert_eq!(client.snapshot().path_down, 0);
+        drop(done);
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn write_stall_refuses_further_stream_data() {
+        let client = Session::new_client(SessionConfig::default());
+        let (a, _peer) = duplex(8);
+        let done = client.start_path("stall".into(), a);
+        let stall_id = *client.inner.paths.lock().unwrap().keys().next().unwrap();
+        client
+            .get_path(stall_id)
+            .unwrap()
+            .record_rtt(Duration::from_millis(7));
+        age_path(&client.get_path(stall_id).unwrap(), Duration::from_secs(1));
+        let _live = inject_live(&client, 99, "live#0", 7);
+        let ping = Frame::Ping(nya_proto::Ping {
+            seq: 1,
+            sent_at_ms: 0,
+        });
+        for _ in 0..80 {
+            let _ = client.send_on_path(stall_id, ping.clone());
+        }
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let stall = client
+            .get_path(stall_id)
+            .expect("blocked writer must stay up");
+        assert!(stall.is_write_stalled());
+        let data = Frame::StreamData(StreamData {
+            stream_id: 1,
+            offset: 0,
+            data: vec![1; 64],
+        });
+        assert!(
+            !client.send_on_path(stall_id, data),
+            "stalled dest must not take more STREAM_DATA"
+        );
+        assert!(stall.is_alive());
         assert_eq!(client.snapshot().path_down, 0);
         drop(done);
         client.shutdown();

@@ -588,6 +588,18 @@ where
     Ok(())
 }
 
+fn hold_stream_data(path: &PathState, frame: &Frame) -> bool {
+    matches!(frame, Frame::StreamData(_)) && (!path.rtt_known() || path.is_write_stalled())
+}
+
+fn park_stream_data(path: &PathState, session: &Session, frame: Frame) {
+    path.note_enqueue(false);
+    if path.writer.try_send(frame).is_err() {
+        path.note_dequeue(false);
+        session.note_send_drop();
+    }
+}
+
 /// Split the TLS stream with `tokio::io::split`, not `Framed::split()`.
 /// `Framed::split` holds a BiLock across `send().await` flush, so a blocked
 /// write still starves `next()`. `tokio::io::split` releases on `Pending`.
@@ -726,6 +738,10 @@ pub fn spawn_path_io<T>(
                             ));
                         };
                         path_w.note_dequeue(true);
+                        if hold_stream_data(&path_w, &frame) {
+                            park_stream_data(&path_w, &session_w, frame);
+                            continue;
+                        }
                         match write_one(
                             &mut writer,
                             &mut close_rx,
@@ -749,7 +765,7 @@ pub fn spawn_path_io<T>(
                             }
                         }
                     }
-                    out = rx.recv(), if !path_w.is_write_stalled() => {
+                    out = rx.recv(), if path_w.rtt_known() && !path_w.is_write_stalled() => {
                         let Some(frame) = out else {
                             return Err(std::io::Error::new(
                                 std::io::ErrorKind::BrokenPipe,
