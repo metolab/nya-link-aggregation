@@ -3239,6 +3239,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn n6_four_cross_link_holds() {
+        let client = Session::new_client(SessionConfig::default());
+        let a0 = inject_named(&client, 1, "akcdn#0", 7);
+        let a1 = inject_named(&client, 2, "akcdn#1", 7);
+        let s0 = inject_named(&client, 3, "soy#0", 7);
+        let s1 = inject_named(&client, 4, "soy#1", 7);
+        inject_named(&client, 5, "nsix#0", 7);
+        inject_named(&client, 6, "nsix#1", 7);
+        age_rx(&a0, 400);
+        age_rx(&a1, 400);
+        age_rx(&s0, 400);
+        age_rx(&s1, 400);
+        let before_n = client.snapshot().path_down;
+        let before_c = client.snapshot().correlated_silence;
+        client.debug_maintain();
+        assert_eq!(
+            client.snapshot().path_down,
+            before_n,
+            "4-of-6 across two named links must hold, not reconnect-storm"
+        );
+        assert_eq!(client.snapshot().correlated_silence, before_c + 1);
+        for id in 1..=6 {
+            assert!(
+                client.inner.paths.lock().unwrap().contains_key(&id),
+                "path {id} must remain in the pool"
+            );
+        }
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn n6_three_cross_link_holds() {
+        let client = Session::new_client(SessionConfig::default());
+        let a0 = inject_named(&client, 1, "akcdn#0", 7);
+        inject_named(&client, 2, "akcdn#1", 7);
+        let s0 = inject_named(&client, 3, "soy#0", 7);
+        inject_named(&client, 4, "soy#1", 7);
+        let n0 = inject_named(&client, 5, "nsix#0", 7);
+        inject_named(&client, 6, "nsix#1", 7);
+        age_rx(&a0, 400);
+        age_rx(&s0, 400);
+        age_rx(&n0, 400);
+        let before_n = client.snapshot().path_down;
+        let before_c = client.snapshot().correlated_silence;
+        client.debug_maintain();
+        assert_eq!(
+            client.snapshot().path_down,
+            before_n,
+            "one silent dest per named link is a cross-link cluster, not three independent deaths"
+        );
+        assert_eq!(client.snapshot().correlated_silence, before_c + 1);
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn n6_two_same_link_tears() {
+        let client = Session::new_client(SessionConfig::default());
+        let a0 = inject_named(&client, 1, "akcdn#0", 7);
+        let a1 = inject_named(&client, 2, "akcdn#1", 7);
+        inject_named(&client, 3, "soy#0", 7);
+        inject_named(&client, 4, "soy#1", 7);
+        inject_named(&client, 5, "nsix#0", 7);
+        inject_named(&client, 6, "nsix#1", 7);
+        age_rx(&a0, 400);
+        age_rx(&a1, 400);
+        let before_n = client.snapshot().path_down;
+        let before_c = client.snapshot().correlated_silence;
+        client.debug_maintain();
+        assert_eq!(
+            client.snapshot().path_down,
+            before_n + 2,
+            "one named link (H8) must still tear at down_for"
+        );
+        assert_eq!(client.snapshot().correlated_silence, before_c);
+        client.shutdown();
+    }
+
+    #[tokio::test]
     async fn snapshot_marks_backup_flag() {
         let client = Session::new_client(SessionConfig::default());
         inject_named(&client, 1, "a#0", 7);

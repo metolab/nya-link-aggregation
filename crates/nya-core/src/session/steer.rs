@@ -20,6 +20,32 @@ use crate::stream::StreamState;
 
 use super::Session;
 
+/// Hold silent TCPs instead of `path_failed` while a survivor exists.
+///
+/// - Exact N−1 quiet (original peer-stall).
+/// - Or a cross-link cluster: ≥3 quiet spanning ≥2 named links.
+/// All-N (`quiet == alive`) never holds. One named link (H8) never holds.
+fn correlated_hold(
+    alive: usize,
+    quiet: usize,
+    silent: usize,
+    known_quiet: usize,
+    quiet_links: usize,
+) -> bool {
+    if alive < 3 || known_quiet < 1 || silent == 0 || quiet >= alive {
+        return false;
+    }
+    quiet + 1 == alive || (quiet >= 3 && quiet_links >= 2)
+}
+
+fn unique_link_count(paths: &[&Arc<PathState>]) -> usize {
+    let mut links = std::collections::BTreeSet::new();
+    for p in paths {
+        links.insert(p.link());
+    }
+    links.len()
+}
+
 impl Session {
     #[cfg(test)]
     pub fn debug_maintain(&self) {
@@ -73,14 +99,22 @@ impl Session {
             .filter(|p| p.last_rx_ago() >= self.down_for(p))
             .collect();
         let known_quiet = quiet.iter().filter(|p| p.rtt_known()).count();
+        let quiet_links = unique_link_count(&quiet);
         // Membership at degrade_for so sequential down_for crossings still
-        // form N−1; enter only once someone is actually at down_for (3-of-4
-        // at ~50 ms must not start an 8 s episode). All-N still tears at
-        // down_for — TCP RTO recovery is worse than a reconnect.
-        let correlated = alive.len() >= 3
-            && known_quiet >= 1
-            && quiet.len() == alive.len() - 1
-            && !silent.is_empty();
+        // form a hold; enter only once someone is actually at down_for
+        // (3-of-4 at ~50 ms must not start an 8 s episode). All-N still
+        // tears at down_for — TCP RTO recovery is worse than a reconnect.
+        // Exact N−1 is the original peer-stall shape. A 3×2 pool also
+        // holds a cross-link cluster (quiet ≥ 3 spanning ≥ 2 named links)
+        // while any survivor remains — otherwise 4-of-6 congestion looks
+        // like independent deaths and reconnects into an unknown-RTT storm.
+        let correlated = correlated_hold(
+            alive.len(),
+            quiet.len(),
+            silent.len(),
+            known_quiet,
+            quiet_links,
+        );
         {
             let mut g = self.inner.correlated_since.lock().unwrap();
             if correlated {
@@ -91,6 +125,7 @@ impl Session {
                         silent = silent.len(),
                         alive = alive.len(),
                         known_quiet,
+                        quiet_links,
                         budget_ms = self.inner.cfg.all_down_timeout.as_millis() as u64,
                         "correlated silence"
                     );
