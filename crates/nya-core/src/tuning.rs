@@ -78,6 +78,9 @@ pub struct Tuning {
     pub reconnect_backoff_max: Duration,
     pub join_poll: Duration,
     pub ready_poll: Duration,
+    /// Origin hostname connect: delay before the next family/addr.
+    /// Not overlay link dial. Not RFC 8305 250 ms. Equals loss_timeout_floor.
+    pub origin_connect_attempt_delay: Duration,
 }
 
 impl Tuning {
@@ -121,6 +124,7 @@ impl Tuning {
         reconnect_backoff_max: Duration::from_secs(2),
         join_poll: Duration::from_millis(20),
         ready_poll: Duration::from_millis(50),
+        origin_connect_attempt_delay: Duration::from_millis(20),
     };
 
     pub fn rebalance_slack(&self) -> u64 {
@@ -238,6 +242,8 @@ mod tests {
         assert_eq!(t.chan, 64);
         assert_eq!(t.close_linger, Duration::from_secs(1));
         assert_eq!(t.handshake_timeout, Duration::from_secs(3));
+        assert_eq!(t.origin_connect_attempt_delay, t.loss_timeout_floor);
+        assert_eq!(t.origin_connect_attempt_delay, Duration::from_millis(20));
     }
 
     #[test]

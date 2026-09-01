@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -1104,6 +1104,115 @@ pub async fn prod_like_all_path_blackhole() -> Result<ScenarioReport> {
     Ok(r)
 }
 
+async fn watch_min_alive(h: &Harness, stop: Arc<AtomicBool>) -> Arc<AtomicUsize> {
+    let min_alive = Arc::new(AtomicUsize::new(h.session.alive_path_count()));
+    let session = h.session.clone();
+    let min = min_alive.clone();
+    tokio::spawn(async move {
+        while !stop.load(Ordering::Relaxed) {
+            let n = session.alive_path_count();
+            min.fetch_min(n, Ordering::Relaxed);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    });
+    min_alive
+}
+
+/// One 5-tuple silent-down; the other five must stay up (no 14:49:28 cascade).
+pub async fn prod_like_silent_tear_no_eof_cascade() -> Result<ScenarioReport> {
+    let h = start(prod_like_spec()).await?;
+    let payload = vec![0u8; 204];
+    let mut baseline = Duration::MAX;
+    for _ in 0..3 {
+        baseline = baseline.min(
+            socks_first_byte(&h, &payload, Duration::from_millis(400))
+                .await
+                .map_err(|_| anyhow!("baseline first-byte timed out"))?,
+        );
+    }
+    let stop = Arc::new(AtomicBool::new(false));
+    let min_alive = watch_min_alive(&h, stop.clone()).await;
+    h.link("akcdn").set_conn_blackhole(0, true);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let t0 = Instant::now();
+    while t0.elapsed() < Duration::from_millis(200) {
+        min_alive.fetch_min(h.session.alive_path_count(), Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let stats = collect_first_bytes(&h, 16, &payload, Duration::from_millis(250)).await;
+    stop.store(true, Ordering::Relaxed);
+    h.link("akcdn").set_conn_blackhole(0, false);
+    let mut r = finish(
+        "prod_like_silent_tear_no_eof_cascade",
+        &h,
+        stats,
+        first_byte_sla(120, 0.95),
+        None,
+    );
+    note_prod_like(&mut r, &h, baseline);
+    let min = min_alive.load(Ordering::Relaxed);
+    r.notes.push(format!(
+        "min_alive={min} path_down={} all_down={}",
+        r.snap.path_down, r.snap.session_all_down_resets
+    ));
+    if min < 5 || r.snap.session_all_down_resets != 0 {
+        r.sla.min_success = 2.0;
+        r.notes
+            .push("silent-tear cascaded or all_down_resets".into());
+    }
+    Ok(r)
+}
+
+/// One path send-buffer HOL; siblings must not drop-storm or path_down.
+pub async fn prod_like_blocked_writer_no_drop_storm() -> Result<ScenarioReport> {
+    let h = start(prod_like_spec()).await?;
+    let payload = vec![0u8; 204];
+    let mut baseline = Duration::MAX;
+    for _ in 0..3 {
+        baseline = baseline.min(
+            socks_first_byte(&h, &payload, Duration::from_millis(400))
+                .await
+                .map_err(|_| anyhow!("baseline first-byte timed out"))?,
+        );
+    }
+    let snap0 = h.session.snapshot();
+    let stop = Arc::new(AtomicBool::new(false));
+    let min_alive = watch_min_alive(&h, stop.clone()).await;
+    h.link("akcdn").set_conn_stall(0, true);
+    let stats = collect_first_bytes(&h, 16, &payload, Duration::from_millis(250)).await;
+    stop.store(true, Ordering::Relaxed);
+    h.link("akcdn").set_conn_stall(0, false);
+    let mut r = finish(
+        "prod_like_blocked_writer_no_drop_storm",
+        &h,
+        stats,
+        first_byte_sla(120, 0.95),
+        None,
+    );
+    note_prod_like(&mut r, &h, baseline);
+    let drop_d = r.snap.frame_send_drop.saturating_sub(snap0.frame_send_drop);
+    let hedge_d = r.snap.data_hedge.saturating_sub(snap0.data_hedge);
+    let mig_d = r
+        .snap
+        .migrates_send_blocked
+        .saturating_sub(snap0.migrates_send_blocked);
+    let min = min_alive.load(Ordering::Relaxed);
+    r.notes.push(format!(
+        "min_alive={min} drop_delta={drop_d} hedge_delta={hedge_d} mig_blocked={mig_d} path_down {}→{}",
+        snap0.path_down, r.snap.path_down
+    ));
+    if min < 5
+        || drop_d > 2
+        || hedge_d > 32
+        || mig_d > 16
+        || r.snap.session_all_down_resets != 0
+    {
+        r.sla.min_success = 2.0;
+        r.notes.push("blocked writer storm or sibling tear".into());
+    }
+    Ok(r)
+}
+
 /// Stall client→server on 2 of 3 connections (TCP send buffer / HOL).
 /// Sibling connections must pick up the stream.
 pub async fn one_conn_stall() -> Result<ScenarioReport> {
@@ -1666,6 +1775,16 @@ pub fn catalog() -> Vec<Scenario> {
             "prod_like_thin_tcp_rto_first_byte",
             false,
             prod_like_thin_tcp_rto_first_byte()
+        ),
+        sc!(
+            "prod_like_silent_tear_no_eof_cascade",
+            false,
+            prod_like_silent_tear_no_eof_cascade()
+        ),
+        sc!(
+            "prod_like_blocked_writer_no_drop_storm",
+            false,
+            prod_like_blocked_writer_no_drop_storm()
         ),
         sc!("one_conn_stall", false, one_conn_stall()),
         sc!("one_conn_disconnect", false, one_conn_disconnect()),

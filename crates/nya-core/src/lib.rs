@@ -43,7 +43,10 @@ pub use handshake::{
     client_create_session, client_join_session, server_accept_handshake, HandshakeError,
     HandshakeResult,
 };
-pub use hop::{HopClock, HopOutcome, HopProbe, HopRole, HopSample, OriginPeerSlots};
+pub use hop::{
+    connect_origin, interleave_families, race_origin_addrs, race_origin_connects, HopClock,
+    HopOutcome, HopProbe, HopRole, HopSample, OriginPeerSlots,
+};
 pub use metrics::{
     percentile, rollup_links, HistSnap, Histogram, LinkSnap, PathSnap, ProcessCounters,
     ProcessSnapshot, Snapshot as SessionSnapshot, FAILOVER_MS_BOUNDS, LIFETIME_MS_BOUNDS,

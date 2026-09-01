@@ -58,9 +58,10 @@ impl Session {
         self.remember_open(id, path_id, target.clone());
         if !self.send_on_path(path_id, open.clone()) {
             if let Some(alt) = self.pick_retry(path_id) {
-                self.send_on_path(alt, open);
-                self.set_sticky(id, alt);
-                self.remember_open(id, alt, target);
+                if self.send_on_path(alt, open) {
+                    self.set_sticky(id, alt);
+                    self.remember_open(id, alt, target);
+                }
             }
         }
         Ok(tun)
@@ -258,6 +259,7 @@ impl Session {
                         path_id,
                         last_sent: std::time::Instant::now(),
                         tried: vec![path_id],
+                        retry_not_before: std::time::Instant::now(),
                     },
                 );
             }
@@ -271,25 +273,27 @@ impl Session {
             });
             if !self.send_on_path(path_id, frame.clone()) {
                 if let Some(alt) = self.pick_retry(path_id) {
-                    self.set_sticky(id, alt);
-                    {
-                        let mut unacked = st.unacked.lock().unwrap();
-                        if let Some(u) = unacked.get_mut(&offset) {
-                            u.path_id = alt;
-                            u.last_sent = std::time::Instant::now();
-                            Session::push_tried(&mut u.tried, alt);
+                    if self.send_on_path(alt, frame) {
+                        self.set_sticky(id, alt);
+                        {
+                            let mut unacked = st.unacked.lock().unwrap();
+                            if let Some(u) = unacked.get_mut(&offset) {
+                                u.path_id = alt;
+                                u.last_sent = std::time::Instant::now();
+                                u.retry_not_before = u.last_sent;
+                                Session::push_tried(&mut u.tried, alt);
+                            }
                         }
+                        self.xfer_inflight(path_id, alt, n as u64);
+                        self.note_migrate("send_blocked");
+                        debug!(
+                            stream_id = id,
+                            from = path_id,
+                            to = alt,
+                            reason = "send_blocked",
+                            "migrate"
+                        );
                     }
-                    self.xfer_inflight(path_id, alt, n as u64);
-                    self.send_on_path(alt, frame);
-                    self.note_migrate("send_blocked");
-                    debug!(
-                        stream_id = id,
-                        from = path_id,
-                        to = alt,
-                        reason = "send_blocked",
-                        "migrate"
-                    );
                 }
             }
         }

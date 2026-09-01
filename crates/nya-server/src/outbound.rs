@@ -2,13 +2,13 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
 
-use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
 use tracing::{debug, warn, Instrument};
 
 use nya_core::{
-    HopClock, HopOutcome, HopProbe, HopRole, HopSample, IncomingStream, OriginPeerSlots,
+    connect_origin, HopClock, HopOutcome, HopProbe, HopRole, HopSample, IncomingStream,
+    OriginPeerSlots, Tuning,
 };
 use nya_proto::ResetReason;
 
@@ -25,15 +25,18 @@ pub async fn handle_incoming(mut incoming: mpsc::Receiver<IncomingStream>) {
                 nya.dial_us = tracing::field::Empty,
             );
             let t0 = Instant::now();
-            let connected = TcpStream::connect((inc.target.host.as_str(), inc.target.port))
-                .instrument(span.clone())
-                .await;
+            let connected = connect_origin(
+                inc.target.host.as_str(),
+                inc.target.port,
+                Tuning::STANDARD.origin_connect_attempt_delay,
+            )
+            .instrument(span.clone())
+            .await;
             let dial_us = (t0.elapsed().as_micros() as u64).max(1);
             span.record("nya.dial_us", dial_us);
             match connected {
                 Ok(tcp) => {
                     drop(span);
-                    let _ = tcp.set_nodelay(true);
                     inc.process()
                         .outbound_dial_ok
                         .fetch_add(1, Ordering::Relaxed);

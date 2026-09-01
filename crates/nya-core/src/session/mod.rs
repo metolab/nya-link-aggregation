@@ -352,7 +352,17 @@ impl Session {
             Frame::Pong(p) => {
                 if let Some(path) = self.get_path(path_id) {
                     let record = path.inflight_bytes() < self.inner.cfg.tuning.inflight_bias;
-                    path.on_pong_record(p.seq, p.sent_at_ms, record);
+                    let cap = if path.rtt_known() {
+                        Some(health::loss_timeout(
+                            &self.inner.cfg,
+                            self.min_alive_fast_rtt().unwrap_or_else(|| {
+                                crate::scheduler::path_loss_rtt(&path)
+                            }),
+                        ))
+                    } else {
+                        Some(self.inner.cfg.tuning.unknown_degrade_min)
+                    };
+                    path.on_pong_record(p.seq, p.sent_at_ms, record, cap);
                 }
             }
             Frame::StreamOpen(open) => {
@@ -429,6 +439,10 @@ impl Session {
         }
     }
 
+    pub(crate) fn write_deadline(&self, path_id: u32) -> Duration {
+        self.retry_after(path_id)
+    }
+
     fn note_retry(&self, from: u32, to: u32) {
         let from_link = self.get_path(from).map(|p| p.link().to_string());
         let to_link = self.get_path(to).map(|p| p.link().to_string());
@@ -450,19 +464,31 @@ impl Session {
         if !st.is_steerable() {
             return;
         }
-        let mut unacked = st.unacked.lock().unwrap();
-        for (offset, u) in unacked.iter_mut() {
-            if u.last_sent.elapsed() < self.retry_after(u.path_id) {
-                continue;
-            }
-            Self::push_tried(&mut u.tried, u.path_id);
-            let Some(alt) = self.pick_retry_tried(&u.tried) else {
+        let now = Instant::now();
+        let expired: Vec<(u64, u32, Vec<u8>, Vec<u32>)> = {
+            let unacked = st.unacked.lock().unwrap();
+            unacked
+                .iter()
+                .filter(|(_, u)| {
+                    u.last_sent.elapsed() >= self.retry_after(u.path_id) && now >= u.retry_not_before
+                })
+                .map(|(off, u)| (*off, u.path_id, u.data.clone(), u.tried.clone()))
+                .collect()
+        };
+        for (offset, from, data, mut tried) in expired {
+            Self::push_tried(&mut tried, from);
+            let Some(alt) = self.pick_retry_tried(&tried) else {
                 continue;
             };
-            let from = u.path_id;
-            self.rehome_unacked(u, alt);
-            self.send_data_frame(st.id, *offset, u.data.clone(), alt);
-            self.note_retry(from, alt);
+            if self.send_data_frame(st.id, offset, data, alt) {
+                if let Some(u) = st.unacked.lock().unwrap().get_mut(&offset) {
+                    self.rehome_unacked(u, alt);
+                }
+                self.note_retry(from, alt);
+            } else if let Some(u) = st.unacked.lock().unwrap().get_mut(&offset) {
+                Self::push_tried(&mut u.tried, alt);
+                u.retry_not_before = Instant::now() + self.retry_after(from);
+            }
         }
     }
 
@@ -579,6 +605,9 @@ impl Session {
                     Self::push_tried(&mut o.tried, alt);
                 }
                 self.note_retry(from, alt);
+            } else if let Some(o) = self.inner.opens.lock().unwrap().get_mut(&id) {
+                o.sent_at = Instant::now();
+                Self::push_tried(&mut o.tried, alt);
             }
         }
     }
@@ -686,6 +715,9 @@ impl Session {
                     .close_retry
                     .fetch_add(1, Ordering::Relaxed);
                 debug!(stream_id = id, from, to = alt, "close_retry");
+            } else if let Some(c) = self.inner.closes.lock().unwrap().get_mut(&id) {
+                c.sent_at = Instant::now();
+                Self::push_tried(&mut c.tried, alt);
             }
         }
     }
@@ -856,6 +888,7 @@ impl Session {
         self.xfer_inflight(u.path_id, to, u.data.len() as u64);
         u.path_id = to;
         u.last_sent = Instant::now();
+        u.retry_not_before = u.last_sent;
         Self::push_tried(&mut u.tried, to);
     }
 
@@ -1411,7 +1444,9 @@ impl SessionTable {
 mod tests {
     use super::*;
     use nya_proto::{StreamAck, Target};
-    use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::{duplex, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
     fn pair() -> (Session, Session, mpsc::Receiver<IncomingStream>) {
         let mut cfg = SessionConfig::default();
@@ -1503,8 +1538,8 @@ mod tests {
     #[tokio::test]
     async fn expired_unacked_retries_other_link() {
         let client = Session::new_client(SessionConfig::default());
-        inject_named(&client, 1, "akcdn#0", 7);
-        inject_named(&client, 2, "soy#0", 7);
+        let _held_a = inject_live(&client, 1, "akcdn#0", 7);
+        let _held_b = inject_live(&client, 2, "soy#0", 7);
         let mut tun = client
             .open_stream(Target {
                 host: "t".into(),
@@ -2026,6 +2061,7 @@ mod tests {
                     path_id,
                     last_sent: Instant::now(),
                     tried: vec![path_id],
+                    retry_not_before: Instant::now(),
                 },
             );
         }
@@ -2082,6 +2118,7 @@ mod tests {
                     path_id,
                     last_sent: Instant::now(),
                     tried: vec![path_id],
+                    retry_not_before: Instant::now(),
                 },
             );
         }
@@ -2344,6 +2381,47 @@ mod tests {
         p
     }
 
+    /// Keep both writer receivers so `try_send` succeeds until the channel fills.
+    fn inject_live(
+        client: &Session,
+        id: u32,
+        name: &str,
+        rtt_ms: u64,
+    ) -> (Arc<PathState>, mpsc::Receiver<Frame>, mpsc::Receiver<Frame>) {
+        inject_live_cap(client, id, name, rtt_ms, 64)
+    }
+
+    fn inject_live_cap(
+        client: &Session,
+        id: u32,
+        name: &str,
+        rtt_ms: u64,
+        cap: usize,
+    ) -> (Arc<PathState>, mpsc::Receiver<Frame>, mpsc::Receiver<Frame>) {
+        let (wtx, wrx) = mpsc::channel(cap);
+        let (utx, urx) = mpsc::channel(cap);
+        let p = PathState::with_writers(id, name.into(), wtx, utx);
+        p.rtt_ewma_us.store(rtt_ms * 1000, Ordering::Relaxed);
+        p.rtt_stable_us.store(rtt_ms * 1000, Ordering::Relaxed);
+        p.rtt_class_us.store(rtt_ms * 1000, Ordering::Relaxed);
+        p.note_class_known_now();
+        client.inner.paths.lock().unwrap().insert(id, p.clone());
+        (p, wrx, urx)
+    }
+
+    fn fill_urgent(client: &Session, path_id: u32) {
+        let ping = Frame::Ping(nya_proto::Ping {
+            seq: 1,
+            sent_at_ms: 0,
+        });
+        for _ in 0..128 {
+            if !client.send_on_path(path_id, ping.clone()) {
+                return;
+            }
+        }
+        panic!("urgent queue did not fill");
+    }
+
     fn age_rx(p: &PathState, ms: u64) {
         *p.last_rx.lock().unwrap() = Instant::now() - Duration::from_millis(ms);
     }
@@ -2517,8 +2595,8 @@ mod tests {
     #[tokio::test]
     async fn retry_after_poisoned_path_with_live_fast_dest_is_floor() {
         let client = Session::new_client(SessionConfig::default());
-        let sick = inject_named(&client, 1, "nsix#0", 7);
-        inject_named(&client, 2, "soy#0", 7);
+        let (sick, _sw, _su) = inject_live(&client, 1, "nsix#0", 7);
+        let _held_b = inject_live(&client, 2, "soy#0", 7);
         sick.rtt_ewma_us.store(200_000, Ordering::Relaxed);
         let mut tun = client
             .open_stream(Target {
@@ -3047,5 +3125,288 @@ mod tests {
             "older ping past loss_timeout must degrade even with a young ping left"
         );
         client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn failed_retry_does_not_hedge_or_tear() {
+        let client = Session::new_client(SessionConfig::default());
+        let (_a, _aw, _au) = inject_live_cap(&client, 1, "a#0", 7, 8);
+        let (_b, _bw, _bu) = inject_live_cap(&client, 2, "b#0", 7, 8);
+        let mut tun = client
+            .open_stream(Target {
+                host: "t".into(),
+                port: 1,
+            })
+            .await
+            .unwrap();
+        tun.write_all(b"hello").await.unwrap();
+        let st = {
+            let g = client.inner.streams.lock().unwrap();
+            g.values().next().unwrap().clone()
+        };
+        let deadline = Instant::now() + Duration::from_millis(200);
+        loop {
+            if !st.unacked.lock().unwrap().is_empty() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "write must leave unacked");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        fill_urgent(&client, 1);
+        fill_urgent(&client, 2);
+        let aged = Instant::now() - Duration::from_millis(100);
+        let from = {
+            let mut u = st.unacked.lock().unwrap();
+            for x in u.values_mut() {
+                x.last_sent = aged;
+                x.retry_not_before = Instant::now() - Duration::from_millis(100);
+            }
+            u.values().next().unwrap().path_id
+        };
+        let hedge0 = client.snapshot().data_hedge;
+        let down0 = client.snapshot().path_down;
+        client.debug_maintain();
+        let (last, pid) = {
+            let u = st.unacked.lock().unwrap();
+            let got = u.values().next().unwrap();
+            (got.last_sent, got.path_id)
+        };
+        assert_eq!(last, aged, "failed send must not bump last_sent");
+        assert_eq!(pid, from);
+        assert_eq!(client.snapshot().data_hedge, hedge0);
+        assert_eq!(client.snapshot().path_down, down0);
+        assert!(client.get_path(1).is_some());
+        assert!(client.get_path(2).is_some());
+        drop(tun);
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn urgent_full_on_one_leaves_five_up() {
+        let client = Session::new_client(SessionConfig::default());
+        let mut held = Vec::new();
+        for i in 1..=6u32 {
+            held.push(inject_live_cap(
+                &client,
+                i,
+                &format!("p{i}#0"),
+                7,
+                8,
+            ));
+        }
+        fill_urgent(&client, 1);
+        assert!(held[0].0.is_congested());
+        let down0 = client.snapshot().path_down;
+        assert!(!client.send_on_path(
+            1,
+            Frame::Ping(nya_proto::Ping {
+                seq: 9,
+                sent_at_ms: 0,
+            })
+        ));
+        assert_eq!(client.snapshot().path_down, down0);
+        assert_eq!(client.alive_path_count(), 6);
+        for i in 2..=6u32 {
+            assert!(client.get_path(i).unwrap().is_alive());
+            assert!(!client.get_path(i).unwrap().is_congested());
+        }
+        drop(held);
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn path_failed_during_blocked_write_completes_add_path() {
+        let client = Session::new_client(SessionConfig::default());
+        let (a, _peer) = duplex(8);
+        let done = client.start_path("p1".into(), a);
+        let id = *client.inner.paths.lock().unwrap().keys().next().unwrap();
+        let ping = Frame::Ping(nya_proto::Ping {
+            seq: 1,
+            sent_at_ms: 0,
+        });
+        for _ in 0..80 {
+            let _ = client.send_on_path(id, ping.clone());
+        }
+        client.path_failed(id);
+        tokio::time::timeout(Duration::from_millis(500), done)
+            .await
+            .expect("add_path must complete after path_failed while write blocked")
+            .expect("oneshot");
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn write_timeout_tears_only_blocked_path() {
+        let client = Session::new_client(SessionConfig::default());
+        let (a, _peer) = duplex(8);
+        let done = client.start_path("stall".into(), a);
+        let stall_id = *client.inner.paths.lock().unwrap().keys().next().unwrap();
+        let _live = inject_live(&client, 99, "live#0", 7);
+        let ping = Frame::Ping(nya_proto::Ping {
+            seq: 1,
+            sent_at_ms: 0,
+        });
+        for _ in 0..80 {
+            let _ = client.send_on_path(stall_id, ping.clone());
+        }
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert!(
+            client.get_path(stall_id).is_none(),
+            "blocked writer must path_failed that dest"
+        );
+        assert!(
+            client.get_path(99).is_some(),
+            "sibling dest must stay up"
+        );
+        let _ = tokio::time::timeout(Duration::from_millis(500), done).await;
+        client.shutdown();
+    }
+
+    struct WarnCap(std::sync::Arc<Mutex<Vec<(String, String)>>>);
+    impl tracing::Subscriber for WarnCap {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::Id {
+            tracing::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::Id, _: &tracing::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Msg(String);
+            impl tracing::field::Visit for Msg {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.0 = format!("{value:?}");
+                    }
+                }
+                fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                    if field.name() == "message" {
+                        self.0 = value.to_string();
+                    }
+                }
+            }
+            let mut msg = Msg(String::new());
+            event.record(&mut msg);
+            self.0.lock().unwrap().push((
+                event.metadata().level().as_str().to_string(),
+                msg.0,
+            ));
+        }
+        fn enter(&self, _: &tracing::Id) {}
+        fn exit(&self, _: &tracing::Id) {}
+    }
+
+    fn warn_read_failed(ev: &[(String, String)]) -> bool {
+        ev.iter()
+            .any(|(l, m)| l == "WARN" && m.contains("path read failed"))
+    }
+
+    struct InjectEof<T> {
+        inner: T,
+        eof: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl<T: AsyncRead + Unpin> AsyncRead for InjectEof<T> {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if self.eof.load(Ordering::SeqCst) {
+                return Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "peer closed connection without sending TLS close_notify",
+                )));
+            }
+            let r = Pin::new(&mut self.inner).poll_read(cx, buf);
+            if self.eof.load(Ordering::SeqCst) {
+                return Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "peer closed connection without sending TLS close_notify",
+                )));
+            }
+            r
+        }
+    }
+
+    impl<T: AsyncWrite + Unpin> AsyncWrite for InjectEof<T> {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<Result<usize, std::io::Error>> {
+            Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Result<(), std::io::Error>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Result<(), std::io::Error>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    #[tokio::test]
+    async fn unexpected_eof_on_up_path_warns() {
+        let store = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let _guard = tracing::subscriber::set_default(WarnCap(store.clone()));
+        let client = Session::new_client(SessionConfig::default());
+        let (a, mut b) = duplex(64 * 1024);
+        let trip = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done = client.start_path(
+            "p1".into(),
+            InjectEof {
+                inner: a,
+                eof: trip.clone(),
+            },
+        );
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        trip.store(true, Ordering::SeqCst);
+        let _ = b.write_all(&[1]).await;
+        let _ = tokio::time::timeout(Duration::from_millis(500), done).await;
+        client.shutdown();
+        let ev = store.lock().unwrap().clone();
+        assert!(
+            warn_read_failed(&ev),
+            "UP unexpected-eof must WARN, got {ev:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unexpected_eof_after_local_down_does_not_warn() {
+        let store = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let _guard = tracing::subscriber::set_default(WarnCap(store.clone()));
+        let client = Session::new_client(SessionConfig::default());
+        let (a, mut b) = duplex(64 * 1024);
+        let trip = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done = client.start_path(
+            "p1".into(),
+            InjectEof {
+                inner: a,
+                eof: trip.clone(),
+            },
+        );
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        let id = *client.inner.paths.lock().unwrap().keys().next().unwrap();
+        client.path_failed(id);
+        trip.store(true, Ordering::SeqCst);
+        let _ = b.write_all(&[1]).await;
+        let _ = tokio::time::timeout(Duration::from_millis(500), done).await;
+        client.shutdown();
+        let ev = store.lock().unwrap().clone();
+        assert!(
+            !warn_read_failed(&ev),
+            "local DOWN unexpected-eof must not WARN, got {ev:?}"
+        );
     }
 }

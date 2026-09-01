@@ -47,6 +47,8 @@ pub struct PathState {
     pub state: AtomicU8,
     ping_seq: AtomicU64,
     pending_ping: std::sync::Mutex<HashMap<u64, Instant>>,
+    /// Instant kept after expire so a late Pong can still sample RTT.
+    late_ping: std::sync::Mutex<HashMap<u64, Instant>>,
     /// How long fast RTT must stay high before stable RTT is raised.
     pub stable_up_hold_us: AtomicU64,
     high_since: std::sync::Mutex<Option<Instant>>,
@@ -98,6 +100,7 @@ impl PathState {
             state: AtomicU8::new(STATE_UP),
             ping_seq: AtomicU64::new(1),
             pending_ping: std::sync::Mutex::new(HashMap::new()),
+            late_ping: std::sync::Mutex::new(HashMap::new()),
             stable_up_hold_us: AtomicU64::new(1_000_000),
             high_since: std::sync::Mutex::new(None),
             class_high_since: std::sync::Mutex::new(None),
@@ -276,12 +279,30 @@ impl PathState {
         self.is_alive() && self.pending_ping_count() == 0 && ago >= ping_every
     }
 
-    /// Drop pings with no Pong within `max_age`. Returns how many were expired.
+    /// Move Instant from pending to late when older than `max_age`.
+    /// Returns how many were expired (probe_miss). Does not drop Instant.
     pub fn expire_stale_pings(&self, max_age: Duration) -> u64 {
-        let mut g = self.pending_ping.lock().unwrap();
-        let n0 = g.len();
-        g.retain(|_, t| t.elapsed() < max_age);
-        n0.saturating_sub(g.len()) as u64
+        let mut pending = self.pending_ping.lock().unwrap();
+        let mut late = self.late_ping.lock().unwrap();
+        let stale: Vec<u64> = pending
+            .iter()
+            .filter(|(_, t)| t.elapsed() >= max_age)
+            .map(|(seq, _)| *seq)
+            .collect();
+        let n = stale.len() as u64;
+        for seq in stale {
+            if let Some(t0) = pending.remove(&seq) {
+                late.insert(seq, t0);
+            }
+        }
+        n
+    }
+
+    pub fn drop_ancient_pings(&self, max_age: Duration) {
+        let mut pending = self.pending_ping.lock().unwrap();
+        let mut late = self.late_ping.lock().unwrap();
+        pending.retain(|_, t| t.elapsed() < max_age);
+        late.retain(|_, t| t.elapsed() < max_age);
     }
 
     pub fn note_tx(&self) {
@@ -476,11 +497,16 @@ impl PathState {
 
     pub fn next_ping(&self) -> Ping {
         let seq = self.ping_seq.fetch_add(1, Ordering::Relaxed);
-        let mut g = self.pending_ping.lock().unwrap();
-        if g.len() > Tuning::STANDARD.pending_ping_max {
-            g.clear();
+        let mut pending = self.pending_ping.lock().unwrap();
+        let mut late = self.late_ping.lock().unwrap();
+        let cap = Tuning::STANDARD.pending_ping_max;
+        while pending.len() + late.len() >= cap {
+            let Some(oldest) = late.iter().min_by_key(|(_, t)| *t).map(|(k, _)| *k) else {
+                break;
+            };
+            late.remove(&oldest);
         }
-        g.insert(seq, Instant::now());
+        pending.insert(seq, Instant::now());
         Ping {
             seq,
             sent_at_ms: now_ms(),
@@ -489,36 +515,43 @@ impl PathState {
 
     /// Prefer local Instant (µs) over the millisecond wall-clock echo.
     pub fn on_pong(&self, seq: u64, sent_at_ms: u64) {
-        self.on_pong_record(seq, sent_at_ms, true);
+        self.on_pong_record(seq, sent_at_ms, true, None);
     }
 
-    /// Always clear the pending ping (degrade clocks). Skip `record_rtt`
-    /// when the sample rode behind bulk inflight.
-    ///
-    /// Instant sample is preferred. If `expire_stale_pings` already dropped
-    /// the Instant: a **known** path ignores the wall-clock (TCP min-RTO
-    /// late Pong must not poison EWMA); an **unknown** path still takes a
-    /// capped first sample so a 60–200 ms dest can freeze class.
-    pub fn on_pong_record(&self, seq: u64, sent_at_ms: u64, record: bool) {
-        let started = self.pending_ping.lock().unwrap().remove(&seq);
+    pub(crate) fn is_tls_unexpected_eof(e: &std::io::Error) -> bool {
+        e.kind() == std::io::ErrorKind::UnexpectedEof
+    }
+
+    /// Always clear the pending/late ping. Skip `record_rtt` when the
+    /// sample rode behind bulk inflight. No wall-clock fallback.
+    pub fn on_pong_record(
+        &self,
+        seq: u64,
+        _sent_at_ms: u64,
+        record: bool,
+        cap: Option<Duration>,
+    ) {
+        let started = {
+            let mut pending = self.pending_ping.lock().unwrap();
+            pending.remove(&seq)
+        };
+        let started = match started {
+            Some(t0) => Some(t0),
+            None => self.late_ping.lock().unwrap().remove(&seq),
+        };
         if !record {
             return;
         }
-        if let Some(t0) = started {
-            self.record_rtt(t0.elapsed());
+        let Some(t0) = started else {
             return;
-        }
-        if self.rtt_known() {
-            return;
-        }
-        let now = now_ms();
-        if now >= sent_at_ms {
-            let sample = Duration::from_millis(now - sent_at_ms);
-            let t = &Tuning::STANDARD;
-            if sample > t.ack_rtt_min && sample < t.ack_rtt_max {
-                self.record_rtt(sample);
+        };
+        let sample = t0.elapsed();
+        if let Some(cap) = cap {
+            if sample > cap {
+                return;
             }
         }
+        self.record_rtt(sample);
     }
 }
 
@@ -581,6 +614,7 @@ pub fn spawn_path_io<T>(
         }
 
         let (close_tx, mut close_rx) = tokio::sync::oneshot::channel::<()>();
+        let ping_max = session.config().ping_interval_max;
 
         let session_r = session.clone();
         let path_r = path.clone();
@@ -592,6 +626,10 @@ pub fn spawn_path_io<T>(
                         return Ok(());
                     }
                     Some(Err(e)) => {
+                        if PathState::is_tls_unexpected_eof(&e) && !path_r.is_alive() {
+                            debug!(path = %path_r.name, "path eof");
+                            return Ok(());
+                        }
                         warn!(path = %path_r.name, error = %e, "path read failed");
                         return Err(e);
                     }
@@ -613,66 +651,158 @@ pub fn spawn_path_io<T>(
             }
         });
 
+        enum WriteOne {
+            Sent,
+            Closed,
+            TimedOut,
+            Io(std::io::Error),
+        }
+
         let session_w = session.clone();
         let path_w = path.clone();
         let mut write_task = tokio::spawn(async move {
             let mut next_ping = tokio::time::Instant::now();
             loop {
-                if session_w.is_dead() || !path_w.is_alive() {
-                    return Ok(());
-                }
                 let ping_every = session_w.probe_interval_for(&path_w);
+                let deadline = session_w.write_deadline(path_w.id);
+                let ping_due = tokio::time::Instant::now() >= next_ping
+                    && path_w.is_alive()
+                    && !session_w.is_dead()
+                    && path_w.should_send_ping(path_w.last_rx_ago(), ping_every);
+
                 tokio::select! {
                     biased;
                     _ = &mut close_rx => {
-                        let _ = writer.close().await;
+                        let _ = tokio::time::timeout(ping_max, writer.close()).await;
                         return Ok(());
                     }
-                    out = urgent.recv() => {
-                        let Some(frame) = out else { return Ok(()); };
-                        path_w.note_dequeue(true);
-                        if let Err(e) = send_frame(&mut writer, &session_w, &path_w, frame).await {
-                            warn!(path = %path_w.name, error = %e, "path write failed");
-                            return Err(e);
-                        }
-                    }
-                    out = rx.recv() => {
-                        let Some(frame) = out else { return Ok(()); };
-                        path_w.note_dequeue(false);
-                        if let Err(e) = send_frame(&mut writer, &session_w, &path_w, frame).await {
-                            warn!(path = %path_w.name, error = %e, "path write failed");
-                            return Err(e);
-                        }
-                    }
-                    _ = tokio::time::sleep_until(next_ping) => {
-                        if session_w.is_dead() || !path_w.is_alive() {
-                            return Ok(());
-                        }
-                        let ago = path_w.last_rx_ago();
-                        if path_w.should_send_ping(ago, ping_every) {
-                            let ping = path_w.next_ping();
-                            if let Err(e) = send_frame(
-                                &mut writer,
-                                &session_w,
-                                &path_w,
-                                Frame::Ping(ping),
-                            )
-                            .await
-                            {
+                    _ = std::future::ready(()), if ping_due => {
+                        let ping = path_w.next_ping();
+                        match write_one(
+                            &mut writer,
+                            &mut close_rx,
+                            deadline,
+                            ping_max,
+                            &session_w,
+                            &path_w,
+                            Frame::Ping(ping),
+                        )
+                        .await
+                        {
+                            WriteOne::Sent => {
+                                next_ping = tokio::time::Instant::now() + ping_every;
+                            }
+                            WriteOne::Closed => return Ok(()),
+                            WriteOne::TimedOut => {
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::TimedOut,
+                                    "path write",
+                                ));
+                            }
+                            WriteOne::Io(e) => {
                                 warn!(path = %path_w.name, error = %e, "path ping failed");
                                 return Err(e);
                             }
-                            next_ping = tokio::time::Instant::now() + ping_every;
-                        } else if ago < ping_every {
-                            next_ping = tokio::time::Instant::now()
-                                + ping_every.saturating_sub(ago);
-                        } else {
-                            next_ping = tokio::time::Instant::now() + ping_every;
                         }
                     }
+                    out = urgent.recv() => {
+                        let Some(frame) = out else {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::BrokenPipe,
+                                "urgent writer closed",
+                            ));
+                        };
+                        path_w.note_dequeue(true);
+                        match write_one(
+                            &mut writer,
+                            &mut close_rx,
+                            deadline,
+                            ping_max,
+                            &session_w,
+                            &path_w,
+                            frame,
+                        )
+                        .await
+                        {
+                            WriteOne::Sent => {}
+                            WriteOne::Closed => return Ok(()),
+                            WriteOne::TimedOut => {
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::TimedOut,
+                                    "path write",
+                                ));
+                            }
+                            WriteOne::Io(e) => {
+                                warn!(path = %path_w.name, error = %e, "path write failed");
+                                return Err(e);
+                            }
+                        }
+                    }
+                    out = rx.recv() => {
+                        let Some(frame) = out else {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::BrokenPipe,
+                                "bulk writer closed",
+                            ));
+                        };
+                        path_w.note_dequeue(false);
+                        match write_one(
+                            &mut writer,
+                            &mut close_rx,
+                            deadline,
+                            ping_max,
+                            &session_w,
+                            &path_w,
+                            frame,
+                        )
+                        .await
+                        {
+                            WriteOne::Sent => {}
+                            WriteOne::Closed => return Ok(()),
+                            WriteOne::TimedOut => {
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::TimedOut,
+                                    "path write",
+                                ));
+                            }
+                            WriteOne::Io(e) => {
+                                warn!(path = %path_w.name, error = %e, "path write failed");
+                                return Err(e);
+                            }
+                        }
+                    }
+                    _ = tokio::time::sleep_until(next_ping), if !ping_due => {}
                 }
             }
         });
+
+        async fn write_one<S>(
+            writer: &mut S,
+            close_rx: &mut tokio::sync::oneshot::Receiver<()>,
+            deadline: Duration,
+            ping_max: Duration,
+            session: &Session,
+            path: &PathState,
+            frame: Frame,
+        ) -> WriteOne
+        where
+            S: Sink<Bytes, Error = std::io::Error> + Unpin,
+        {
+            tokio::select! {
+                biased;
+                _ = &mut *close_rx => {
+                    let _ = tokio::time::timeout(ping_max, writer.close()).await;
+                    WriteOne::Closed
+                }
+                r = tokio::time::timeout(deadline, send_frame(writer, session, path, frame)) => {
+                    match r {
+                        Ok(Ok(())) => WriteOne::Sent,
+                        Ok(Err(e)) => WriteOne::Io(e),
+                        Err(_) => WriteOne::TimedOut,
+                    }
+                }
+            }
+        }
 
         enum Exit {
             Idle,
@@ -696,13 +826,13 @@ pub fn spawn_path_io<T>(
             } => Exit::Down,
         };
         match exit {
-            Exit::Idle => {
+            Exit::Idle | Exit::Down => {
                 let _ = close_tx.send(());
                 let _ = tokio::time::timeout(ping_max, &mut write_task).await;
                 read_task.abort();
                 write_task.abort();
             }
-            Exit::Down | Exit::Child => {
+            Exit::Child => {
                 read_task.abort();
                 write_task.abort();
             }
@@ -741,7 +871,7 @@ mod tests {
         let p = path();
         p.record_rtt(Duration::from_millis(7));
         let before = p.rtt_ewma_us.load(Ordering::Relaxed);
-        p.on_pong_record(99, 0, true);
+        p.on_pong_record(99, 0, true, None);
         assert_eq!(
             p.rtt_ewma_us.load(Ordering::Relaxed),
             before,
@@ -753,12 +883,32 @@ mod tests {
     fn expired_pong_unknown_path_records_first_sample() {
         let p = path();
         assert!(!p.rtt_known());
-        p.on_pong_record(1, now_ms().saturating_sub(80), true);
-        let us = p.rtt_ewma_us.load(Ordering::Relaxed);
-        assert!(
-            (60_000..120_000).contains(&us),
-            "unknown first sample must land near 80 ms, got {us}"
+        let ping = p.next_ping();
+        let miss = p.expire_stale_pings(Duration::ZERO);
+        assert_eq!(miss, 1);
+        assert_eq!(p.pending_ping_count(), 0);
+        std::thread::sleep(Duration::from_millis(12));
+        p.on_pong_record(
+            ping.seq,
+            ping.sent_at_ms,
+            true,
+            Some(Duration::from_millis(300)),
         );
+        assert!(p.rtt_known(), "late Instant must still freeze unknown RTT");
+    }
+
+    #[test]
+    fn unknown_instant_957ms_not_recorded() {
+        let p = path();
+        let ping = p.next_ping();
+        std::thread::sleep(Duration::from_millis(5));
+        p.on_pong_record(
+            ping.seq,
+            ping.sent_at_ms,
+            true,
+            Some(Duration::from_millis(1)),
+        );
+        assert!(!p.rtt_known(), "sample above unknown cap must be ignored");
     }
 
     #[test]
@@ -767,7 +917,12 @@ mod tests {
         p.record_rtt(Duration::from_millis(7));
         let ping = p.next_ping();
         std::thread::sleep(Duration::from_millis(12));
-        p.on_pong_record(ping.seq, ping.sent_at_ms, true);
+        p.on_pong_record(
+            ping.seq,
+            ping.sent_at_ms,
+            true,
+            Some(Duration::from_millis(50)),
+        );
         let after = p.rtt_ewma_us.load(Ordering::Relaxed);
         assert!(
             after > 7_000,
@@ -1130,6 +1285,71 @@ mod tests {
         assert!(!p.should_send_ping(every, every));
         p.mark_degraded();
         assert!(!p.should_send_ping(every, every));
+    }
+
+    #[test]
+    fn expire_stale_allows_next_probe() {
+        let p = path();
+        p.next_ping();
+        let every = Duration::from_millis(10);
+        assert!(!p.should_send_ping(every, every));
+        let miss = p.expire_stale_pings(Duration::ZERO);
+        assert_eq!(miss, 1);
+        assert_eq!(p.pending_ping_count(), 0);
+        assert!(p.should_send_ping(every, every));
+    }
+
+    #[test]
+    fn record_false_discards_instant() {
+        let p = path();
+        let ping = p.next_ping();
+        std::thread::sleep(Duration::from_millis(5));
+        p.on_pong_record(ping.seq, ping.sent_at_ms, false, None);
+        assert!(!p.rtt_known());
+        assert_eq!(p.pending_ping_count(), 0);
+    }
+
+    #[test]
+    fn known_instant_above_loss_timeout_not_recorded() {
+        let p = path();
+        p.record_rtt(Duration::from_millis(7));
+        let before = p.rtt_ewma_us.load(Ordering::Relaxed);
+        let ping = p.next_ping();
+        std::thread::sleep(Duration::from_millis(25));
+        p.on_pong_record(
+            ping.seq,
+            ping.sent_at_ms,
+            true,
+            Some(Duration::from_millis(20)),
+        );
+        assert_eq!(
+            p.rtt_ewma_us.load(Ordering::Relaxed),
+            before,
+            "known Instant above loss_timeout cap must not move EWMA"
+        );
+    }
+
+    #[test]
+    fn next_ping_overflow_drops_oldest_late() {
+        let p = path();
+        let first = p.next_ping();
+        p.expire_stale_pings(Duration::ZERO);
+        for _ in 1..Tuning::STANDARD.pending_ping_max {
+            p.next_ping();
+            p.expire_stale_pings(Duration::ZERO);
+        }
+        assert_eq!(p.pending_ping_count(), 0);
+        p.next_ping();
+        p.on_pong_record(
+            first.seq,
+            first.sent_at_ms,
+            true,
+            Some(Duration::from_millis(300)),
+        );
+        assert!(
+            !p.rtt_known(),
+            "overflow must drop oldest late Instant, never clear pending"
+        );
     }
 
     #[test]

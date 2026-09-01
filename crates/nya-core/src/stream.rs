@@ -26,6 +26,8 @@ pub struct Unacked {
     pub path_id: u32,
     pub last_sent: Instant,
     pub tried: Vec<u32>,
+    /// Rate-limit failed retry attempts without moving last_sent (ACK RTT).
+    pub retry_not_before: Instant,
 }
 
 pub struct StreamState {

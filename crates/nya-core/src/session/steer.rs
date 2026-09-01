@@ -57,6 +57,7 @@ impl Session {
                     .probe_miss
                     .fetch_add(miss, Ordering::Relaxed);
             }
+            p.drop_ancient_pings(self.inner.cfg.tuning.ack_rtt_max);
             miss_by_id.insert(p.id, miss);
         }
 
