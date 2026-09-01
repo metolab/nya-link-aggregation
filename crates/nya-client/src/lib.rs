@@ -219,6 +219,7 @@ async fn connect_one(
                         .handshake_create_ok
                         .fetch_add(1, Ordering::Relaxed);
                     join.set_id(sid);
+                    session.set_session_id(&sid);
                     join.ready.notify_waiters();
                     info!(path = %path_name, "session created");
                 }
@@ -254,6 +255,7 @@ async fn connect_one(
             .await
             {
                 Ok(Ok(())) => {
+                    session.set_session_id(&sid);
                     session
                         .process()
                         .handshake_join_ok

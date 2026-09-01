@@ -7,7 +7,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{info, warn, Instrument};
 
-use nya_core::{HopClock, HopOutcome, HopProbe, HopRole, HopSample, Session, TunnelStream};
+use nya_core::{
+    io_err_kind, HopClock, HopOutcome, HopProbe, HopRole, HopSample, Session, TunnelStream,
+};
 use nya_proto::Target;
 
 use crate::config::Inbound;
@@ -193,9 +195,14 @@ async fn serve_socks5(mut tcp: TcpStream, session: Session) -> Result<()> {
         otel.kind = "server",
         nya.host = %host,
         nya.port = port,
+        nya.session_fp = tracing::field::Empty,
+        nya.stream_id = tracing::field::Empty,
         otel.status_code = tracing::field::Empty,
         nya.open_us = tracing::field::Empty,
     );
+    if let Some(fp) = session.session_fp() {
+        span.record("nya.session_fp", fp.as_str());
+    }
     let t0 = Instant::now();
     let opened = session
         .open_stream(Target {
@@ -208,6 +215,7 @@ async fn serve_socks5(mut tcp: TcpStream, session: Session) -> Result<()> {
     span.record("nya.open_us", open_us);
     match opened {
         Ok(tun) => {
+            span.record("nya.stream_id", tun.id);
             drop(span);
             session
                 .process()
@@ -238,6 +246,7 @@ fn record_open_fail(session: &Session, host: String, open_us: u64) {
         role: HopRole::Client,
         stream_id: 0,
         host,
+        session_fp: session.session_fp().unwrap_or_default(),
         outcome: HopOutcome::OpenFail,
         open_us: Some(open_us),
         copy_us: None,
@@ -257,20 +266,24 @@ async fn copy_with_hop(
     let mut overlay = HopProbe::wrap(tun, clock.clone());
     let t_copy = Instant::now();
     let copy = tokio::io::copy_bidirectional(&mut tcp, &mut overlay).await;
+    let (outcome, copy_err) = match &copy {
+        Ok(_) => (HopOutcome::Ok, None),
+        Err(e) => (HopOutcome::CopyErr, Some(io_err_kind(e))),
+    };
     session.process().record_hop(HopSample {
         role: HopRole::Client,
         stream_id,
         host,
-        outcome: if copy.is_ok() {
-            HopOutcome::Ok
-        } else {
-            HopOutcome::CopyErr
-        },
+        session_fp: session.session_fp().unwrap_or_default(),
+        outcome,
         copy_us: Some((t_copy.elapsed().as_micros() as u64).max(1)),
         open_us: Some(open_us),
         first_rx_us: clock.first_rx_us(),
         last_rx_us: clock.last_rx_us(),
         first_tx_us: clock.first_tx_us(),
+        rx_bytes: Some(clock.rx_bytes()),
+        tx_bytes: Some(clock.tx_bytes()),
+        copy_err,
         ..Default::default()
     });
 }

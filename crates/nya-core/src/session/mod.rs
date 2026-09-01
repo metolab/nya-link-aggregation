@@ -71,6 +71,10 @@ impl IncomingStream {
     pub fn process(&self) -> Arc<ProcessCounters> {
         self.session.process()
     }
+
+    pub fn session_fp(&self) -> Option<String> {
+        self.session.session_fp()
+    }
 }
 
 pub(crate) struct Inner {
@@ -92,6 +96,7 @@ pub(crate) struct Inner {
     opens: Mutex<HashMap<u32, OpenUnacked>>,
     closes: Mutex<HashMap<u32, CloseUnacked>>,
     pending_early: Mutex<HashMap<u32, Vec<PendingEarly>>>,
+    session_fp: Mutex<String>,
 }
 
 #[derive(Clone)]
@@ -137,6 +142,7 @@ impl Session {
             opens: Mutex::new(HashMap::new()),
             closes: Mutex::new(HashMap::new()),
             pending_early: Mutex::new(HashMap::new()),
+            session_fp: Mutex::new(String::new()),
         });
         let session = Self { inner };
         session.spawn_maintenance();
@@ -145,6 +151,20 @@ impl Session {
 
     pub fn process(&self) -> Arc<ProcessCounters> {
         self.inner.process.clone()
+    }
+
+    /// First 4 bytes of the overlay session id, hex. Replaces on Create-retry.
+    pub fn set_session_id(&self, id: &[u8; 16]) {
+        *self.inner.session_fp.lock().unwrap() = crate::hop::session_fp_hex(id);
+    }
+
+    pub fn session_fp(&self) -> Option<String> {
+        let s = self.inner.session_fp.lock().unwrap().clone();
+        if s.is_empty() {
+            None
+        } else {
+            Some(s)
+        }
     }
 
     pub fn config(&self) -> &SessionConfig {
@@ -1443,6 +1463,7 @@ impl SessionTable {
             Some(tx),
             Some(self.process.clone()),
         );
+        session.set_session_id(&session_id);
         self.sessions
             .lock()
             .unwrap()
@@ -1469,6 +1490,27 @@ mod tests {
     use std::pin::Pin;
     use std::task::{Context, Poll};
     use tokio::io::{duplex, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+
+    #[tokio::test]
+    async fn create_sets_session_fp_and_recreate_replaces() {
+        let table = SessionTable::new(SessionConfig::default());
+        let mut id = [0u8; 16];
+        id[0] = 0xde;
+        id[1] = 0xad;
+        id[2] = 0xbe;
+        id[3] = 0xef;
+        let (s, _rx) = table.create_with_incoming(id).unwrap();
+        assert_eq!(s.session_fp().as_deref(), Some("deadbeef"));
+        let mut id2 = [0u8; 16];
+        id2[0] = 0x4c;
+        id2[1] = 0xcd;
+        id2[2] = 0x39;
+        id2[3] = 0x13;
+        s.set_session_id(&id2);
+        assert_eq!(s.session_fp().as_deref(), Some("4ccd3913"));
+        s.shutdown();
+        table.shutdown_all();
+    }
 
     fn pair() -> (Session, Session, mpsc::Receiver<IncomingStream>) {
         let mut cfg = SessionConfig::default();

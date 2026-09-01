@@ -617,6 +617,7 @@ impl ProcessCounters {
             target: "nya_core::hop",
             event = "hop",
             stream_id = sample.stream_id,
+            session_fp = sample.session_fp.as_str(),
             host = %sample.host,
             outcome = sample.outcome.as_str(),
             hops = %sample.format_debug_fields(),

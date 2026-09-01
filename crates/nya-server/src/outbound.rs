@@ -7,8 +7,8 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn, Instrument};
 
 use nya_core::{
-    connect_origin_meta, HopClock, HopOutcome, HopProbe, HopRole, HopSample, IncomingStream,
-    OriginDialMeta, OriginPeerSlots, Tuning,
+    connect_origin_meta, io_err_kind, HopClock, HopOutcome, HopProbe, HopRole, HopSample,
+    IncomingStream, OriginDialMeta, OriginPeerSlots, Tuning,
 };
 use nya_proto::ResetReason;
 
@@ -21,6 +21,8 @@ pub async fn handle_incoming(mut incoming: mpsc::Receiver<IncomingStream>) {
                 "nya.outbound.dial",
                 otel.kind = "client",
                 server.address = %target,
+                nya.stream_id = inc.stream_id,
+                nya.session_fp = tracing::field::Empty,
                 otel.status_code = tracing::field::Empty,
                 nya.dial_us = tracing::field::Empty,
                 nya.lookup_a_us = tracing::field::Empty,
@@ -29,6 +31,9 @@ pub async fn handle_incoming(mut incoming: mpsc::Receiver<IncomingStream>) {
                 nya.n_v6 = tracing::field::Empty,
                 nya.winner = tracing::field::Empty,
             );
+            if let Some(fp) = inc.session_fp() {
+                span.record("nya.session_fp", fp.as_str());
+            }
             let t0 = Instant::now();
             let connected = connect_origin_meta(
                 inc.target.host.as_str(),
@@ -80,6 +85,7 @@ pub async fn handle_incoming(mut incoming: mpsc::Receiver<IncomingStream>) {
                     let process = inc.process();
                     let stream_id = inc.stream_id;
                     let host = inc.target.host.clone();
+                    let session_fp = inc.session_fp().unwrap_or_default();
                     let origin_clock = HopClock::new();
                     let overlay_clock = HopClock::new();
                     let slots = Arc::new(OriginPeerSlots::default());
@@ -88,15 +94,16 @@ pub async fn handle_incoming(mut incoming: mpsc::Receiver<IncomingStream>) {
                     let mut overlay = HopProbe::wrap(inc.io, overlay_clock.clone());
                     let t_copy = Instant::now();
                     let copy = tokio::io::copy_bidirectional(&mut origin, &mut overlay).await;
+                    let (outcome, copy_err) = match &copy {
+                        Ok(_) => (HopOutcome::Ok, None),
+                        Err(e) => (HopOutcome::CopyErr, Some(io_err_kind(e))),
+                    };
                     process.record_hop(HopSample {
                         role: HopRole::Server,
                         stream_id,
                         host,
-                        outcome: if copy.is_ok() {
-                            HopOutcome::Ok
-                        } else {
-                            HopOutcome::CopyErr
-                        },
+                        session_fp,
+                        outcome,
                         copy_us: Some((t_copy.elapsed().as_micros() as u64).max(1)),
                         dial_us: Some(dial_us),
                         origin_first_rx_us: origin_clock.first_rx_us(),
@@ -107,6 +114,9 @@ pub async fn handle_incoming(mut incoming: mpsc::Receiver<IncomingStream>) {
                         max_gap: slots.max_gap_us(),
                         crx_at_gap: slots.crx_at_gap(),
                         origin_at_gap: slots.origin_at_gap(),
+                        rx_bytes: Some(origin_clock.rx_bytes()),
+                        tx_bytes: Some(origin_clock.tx_bytes()),
+                        copy_err,
                         ..Default::default()
                     });
                 }
@@ -119,6 +129,7 @@ pub async fn handle_incoming(mut incoming: mpsc::Receiver<IncomingStream>) {
                         role: HopRole::Server,
                         stream_id: inc.stream_id,
                         host: inc.target.host.clone(),
+                        session_fp: inc.session_fp().unwrap_or_default(),
                         outcome: HopOutcome::DialFail,
                         dial_us: Some(dial_us),
                         copy_us: None,

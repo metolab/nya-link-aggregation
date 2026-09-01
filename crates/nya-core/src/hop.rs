@@ -31,6 +31,8 @@ pub struct HopClock {
     first_rx_us: AtomicU64,
     first_tx_us: AtomicU64,
     last_rx_us: AtomicU64,
+    rx_bytes: AtomicU64,
+    tx_bytes: AtomicU64,
 }
 
 impl HopClock {
@@ -40,6 +42,8 @@ impl HopClock {
             first_rx_us: AtomicU64::new(0),
             first_tx_us: AtomicU64::new(0),
             last_rx_us: AtomicU64::new(0),
+            rx_bytes: AtomicU64::new(0),
+            tx_bytes: AtomicU64::new(0),
         })
     }
 
@@ -54,6 +58,24 @@ impl HopClock {
     pub fn last_rx_us(&self) -> Option<u64> {
         nz(self.last_rx_us.load(Ordering::Relaxed))
     }
+
+    pub fn rx_bytes(&self) -> u64 {
+        self.rx_bytes.load(Ordering::Relaxed)
+    }
+
+    pub fn tx_bytes(&self) -> u64 {
+        self.tx_bytes.load(Ordering::Relaxed)
+    }
+}
+
+/// First 4 bytes of the 16-byte session id, hex. Join key across
+/// client/server hops when the server has more than one session.
+pub fn session_fp_hex(id: &[u8; 16]) -> String {
+    format!("{:02x}{:02x}{:02x}{:02x}", id[0], id[1], id[2], id[3])
+}
+
+pub fn io_err_kind(e: &io::Error) -> String {
+    format!("{:?}", e.kind())
 }
 
 /// Origin-probe peer samples. All 0 = never. Debug + tail only; never observe.
@@ -140,6 +162,8 @@ impl<T: AsyncRead + Unpin> AsyncRead for HopProbe<T> {
         let polled = Pin::new(&mut self.inner).poll_read(cx, buf);
         if let Poll::Ready(Ok(())) = &polled {
             if buf.filled().len() > before {
+                let n = (buf.filled().len() - before) as u64;
+                self.clock.rx_bytes.fetch_add(n, Ordering::Relaxed);
                 let us = elapsed_us(self.clock.start);
                 let _ = self.clock.first_rx_us.compare_exchange(
                     0,
@@ -173,6 +197,7 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for HopProbe<T> {
         let polled = Pin::new(&mut self.inner).poll_write(cx, buf);
         if let Poll::Ready(Ok(n)) = &polled {
             if *n > 0 {
+                self.clock.tx_bytes.fetch_add(*n as u64, Ordering::Relaxed);
                 let us = elapsed_us(self.clock.start);
                 let _ = self.clock.first_tx_us.compare_exchange(
                     0,
@@ -235,6 +260,8 @@ pub struct HopSample {
     pub role: HopRole,
     pub stream_id: u32,
     pub host: String,
+    /// 8 hex chars; empty if the session id was never set (unit tests).
+    pub session_fp: String,
     pub outcome: HopOutcome,
     pub copy_us: Option<u64>,
     pub open_us: Option<u64>,
@@ -250,6 +277,9 @@ pub struct HopSample {
     pub max_gap: Option<u64>,
     pub crx_at_gap: Option<u64>,
     pub origin_at_gap: Option<u64>,
+    pub rx_bytes: Option<u64>,
+    pub tx_bytes: Option<u64>,
+    pub copy_err: Option<String>,
 }
 
 impl HopSample {
@@ -297,6 +327,14 @@ impl HopSample {
         push(&mut parts, "max_gap", self.max_gap);
         push(&mut parts, "crx_at_gap", self.crx_at_gap);
         push(&mut parts, "origin_at_gap", self.origin_at_gap);
+        push(&mut parts, "rx_bytes", self.rx_bytes);
+        push(&mut parts, "tx_bytes", self.tx_bytes);
+        if !self.session_fp.is_empty() {
+            parts.push(format!("session_fp={}", self.session_fp));
+        }
+        if let Some(ref e) = self.copy_err {
+            parts.push(format!("copy_err={e}"));
+        }
         parts.join(" ")
     }
 
@@ -310,6 +348,7 @@ impl HopSample {
             otel.kind = "internal",
             nya.host = %self.host,
             nya.stream_id = self.stream_id,
+            nya.session_fp = tracing::field::Empty,
             nya.hop_role = self.role.as_str(),
             nya.outcome = self.outcome.as_str(),
             nya.copy_us = tracing::field::Empty,
@@ -326,11 +365,17 @@ impl HopSample {
             nya.max_gap_us = tracing::field::Empty,
             nya.crx_at_gap = tracing::field::Empty,
             nya.origin_at_gap = tracing::field::Empty,
+            nya.rx_bytes = tracing::field::Empty,
+            nya.tx_bytes = tracing::field::Empty,
+            nya.copy_err = tracing::field::Empty,
         );
         fn rec(span: &tracing::Span, name: &'static str, v: Option<u64>) {
             if let Some(v) = v {
                 span.record(name, v);
             }
+        }
+        if !self.session_fp.is_empty() {
+            span.record("nya.session_fp", self.session_fp.as_str());
         }
         rec(&span, "nya.copy_us", self.copy_us);
         rec(&span, "nya.open_us", self.open_us);
@@ -346,6 +391,11 @@ impl HopSample {
         rec(&span, "nya.max_gap_us", self.max_gap);
         rec(&span, "nya.crx_at_gap", self.crx_at_gap);
         rec(&span, "nya.origin_at_gap", self.origin_at_gap);
+        rec(&span, "nya.rx_bytes", self.rx_bytes);
+        rec(&span, "nya.tx_bytes", self.tx_bytes);
+        if let Some(ref e) = self.copy_err {
+            span.record("nya.copy_err", e.as_str());
+        }
         let _g = span.entered();
     }
 
@@ -357,6 +407,9 @@ impl HopSample {
             None => "-".to_string(),
         };
         let mut s = format!("{host} copy={copy}");
+        if !self.session_fp.is_empty() {
+            s.push_str(&format!(" sfp={}", self.session_fp));
+        }
         let copy_ran = self.copy_us.is_some();
         match self.role {
             HopRole::Client => {
@@ -379,6 +432,15 @@ impl HopSample {
                 push_dashable(&mut s, "crx_at_gap", self.crx_at_gap, copy_ran);
                 push_dashable(&mut s, "origin_at_gap", self.origin_at_gap, copy_ran);
             }
+        }
+        if let Some(v) = self.rx_bytes {
+            s.push_str(&format!(" rx={v}"));
+        }
+        if let Some(v) = self.tx_bytes {
+            s.push_str(&format!(" tx={v}"));
+        }
+        if let Some(ref e) = self.copy_err {
+            s.push_str(&format!(" err={e}"));
         }
         s.push_str(&format!(" sid={}", self.stream_id));
         s
@@ -824,6 +886,8 @@ mod tests {
         assert_eq!(n, 3);
         assert!(clock.first_rx_us().unwrap() >= 1);
         assert_eq!(clock.first_rx_us(), clock.last_rx_us());
+        assert_eq!(clock.rx_bytes(), 3);
+        assert_eq!(clock.tx_bytes(), 0);
     }
 
     #[tokio::test]
@@ -837,6 +901,7 @@ mod tests {
         assert_eq!(n, 0);
         assert!(clock.first_rx_us().is_none());
         assert!(clock.last_rx_us().is_none());
+        assert_eq!(clock.rx_bytes(), 0);
     }
 
     #[tokio::test]
@@ -849,6 +914,8 @@ mod tests {
         let n = b.read(&mut buf).await.unwrap();
         assert_eq!(n, 1);
         assert!(clock.first_tx_us().unwrap() >= 1);
+        assert_eq!(clock.tx_bytes(), 1);
+        assert_eq!(clock.rx_bytes(), 0);
     }
 
     #[tokio::test]
@@ -956,6 +1023,36 @@ mod tests {
             fail.format_tail(),
             "www.gstatic.com copy=- dial=8001000 sid=99"
         );
+        let joined = HopSample {
+            role: HopRole::Client,
+            stream_id: 22346,
+            host: "cp.cloudflare.com".into(),
+            session_fp: "a1b2c3d4".into(),
+            outcome: HopOutcome::CopyErr,
+            copy_us: Some(46_630),
+            open_us: Some(32),
+            first_rx_us: Some(14_688),
+            last_rx_us: Some(45_079),
+            rx_bytes: Some(1200),
+            tx_bytes: Some(517),
+            copy_err: Some("ConnectionReset".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            joined.format_tail(),
+            "cp.cloudflare.com copy=46630 sfp=a1b2c3d4 open=32 first_rx=14688 last_rx=45079 rx=1200 tx=517 err=ConnectionReset sid=22346"
+        );
+    }
+
+    #[test]
+    fn session_fp_hex_is_first_4_bytes() {
+        let mut id = [0u8; 16];
+        id[0] = 0x4c;
+        id[1] = 0xcd;
+        id[2] = 0x39;
+        id[3] = 0x13;
+        id[4] = 0xff;
+        assert_eq!(session_fp_hex(&id), "4ccd3913");
     }
 
     #[test]
