@@ -470,6 +470,12 @@ impl PathState {
     }
 
     #[cfg(test)]
+    pub(crate) fn backdate_up_since(&self, age: Duration) {
+        *self.up_since.lock().unwrap() =
+            Instant::now().checked_sub(age).unwrap_or_else(Instant::now);
+    }
+
+    #[cfg(test)]
     pub(crate) fn backdate_class_known(&self, age: Duration) {
         *self.class_known_since.lock().unwrap() =
             Some(Instant::now().checked_sub(age).unwrap_or_else(Instant::now));

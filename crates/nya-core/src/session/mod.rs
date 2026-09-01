@@ -94,6 +94,8 @@ pub(crate) struct Inner {
     metrics: Counters,
     process: Arc<ProcessCounters>,
     last_rtt_us: Mutex<HashMap<String, u64>>,
+    /// Last `up_since` age at `path_failed`, keyed by path name.
+    last_lived: Mutex<HashMap<String, Duration>>,
     opens: Mutex<HashMap<u32, OpenUnacked>>,
     closes: Mutex<HashMap<u32, CloseUnacked>>,
     pending_early: Mutex<HashMap<u32, Vec<PendingEarly>>>,
@@ -143,6 +145,7 @@ impl Session {
             metrics: Counters::default(),
             process,
             last_rtt_us: Mutex::new(HashMap::new()),
+            last_lived: Mutex::new(HashMap::new()),
             opens: Mutex::new(HashMap::new()),
             closes: Mutex::new(HashMap::new()),
             pending_early: Mutex::new(HashMap::new()),
@@ -358,6 +361,11 @@ impl Session {
         if prev == STATE_DOWN {
             return;
         }
+        self.inner
+            .last_lived
+            .lock()
+            .unwrap()
+            .insert(path.name.clone(), path.up_age());
         info!(path = %path.name, path_id, "path down");
         self.inner.metrics.path_down.fetch_add(1, Ordering::Relaxed);
         self.observe_failover(&path);
@@ -888,6 +896,17 @@ impl Session {
             .get(name)
             .copied()
             .map(Duration::from_micros)
+    }
+
+    pub fn last_path_lived(&self, name: &str) -> Option<Duration> {
+        self.inner.last_lived.lock().unwrap().get(name).copied()
+    }
+
+    /// Handshake-ok then silent-down is a flap, not a recovery. Reconnect
+    /// backoff resets only after the dest has been up for a hold.
+    pub fn path_lived_stable(&self, name: &str) -> bool {
+        self.last_path_lived(name)
+            .is_some_and(|d| d >= self.inner.cfg.tuning.stable_up_hold)
     }
 
     fn set_sticky(&self, stream_id: u32, path_id: u32) {
@@ -1681,6 +1700,32 @@ mod tests {
             .await
             .expect("add_path must complete after path_failed")
             .expect("oneshot");
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn short_lived_path_is_not_stable() {
+        let client = Session::new_client(SessionConfig::default());
+        inject_named(&client, 1, "nsix#1", 7);
+        assert!(!client.path_lived_stable("nsix#1"));
+        client.path_failed(1);
+        assert!(
+            !client.path_lived_stable("nsix#1"),
+            "handshake-ok then immediate down must keep reconnect backoff"
+        );
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn hold_aged_path_is_stable() {
+        let client = Session::new_client(SessionConfig::default());
+        let p = inject_named(&client, 1, "nsix#1", 7);
+        p.backdate_up_since(client.config().tuning.stable_up_hold);
+        client.path_failed(1);
+        assert!(
+            client.path_lived_stable("nsix#1"),
+            "a dest that stayed up for a hold is a real recovery"
+        );
         client.shutdown();
     }
 
