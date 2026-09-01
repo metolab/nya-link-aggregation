@@ -313,13 +313,18 @@ impl Session {
         }
         st.note_close_started();
         let second = st.recv_fin.load(Ordering::Relaxed);
+        let final_offset = Some(st.send_next.load(Ordering::Relaxed));
+        let close = StreamClose {
+            stream_id: id,
+            final_offset,
+        };
         let path_id = self.pick_pref(PickPref::Any);
         if let Some(path_id) = path_id {
-            self.remember_close(id, path_id, second);
-            if !self.send_on_path(path_id, Frame::StreamClose(StreamClose { stream_id: id })) {
+            self.remember_close(id, path_id, second, final_offset);
+            if !self.send_on_path(path_id, Frame::StreamClose(close.clone())) {
                 if let Some(alt) = self.pick_retry(path_id) {
-                    self.remember_close(id, alt, second);
-                    self.send_on_path(alt, Frame::StreamClose(StreamClose { stream_id: id }));
+                    self.remember_close(id, alt, second, final_offset);
+                    self.send_on_path(alt, Frame::StreamClose(close));
                 }
             }
         }
@@ -396,6 +401,10 @@ impl Session {
         if st.reset.load(Ordering::Relaxed) || st.recv_fin.load(Ordering::Relaxed) {
             return;
         }
+        let close_off = st.recv_close_off.load(Ordering::Relaxed);
+        if close_off != u64::MAX && data.offset >= close_off {
+            return;
+        }
         let mut buf = st.recv_buf.lock().unwrap();
         if data.offset < st.recv_next.load(Ordering::Relaxed) {
             drop(buf);
@@ -432,6 +441,7 @@ impl Session {
                 .store(crate::metrics::mono_ms().max(1), Ordering::Relaxed);
         }
         self.send_ack(st, ack_path);
+        self.try_finish_recv_close(st);
     }
 
     fn send_ack(&self, st: &StreamState, path_id: u32) {
@@ -495,16 +505,62 @@ impl Session {
         st.send_wait.notify_waiters();
     }
 
-    pub(super) fn on_peer_close(&self, id: u32) {
-        let Some(st) = self.get_stream(id) else {
+    pub(super) fn on_peer_close(&self, close: StreamClose) {
+        let Some(st) = self.get_stream(close.stream_id) else {
             return;
         };
         st.note_close_started();
+        let off = close
+            .final_offset
+            .unwrap_or_else(|| st.recv_next.load(Ordering::Relaxed));
+        let _ =
+            st.recv_close_off
+                .compare_exchange(u64::MAX, off, Ordering::SeqCst, Ordering::Relaxed);
+        self.try_finish_recv_close(&st);
+    }
+
+    fn apply_recv_fin(&self, st: &StreamState) {
         if !st.recv_fin.swap(true, Ordering::SeqCst) {
             let _ = st.inbound_tx.try_send(Inbound::Close);
         }
-        self.forget_close(id);
-        self.maybe_count_graceful(&st);
+        self.forget_close(st.id);
+        self.maybe_count_graceful(st);
+    }
+
+    fn try_finish_recv_close(&self, st: &StreamState) {
+        let off = st.recv_close_off.load(Ordering::Relaxed);
+        if off == u64::MAX || st.recv_fin.load(Ordering::Relaxed) {
+            return;
+        }
+        if st.recv_next.load(Ordering::Relaxed) < off {
+            return;
+        }
+        self.apply_recv_fin(st);
+    }
+
+    /// Peer Close beat in-flight DATA. Wait one loss_timeout, then FIN anyway.
+    pub(super) fn expire_recv_closes(&self) {
+        let wait = health::loss_timeout(&self.inner.cfg, self.min_known_rtt());
+        let wait_ms = wait.as_millis() as u64;
+        let now = crate::metrics::mono_ms();
+        let sts: Vec<Arc<StreamState>> = self
+            .inner
+            .streams
+            .lock()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect();
+        for st in sts {
+            let off = st.recv_close_off.load(Ordering::Relaxed);
+            if off == u64::MAX || st.recv_fin.load(Ordering::Relaxed) {
+                continue;
+            }
+            let start = st.close_started_ms.load(Ordering::Relaxed);
+            if start != 0 && now.saturating_sub(start) >= wait_ms {
+                self.apply_recv_fin(&st);
+            }
+        }
     }
 
     pub(super) fn on_peer_reset(&self, id: u32, reason: ResetReason) {

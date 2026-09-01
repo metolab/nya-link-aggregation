@@ -144,6 +144,8 @@ pub struct StreamAck {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamClose {
     pub stream_id: u32,
+    /// `send_next` at FIN. Absent on old peers (body is stream_id only).
+    pub final_offset: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -241,6 +243,9 @@ impl Frame {
             Frame::StreamClose(s) => {
                 o.push(T_CLOSE);
                 o.extend_from_slice(&s.stream_id.to_be_bytes());
+                if let Some(off) = s.final_offset {
+                    o.extend_from_slice(&off.to_be_bytes());
+                }
             }
             Frame::StreamReset(s) => {
                 o.push(T_RESET);
@@ -330,9 +335,18 @@ impl Frame {
                 acked_offset: p.u64()?,
                 window: p.u32()?,
             }),
-            T_CLOSE => Frame::StreamClose(StreamClose {
-                stream_id: p.u32()?,
-            }),
+            T_CLOSE => {
+                let stream_id = p.u32()?;
+                let final_offset = if p.rest().len() >= 8 {
+                    Some(p.u64()?)
+                } else {
+                    None
+                };
+                Frame::StreamClose(StreamClose {
+                    stream_id,
+                    final_offset,
+                })
+            }
             T_RESET => {
                 let stream_id = p.u32()?;
                 let reason = ResetReason::from_u8(p.u8()?);
@@ -449,6 +463,14 @@ mod tests {
             stream_id: 3,
             reason: ResetReason::DialFailed,
         }));
+        roundtrip(Frame::StreamClose(StreamClose {
+            stream_id: 11,
+            final_offset: Some(4096),
+        }));
+        roundtrip(Frame::StreamClose(StreamClose {
+            stream_id: 11,
+            final_offset: None,
+        }));
         roundtrip(Frame::SessionClose);
         roundtrip(Frame::CreateSession(CreateSession {
             version: crate::PROTOCOL_VERSION,
@@ -457,6 +479,20 @@ mod tests {
             proof: [9u8; PROOF_LEN],
             path_name: "soy#0".into(),
         }));
+    }
+
+    #[test]
+    fn stream_close_old_bytes_have_no_offset() {
+        let mut o = Vec::new();
+        o.push(T_CLOSE);
+        o.extend_from_slice(&7u32.to_be_bytes());
+        match Frame::decode(&o).unwrap() {
+            Frame::StreamClose(c) => {
+                assert_eq!(c.stream_id, 7);
+                assert_eq!(c.final_offset, None);
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

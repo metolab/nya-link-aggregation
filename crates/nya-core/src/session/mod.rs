@@ -43,6 +43,7 @@ struct CloseUnacked {
     started_at: Instant,
     tried: Vec<u32>,
     second_closer: bool,
+    final_offset: Option<u64>,
 }
 
 struct PendingEarly {
@@ -210,16 +211,23 @@ impl Session {
             Ordering::Relaxed,
             |v| Some(v.saturating_sub(1)),
         );
-        self.inner.dead_notify.notify_waiters();
         info!(
             reason = if send_frame { "shutdown" } else { "drop" },
             "session dead"
         );
         self.inner.closes.lock().unwrap().clear();
+        if send_frame {
+            if let Some(p) = self.pick_pref(PickPref::Any) {
+                self.send_on_path(p, Frame::SessionClose);
+            }
+        }
         let ids: Vec<u32> = self.inner.streams.lock().unwrap().keys().copied().collect();
         for id in ids {
             self.finish_stream(id, Some(ResetReason::SessionDead), send_frame);
         }
+        // After SessionClose / Reset hit the writer queues, wake path IO
+        // so Idle close can flush urgent then close_notify.
+        self.inner.dead_notify.notify_waiters();
     }
 
     pub fn has_alive_path(&self) -> bool {
@@ -397,9 +405,9 @@ impl Session {
             }
             Frame::StreamData(data) => self.on_data(path_id, data),
             Frame::StreamAck(ack) => self.on_ack(ack),
-            Frame::StreamClose(c) => self.on_peer_close(c.stream_id),
+            Frame::StreamClose(c) => self.on_peer_close(c),
             Frame::StreamReset(r) => self.on_peer_reset(r.stream_id, r.reason),
-            Frame::SessionClose => self.shutdown(),
+            Frame::SessionClose => self.mark_dead(false),
             other => {
                 debug!(?other, "ignoring frame on established path");
             }
@@ -576,12 +584,21 @@ impl Session {
         self.inner.opens.lock().unwrap().remove(&id);
     }
 
-    fn remember_close(&self, id: u32, path_id: u32, second_closer: bool) {
+    fn remember_close(
+        &self,
+        id: u32,
+        path_id: u32,
+        second_closer: bool,
+        final_offset: Option<u64>,
+    ) {
         let mut g = self.inner.closes.lock().unwrap();
         if let Some(c) = g.get_mut(&id) {
             c.path_id = path_id;
             c.sent_at = Instant::now();
             Self::push_tried(&mut c.tried, path_id);
+            if c.final_offset.is_none() {
+                c.final_offset = final_offset;
+            }
             return;
         }
         let now = Instant::now();
@@ -593,6 +610,7 @@ impl Session {
                 started_at: now,
                 tried: vec![path_id],
                 second_closer,
+                final_offset,
             },
         );
     }
@@ -709,15 +727,24 @@ impl Session {
 
     fn retry_closes(&self) {
         self.reap_closes();
-        let snapshot: Vec<(u32, u32, bool, Vec<u32>, Instant)> = self
+        let snapshot: Vec<(u32, u32, bool, Vec<u32>, Instant, Option<u64>)> = self
             .inner
             .closes
             .lock()
             .unwrap()
             .iter()
-            .map(|(id, c)| (*id, c.path_id, c.second_closer, c.tried.clone(), c.sent_at))
+            .map(|(id, c)| {
+                (
+                    *id,
+                    c.path_id,
+                    c.second_closer,
+                    c.tried.clone(),
+                    c.sent_at,
+                    c.final_offset,
+                )
+            })
             .collect();
-        for (id, from, second, tried, sent_at) in snapshot {
+        for (id, from, second, tried, sent_at, final_offset) in snapshot {
             if !second {
                 if let Some(st) = self.get_stream(id) {
                     if st.recv_fin.load(Ordering::Relaxed) {
@@ -736,7 +763,13 @@ impl Session {
             let Some(alt) = self.pick_retry_tried(&tried) else {
                 continue;
             };
-            if self.send_on_path(alt, Frame::StreamClose(StreamClose { stream_id: id })) {
+            if self.send_on_path(
+                alt,
+                Frame::StreamClose(StreamClose {
+                    stream_id: id,
+                    final_offset,
+                }),
+            ) {
                 if let Some(c) = self.inner.closes.lock().unwrap().get_mut(&id) {
                     c.path_id = alt;
                     c.sent_at = Instant::now();
@@ -755,20 +788,26 @@ impl Session {
     }
 
     fn retry_close_from(&self, dead: u32) {
-        let snapshot: Vec<(u32, Vec<u32>)> = self
+        let snapshot: Vec<(u32, Vec<u32>, Option<u64>)> = self
             .inner
             .closes
             .lock()
             .unwrap()
             .iter()
             .filter(|(_, c)| c.path_id == dead)
-            .map(|(id, c)| (*id, c.tried.clone()))
+            .map(|(id, c)| (*id, c.tried.clone(), c.final_offset))
             .collect();
-        for (id, tried) in snapshot {
+        for (id, tried, final_offset) in snapshot {
             let Some(alt) = self.pick_retry_tried(&tried) else {
                 continue;
             };
-            if self.send_on_path(alt, Frame::StreamClose(StreamClose { stream_id: id })) {
+            if self.send_on_path(
+                alt,
+                Frame::StreamClose(StreamClose {
+                    stream_id: id,
+                    final_offset,
+                }),
+            ) {
                 if let Some(c) = self.inner.closes.lock().unwrap().get_mut(&id) {
                     c.path_id = alt;
                     c.sent_at = Instant::now();
@@ -971,7 +1010,6 @@ impl Session {
     fn frame_is_interactive(&self, frame: &Frame) -> bool {
         match frame {
             Frame::StreamData(d) => d.data.len() <= self.inner.cfg.tuning.interactive_max,
-            Frame::SessionClose => false,
             _ => true,
         }
     }
@@ -1500,7 +1538,7 @@ impl SessionTable {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nya_proto::{StreamAck, Target};
+    use nya_proto::{StreamAck, StreamClose, Target};
     use std::pin::Pin;
     use std::task::{Context, Poll};
     use tokio::io::{duplex, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
@@ -1732,7 +1770,7 @@ mod tests {
             let st = g.values().next().unwrap();
             (st.id, st.sticky.load(Ordering::Relaxed))
         };
-        client.remember_close(sid, from, false);
+        client.remember_close(sid, from, false, None);
         if let Some(p) = client.get_path(from) {
             *p.last_rx.lock().unwrap() = Instant::now() - Duration::from_millis(400);
         }
@@ -1759,7 +1797,7 @@ mod tests {
         cfg.tuning.close_linger = Duration::from_millis(20);
         let client = Session::new_client(cfg);
         inject_named(&client, 1, "akcdn#0", 7);
-        client.remember_close(7, 1, true);
+        client.remember_close(7, 1, true, None);
         {
             let mut g = client.inner.closes.lock().unwrap();
             for c in g.values_mut() {
@@ -1857,6 +1895,71 @@ mod tests {
             .expect("early data")
             .unwrap();
         assert_eq!(&buf, b"hi!");
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn close_with_offset_delivers_data_that_arrives_after() {
+        let (server, mut incoming) = Session::new_server(SessionConfig::default());
+        inject_named(&server, 1, "akcdn#0", 7);
+        server.accept_remote_stream(
+            1,
+            StreamOpen {
+                stream_id: 9,
+                target: Target {
+                    host: "t".into(),
+                    port: 1,
+                },
+            },
+        );
+        let mut inc = incoming.try_recv().expect("incoming");
+        server.handle_frame(
+            1,
+            Frame::StreamClose(StreamClose {
+                stream_id: 9,
+                final_offset: Some(4),
+            }),
+        );
+        let st = server.get_stream(9).expect("held until offset");
+        assert!(
+            !st.recv_fin.load(Ordering::Relaxed),
+            "Close must not FIN while recv_next < final_offset"
+        );
+        server.handle_frame(
+            1,
+            Frame::StreamData(StreamData {
+                stream_id: 9,
+                offset: 0,
+                data: b"abcd".to_vec(),
+            }),
+        );
+        let mut buf = [0u8; 4];
+        tokio::time::timeout(Duration::from_secs(1), inc.io.read_exact(&mut buf))
+            .await
+            .expect("late data after Close")
+            .unwrap();
+        assert_eq!(&buf, b"abcd");
+        let n = tokio::time::timeout(Duration::from_secs(1), inc.io.read(&mut buf))
+            .await
+            .expect("eof after reassembly")
+            .unwrap();
+        assert_eq!(n, 0, "FIN after recv_next reaches final_offset");
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn shutdown_session_close_ends_peer_without_all_down_wait() {
+        let (client, server) = pair_echo(&["p1"]).await;
+        assert!(!server.is_dead());
+        client.shutdown();
+        let deadline = Instant::now() + Duration::from_millis(400);
+        while !server.is_dead() {
+            assert!(
+                Instant::now() < deadline,
+                "peer must die on SessionClose, not all_down_timeout"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         server.shutdown();
     }
 

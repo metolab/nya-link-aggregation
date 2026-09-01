@@ -238,6 +238,7 @@ impl Session {
         self.retry_opens();
         self.retry_closes();
         self.expire_early_data();
+        self.expire_recv_closes();
 
         let all_down = !self.has_alive_path();
         if all_down {

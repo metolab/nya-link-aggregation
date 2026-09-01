@@ -42,6 +42,8 @@ pub struct StreamState {
     pub recv_next: AtomicU64,
     pub recv_buf: Mutex<BTreeMap<u64, Vec<u8>>>,
     pub recv_fin: AtomicBool,
+    /// `u64::MAX` = no peer Close yet. Else the sender's `send_next` at FIN.
+    pub recv_close_off: AtomicU64,
     pub send_fin_sent: AtomicBool,
     pub reset: AtomicBool,
     /// Set on first STREAM_DATA larger than `tuning.interactive_max`.
@@ -80,6 +82,7 @@ impl StreamState {
             recv_next: AtomicU64::new(0),
             recv_buf: Mutex::new(BTreeMap::new()),
             recv_fin: AtomicBool::new(false),
+            recv_close_off: AtomicU64::new(u64::MAX),
             send_fin_sent: AtomicBool::new(false),
             reset: AtomicBool::new(false),
             bulk: AtomicBool::new(false),
