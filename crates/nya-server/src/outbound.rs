@@ -4,11 +4,11 @@ use std::time::Instant;
 
 use tokio::sync::mpsc;
 
-use tracing::{debug, warn, Instrument};
+use tracing::{debug, info, warn, Instrument};
 
 use nya_core::{
-    connect_origin, HopClock, HopOutcome, HopProbe, HopRole, HopSample, IncomingStream,
-    OriginPeerSlots, Tuning,
+    connect_origin_meta, HopClock, HopOutcome, HopProbe, HopRole, HopSample, IncomingStream,
+    OriginDialMeta, OriginPeerSlots, Tuning,
 };
 use nya_proto::ResetReason;
 
@@ -23,9 +23,14 @@ pub async fn handle_incoming(mut incoming: mpsc::Receiver<IncomingStream>) {
                 server.address = %target,
                 otel.status_code = tracing::field::Empty,
                 nya.dial_us = tracing::field::Empty,
+                nya.lookup_a_us = tracing::field::Empty,
+                nya.lookup_aaaa_us = tracing::field::Empty,
+                nya.n_v4 = tracing::field::Empty,
+                nya.n_v6 = tracing::field::Empty,
+                nya.winner = tracing::field::Empty,
             );
             let t0 = Instant::now();
-            let connected = connect_origin(
+            let connected = connect_origin_meta(
                 inc.target.host.as_str(),
                 inc.target.port,
                 Tuning::STANDARD.origin_connect_attempt_delay,
@@ -34,8 +39,39 @@ pub async fn handle_incoming(mut incoming: mpsc::Receiver<IncomingStream>) {
             .await;
             let dial_us = (t0.elapsed().as_micros() as u64).max(1);
             span.record("nya.dial_us", dial_us);
+            let meta = match &connected {
+                Ok(d) => d.meta.clone(),
+                Err(_) => OriginDialMeta::default(),
+            };
+            if let Some(us) = meta.lookup_a_us {
+                span.record("nya.lookup_a_us", us);
+            }
+            if let Some(us) = meta.lookup_aaaa_us {
+                span.record("nya.lookup_aaaa_us", us);
+            }
+            if let Some(n) = meta.n_v4 {
+                span.record("nya.n_v4", n);
+            }
+            if let Some(n) = meta.n_v6 {
+                span.record("nya.n_v6", n);
+            }
+            if !meta.winner.is_empty() {
+                span.record("nya.winner", meta.winner);
+            }
+            if dial_us >= 100_000 {
+                info!(
+                    lookup_a_us = ?meta.lookup_a_us,
+                    lookup_aaaa_us = ?meta.lookup_aaaa_us,
+                    n_v4 = ?meta.n_v4,
+                    n_v6 = ?meta.n_v6,
+                    winner = meta.winner,
+                    dial_us,
+                    "outbound dial slow"
+                );
+            }
             match connected {
-                Ok(tcp) => {
+                Ok(dial) => {
+                    let tcp = dial.stream;
                     drop(span);
                     inc.process()
                         .outbound_dial_ok

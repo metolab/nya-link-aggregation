@@ -439,7 +439,15 @@ impl Session {
     }
 
     pub(crate) fn write_deadline(&self, path_id: u32) -> Duration {
-        self.retry_after(path_id)
+        let this_unknown = self
+            .get_path(path_id)
+            .map(|p| !p.rtt_known())
+            .unwrap_or(true);
+        if this_unknown || self.min_alive_fast_rtt().is_none() {
+            self.inner.cfg.tuning.unknown_degrade_min
+        } else {
+            self.retry_after(path_id)
+        }
     }
 
     fn note_retry(&self, from: u32, to: u32) {
@@ -3230,11 +3238,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_timeout_tears_only_blocked_path() {
+    async fn write_stall_does_not_tear_blocked_path() {
         let client = Session::new_client(SessionConfig::default());
         let (a, _peer) = duplex(8);
         let done = client.start_path("stall".into(), a);
         let stall_id = *client.inner.paths.lock().unwrap().keys().next().unwrap();
+        client
+            .get_path(stall_id)
+            .unwrap()
+            .record_rtt(Duration::from_millis(7));
         let _live = inject_live(&client, 99, "live#0", 7);
         let ping = Frame::Ping(nya_proto::Ping {
             seq: 1,
@@ -3244,12 +3256,123 @@ mod tests {
             let _ = client.send_on_path(stall_id, ping.clone());
         }
         tokio::time::sleep(Duration::from_millis(80)).await;
+        let stall = client
+            .get_path(stall_id)
+            .expect("blocked writer must stay up");
+        assert!(stall.is_alive(), "write stall is not path_failed");
         assert!(
-            client.get_path(stall_id).is_none(),
-            "blocked writer must path_failed that dest"
+            stall.is_write_stalled(),
+            "deadline on known dest marks write_stalled"
         );
+        assert!(!stall.is_schedulable());
         assert!(client.get_path(99).is_some(), "sibling dest must stay up");
-        let _ = tokio::time::timeout(Duration::from_millis(500), done).await;
+        assert_eq!(client.snapshot().path_down, 0);
+        drop(done);
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn write_deadline_unknown_dest_is_unknown_degrade_min() {
+        let client = Session::new_client(SessionConfig::default());
+        let (a, _peer) = duplex(64);
+        let _done = client.start_path("new".into(), a);
+        let id = *client.inner.paths.lock().unwrap().keys().next().unwrap();
+        let _live = inject_live(&client, 99, "live#0", 7);
+        assert_eq!(
+            client.write_deadline(id),
+            client.inner.cfg.tuning.unknown_degrade_min
+        );
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn write_deadline_known_fast_pool_is_floor() {
+        let client = Session::new_client(SessionConfig::default());
+        let (a, _peer) = duplex(64);
+        let _done = client.start_path("known".into(), a);
+        let id = *client.inner.paths.lock().unwrap().keys().next().unwrap();
+        client
+            .get_path(id)
+            .unwrap()
+            .record_rtt(Duration::from_millis(7));
+        assert_eq!(
+            client.write_deadline(id),
+            client.inner.cfg.tuning.loss_timeout_floor
+        );
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn write_stall_unknown_just_joined_does_not_stall_at_20ms() {
+        let client = Session::new_client(SessionConfig::default());
+        let (a, _peer) = duplex(8);
+        let done = client.start_path("new".into(), a);
+        let id = *client.inner.paths.lock().unwrap().keys().next().unwrap();
+        let _live = inject_live(&client, 99, "live#0", 7);
+        let ping = Frame::Ping(nya_proto::Ping {
+            seq: 1,
+            sent_at_ms: 0,
+        });
+        for _ in 0..80 {
+            let _ = client.send_on_path(id, ping.clone());
+        }
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let p = client.get_path(id).expect("just-joined dest stays up");
+        assert!(p.is_alive());
+        assert!(
+            !p.is_write_stalled(),
+            "unknown dest write_deadline is 300ms, not 20ms"
+        );
+        assert_eq!(client.snapshot().path_down, 0);
+        drop(done);
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn write_stall_on_one_of_six_leaves_six_up() {
+        let client = Session::new_client(SessionConfig::default());
+        let mut peers = Vec::new();
+        let mut dones = Vec::new();
+        for i in 0..6 {
+            // Stall dest uses a tiny buffer so send_frame blocks; siblings
+            // must still run spawn_path_io (not inject_live) but need room
+            // for maintain pings so they are not themselves write_stalled.
+            let cap = if i == 0 { 8 } else { 64 * 1024 };
+            let (a, peer) = duplex(cap);
+            dones.push(client.start_path(format!("p{i}#0"), a));
+            peers.push(peer);
+        }
+        let ids: Vec<u32> = {
+            let paths = client.inner.paths.lock().unwrap();
+            let mut v: Vec<_> = paths.keys().copied().collect();
+            v.sort();
+            v
+        };
+        assert_eq!(ids.len(), 6);
+        for &id in &ids {
+            client
+                .get_path(id)
+                .unwrap()
+                .record_rtt(Duration::from_millis(7));
+        }
+        let stall_id = ids[0];
+        let ping = Frame::Ping(nya_proto::Ping {
+            seq: 1,
+            sent_at_ms: 0,
+        });
+        for _ in 0..80 {
+            let _ = client.send_on_path(stall_id, ping.clone());
+        }
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert_eq!(client.alive_path_count(), 6);
+        assert_eq!(client.snapshot().path_down, 0);
+        assert!(client.get_path(stall_id).unwrap().is_write_stalled());
+        for &id in &ids[1..] {
+            assert!(!client.get_path(id).unwrap().is_write_stalled());
+            assert!(client.get_path(id).unwrap().is_alive());
+        }
+        drop(dones);
+        drop(peers);
         client.shutdown();
     }
 

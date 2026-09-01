@@ -44,8 +44,9 @@ pub use handshake::{
     HandshakeResult,
 };
 pub use hop::{
-    connect_origin, interleave_families, race_origin_addrs, race_origin_connects, HopClock,
-    HopOutcome, HopProbe, HopRole, HopSample, OriginPeerSlots,
+    connect_origin, connect_origin_meta, interleave_families, race_origin_addrs,
+    race_origin_connects, race_origin_lookups, HopClock, HopOutcome, HopProbe, HopRole, HopSample,
+    OriginDial, OriginDialMeta, OriginPeerSlots,
 };
 pub use metrics::{
     percentile, rollup_links, HistSnap, Histogram, LinkSnap, PathSnap, ProcessCounters,

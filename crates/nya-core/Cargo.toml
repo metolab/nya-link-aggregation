@@ -27,6 +27,7 @@ tokio-util = { workspace = true, features = ["codec"] }
 futures-util = { version = "0.3", features = ["sink"] }
 tracing.workspace = true
 x509-parser.workspace = true
+dns-lookup = "4"
 
 [dev-dependencies]
 rcgen.workspace = true

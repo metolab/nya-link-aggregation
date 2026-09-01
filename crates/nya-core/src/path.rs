@@ -8,7 +8,7 @@ use futures_util::{Sink, SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use nya_proto::{Frame, Ping, MAX_FRAME_SIZE};
 
@@ -41,6 +41,8 @@ pub struct PathState {
     pub sticky_streams: AtomicU64,
     /// Writer queue was full; do not pick until a send succeeds again.
     pub congested: AtomicBool,
+    /// In-flight `send_frame` exceeded `write_deadline`. Pick skips; TCP stays up.
+    write_stalled: AtomicBool,
     pub last_rx: std::sync::Mutex<Instant>,
     pub last_tx: std::sync::Mutex<Instant>,
     pub up_since: std::sync::Mutex<Instant>,
@@ -94,6 +96,7 @@ impl PathState {
             inflight: AtomicU64::new(0),
             sticky_streams: AtomicU64::new(0),
             congested: AtomicBool::new(false),
+            write_stalled: AtomicBool::new(false),
             last_rx: std::sync::Mutex::new(now),
             last_tx: std::sync::Mutex::new(now),
             up_since: std::sync::Mutex::new(now),
@@ -173,9 +176,17 @@ impl PathState {
         self.congested.store(v, Ordering::Relaxed);
     }
 
-    /// Eligible for new sticky assignment: up and not send-blocked.
+    pub fn is_write_stalled(&self) -> bool {
+        self.write_stalled.load(Ordering::Relaxed)
+    }
+
+    pub fn set_write_stalled(&self, v: bool) {
+        self.write_stalled.store(v, Ordering::SeqCst);
+    }
+
+    /// Eligible for new sticky assignment: up, not enqueue-blocked, not flush-stalled.
     pub fn is_schedulable(&self) -> bool {
-        self.is_up() && !self.is_congested()
+        self.is_up() && !self.is_congested() && !self.is_write_stalled()
     }
 
     pub fn rtt_known(&self) -> bool {
@@ -646,9 +657,8 @@ pub fn spawn_path_io<T>(
         });
 
         enum WriteOne {
-            Sent,
+            Sent { stalled: bool },
             Closed,
-            TimedOut,
             Io(std::io::Error),
         }
 
@@ -683,16 +693,13 @@ pub fn spawn_path_io<T>(
                         )
                         .await
                         {
-                            WriteOne::Sent => {
+                            WriteOne::Sent { stalled } => {
+                                if !stalled {
+                                    path_w.set_write_stalled(false);
+                                }
                                 next_ping = tokio::time::Instant::now() + ping_every;
                             }
                             WriteOne::Closed => return Ok(()),
-                            WriteOne::TimedOut => {
-                                return Err(std::io::Error::new(
-                                    std::io::ErrorKind::TimedOut,
-                                    "path write",
-                                ));
-                            }
                             WriteOne::Io(e) => {
                                 warn!(path = %path_w.name, error = %e, "path ping failed");
                                 return Err(e);
@@ -718,14 +725,12 @@ pub fn spawn_path_io<T>(
                         )
                         .await
                         {
-                            WriteOne::Sent => {}
-                            WriteOne::Closed => return Ok(()),
-                            WriteOne::TimedOut => {
-                                return Err(std::io::Error::new(
-                                    std::io::ErrorKind::TimedOut,
-                                    "path write",
-                                ));
+                            WriteOne::Sent { stalled } => {
+                                if !stalled {
+                                    path_w.set_write_stalled(false);
+                                }
                             }
+                            WriteOne::Closed => return Ok(()),
                             WriteOne::Io(e) => {
                                 warn!(path = %path_w.name, error = %e, "path write failed");
                                 return Err(e);
@@ -751,14 +756,12 @@ pub fn spawn_path_io<T>(
                         )
                         .await
                         {
-                            WriteOne::Sent => {}
-                            WriteOne::Closed => return Ok(()),
-                            WriteOne::TimedOut => {
-                                return Err(std::io::Error::new(
-                                    std::io::ErrorKind::TimedOut,
-                                    "path write",
-                                ));
+                            WriteOne::Sent { stalled } => {
+                                if !stalled {
+                                    path_w.set_write_stalled(false);
+                                }
                             }
+                            WriteOne::Closed => return Ok(()),
                             WriteOne::Io(e) => {
                                 warn!(path = %path_w.name, error = %e, "path write failed");
                                 return Err(e);
@@ -782,20 +785,44 @@ pub fn spawn_path_io<T>(
         where
             S: Sink<Bytes, Error = std::io::Error> + Unpin,
         {
-            tokio::select! {
-                biased;
-                _ = &mut *close_rx => {
-                    let _ = tokio::time::timeout(ping_max, writer.close()).await;
-                    WriteOne::Closed
-                }
-                r = tokio::time::timeout(deadline, send_frame(writer, session, path, frame)) => {
-                    match r {
-                        Ok(Ok(())) => WriteOne::Sent,
-                        Ok(Err(e)) => WriteOne::Io(e),
-                        Err(_) => WriteOne::TimedOut,
+            let mut this_stalled = false;
+            let t0 = tokio::time::Instant::now();
+            {
+                let send = send_frame(writer, session, path, frame);
+                tokio::pin!(send);
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = &mut *close_rx => {
+                            break;
+                        }
+                        r = &mut send => {
+                            return match r {
+                                Ok(()) => WriteOne::Sent {
+                                    stalled: this_stalled,
+                                },
+                                Err(e) => WriteOne::Io(e),
+                            };
+                        }
+                        _ = tokio::time::sleep(deadline), if !this_stalled => {
+                            this_stalled = true;
+                            let first = !path.is_write_stalled();
+                            path.set_write_stalled(true);
+                            if first {
+                                info!(
+                                    path = %path.name,
+                                    path_id = path.id,
+                                    waited_ms = t0.elapsed().as_millis() as u64,
+                                    deadline_ms = deadline.as_millis() as u64,
+                                    "path write stalled"
+                                );
+                            }
+                        }
                     }
                 }
             }
+            let _ = tokio::time::timeout(ping_max, writer.close()).await;
+            WriteOne::Closed
         }
 
         enum Exit {

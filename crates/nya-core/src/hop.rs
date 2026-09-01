@@ -2,6 +2,7 @@
 //!
 //! No tracing in poll. Missing hops are `None`, never 0.
 
+use std::collections::VecDeque;
 use std::future::Future;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -372,16 +373,303 @@ pub fn interleave_families(addrs: Vec<SocketAddr>) -> Vec<SocketAddr> {
     out
 }
 
-/// Literal IP: one connect, nodelay. Hostname: lookup then race families.
-pub async fn connect_origin(host: &str, port: u16, cad: Duration) -> io::Result<TcpStream> {
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        return connect_and_nodelay(SocketAddr::new(ip, port)).await;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OriginFamily {
+    V4,
+    V6,
+}
+
+/// Lookup / winner metadata for `nya.outbound.dial`. Pending family is `None`,
+/// not `0` (`Some(0)` = that family completed empty).
+#[derive(Clone, Debug, Default)]
+pub struct OriginDialMeta {
+    pub lookup_a_us: Option<u64>,
+    pub lookup_aaaa_us: Option<u64>,
+    pub n_v4: Option<u32>,
+    pub n_v6: Option<u32>,
+    pub winner: &'static str,
+}
+
+pub struct OriginDial {
+    pub stream: TcpStream,
+    pub meta: OriginDialMeta,
+}
+
+fn is_family_empty(e: &dns_lookup::LookupError) -> bool {
+    matches!(
+        e.kind(),
+        dns_lookup::LookupErrorKind::NoName
+            | dns_lookup::LookupErrorKind::NoData
+            | dns_lookup::LookupErrorKind::Family
+            | dns_lookup::LookupErrorKind::Again
+            | dns_lookup::LookupErrorKind::Socktype
+    )
+}
+
+fn lookup_family_blocking(
+    host: &str,
+    port: u16,
+    family: OriginFamily,
+) -> io::Result<Vec<SocketAddr>> {
+    use dns_lookup::{getaddrinfo, AddrFamily, AddrInfoHints, SockType};
+    let hints = AddrInfoHints {
+        socktype: SockType::Stream.into(),
+        address: match family {
+            OriginFamily::V4 => AddrFamily::Inet.into(),
+            OriginFamily::V6 => AddrFamily::Inet6.into(),
+        },
+        ..AddrInfoHints::default()
+    };
+    match getaddrinfo(Some(host), Some(&port.to_string()), Some(hints)) {
+        Ok(iter) => Ok(iter
+            .filter_map(Result::ok)
+            .map(|a| a.sockaddr)
+            .filter(|a| match family {
+                OriginFamily::V4 => a.is_ipv4(),
+                OriginFamily::V6 => a.is_ipv6(),
+            })
+            .collect()),
+        Err(e) if is_family_empty(&e) => Ok(Vec::new()),
+        Err(e) => Err(e.into()),
     }
-    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, port)).await?.collect();
-    race_origin_addrs(addrs, cad).await
+}
+
+async fn lookup_family(
+    host: String,
+    port: u16,
+    family: OriginFamily,
+) -> io::Result<Vec<SocketAddr>> {
+    tokio::task::spawn_blocking(move || lookup_family_blocking(&host, port, family))
+        .await
+        .unwrap_or_else(|e| Err(io::Error::other(e)))
+}
+
+/// Literal IP: one connect, nodelay. Hostname: split A/AAAA, connect as soon as
+/// one family returns. Do not wait for dual-stack `lookup_host`.
+pub async fn connect_origin(host: &str, port: u16, cad: Duration) -> io::Result<TcpStream> {
+    Ok(connect_origin_meta(host, port, cad).await?.stream)
+}
+
+pub async fn connect_origin_meta(host: &str, port: u16, cad: Duration) -> io::Result<OriginDial> {
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        let stream = connect_and_nodelay(SocketAddr::new(ip, port)).await?;
+        let meta = OriginDialMeta {
+            n_v4: Some(u32::from(ip.is_ipv4())),
+            n_v6: Some(u32::from(ip.is_ipv6())),
+            winner: "literal",
+            ..OriginDialMeta::default()
+        };
+        return Ok(OriginDial { stream, meta });
+    }
+    let host_v4 = host.to_string();
+    let host_v6 = host.to_string();
+    race_origin_lookups_meta(
+        Box::pin(lookup_family(host_v4, port, OriginFamily::V4)),
+        Box::pin(lookup_family(host_v6, port, OriginFamily::V6)),
+        cad,
+        |addr| Box::pin(connect_and_nodelay(addr)) as OriginConnect,
+    )
+    .await
 }
 
 type OriginConnect = Pin<Box<dyn Future<Output = io::Result<TcpStream>> + Send>>;
+pub type FamilyLookup = Pin<Box<dyn Future<Output = io::Result<Vec<SocketAddr>>> + Send>>;
+
+/// First family that returns addresses starts connecting immediately; the other
+/// joins CAD-spaced. `connect` is the per-addr factory (production: nodelay).
+pub async fn race_origin_lookups(
+    v4: FamilyLookup,
+    v6: FamilyLookup,
+    cad: Duration,
+) -> io::Result<TcpStream> {
+    Ok(race_origin_lookups_meta(v4, v6, cad, |addr| {
+        Box::pin(connect_and_nodelay(addr)) as OriginConnect
+    })
+    .await?
+    .stream)
+}
+
+pub async fn race_origin_lookups_meta(
+    v4: FamilyLookup,
+    v6: FamilyLookup,
+    cad: Duration,
+    mut connect: impl FnMut(SocketAddr) -> OriginConnect,
+) -> io::Result<OriginDial> {
+    let t0 = Instant::now();
+    let mut v4 = v4;
+    let mut v6 = v6;
+    let mut v4_pending = true;
+    let mut v6_pending = true;
+    let mut q4: VecDeque<SocketAddr> = VecDeque::new();
+    let mut q6: VecDeque<SocketAddr> = VecDeque::new();
+    let mut last_err: Option<io::Error> = None;
+    let mut last_start: Option<Instant> = None;
+    let mut last_family: Option<OriginFamily> = None;
+    let mut prefer: Option<OriginFamily> = None;
+    let mut started_any = false;
+    let mut meta = OriginDialMeta::default();
+    let mut set: JoinSet<(OriginFamily, io::Result<TcpStream>)> = JoinSet::new();
+
+    let start_one = |set: &mut JoinSet<_>,
+                     q4: &mut VecDeque<SocketAddr>,
+                     q6: &mut VecDeque<SocketAddr>,
+                     prefer: &mut Option<OriginFamily>,
+                     last_family: &mut Option<OriginFamily>,
+                     last_start: &mut Option<Instant>,
+                     started_any: &mut bool,
+                     connect: &mut dyn FnMut(SocketAddr) -> OriginConnect|
+     -> bool {
+        let pick = if let Some(f) = *prefer {
+            let got = match f {
+                OriginFamily::V4 => q4.pop_front().map(|a| (OriginFamily::V4, a)),
+                OriginFamily::V6 => q6.pop_front().map(|a| (OriginFamily::V6, a)),
+            };
+            if got.is_none() {
+                *prefer = None;
+            } else {
+                let empty = match f {
+                    OriginFamily::V4 => q4.is_empty(),
+                    OriginFamily::V6 => q6.is_empty(),
+                };
+                if empty {
+                    *prefer = None;
+                }
+            }
+            got
+        } else {
+            None
+        };
+        let pick = pick.or_else(|| match *last_family {
+            Some(OriginFamily::V4) if !q6.is_empty() => {
+                q6.pop_front().map(|a| (OriginFamily::V6, a))
+            }
+            Some(OriginFamily::V6) if !q4.is_empty() => {
+                q4.pop_front().map(|a| (OriginFamily::V4, a))
+            }
+            _ if !q4.is_empty() => q4.pop_front().map(|a| (OriginFamily::V4, a)),
+            _ if !q6.is_empty() => q6.pop_front().map(|a| (OriginFamily::V6, a)),
+            _ => None,
+        });
+        let Some((family, addr)) = pick else {
+            return false;
+        };
+        let fut = connect(addr);
+        set.spawn(async move { (family, fut.await) });
+        *last_start = Some(Instant::now());
+        *last_family = Some(family);
+        *started_any = true;
+        true
+    };
+
+    loop {
+        if set.is_empty()
+            && !start_one(
+                &mut set,
+                &mut q4,
+                &mut q6,
+                &mut prefer,
+                &mut last_family,
+                &mut last_start,
+                &mut started_any,
+                &mut connect,
+            )
+            && !v4_pending
+            && !v6_pending
+        {
+            return Err(last_err.unwrap_or_else(|| {
+                io::Error::new(io::ErrorKind::AddrNotAvailable, "no addresses")
+            }));
+        }
+        let more = !q4.is_empty() || !q6.is_empty();
+        let cad_wait = if more {
+            match last_start {
+                Some(t) => cad.saturating_sub(t.elapsed()),
+                None => Duration::ZERO,
+            }
+        } else {
+            cad
+        };
+        tokio::select! {
+            r = &mut v4, if v4_pending => {
+                v4_pending = false;
+                meta.lookup_a_us = Some(elapsed_us(t0));
+                match r {
+                    Ok(addrs) => {
+                        meta.n_v4 = Some(addrs.len() as u32);
+                        if started_any && last_family != Some(OriginFamily::V4) && !addrs.is_empty() {
+                            prefer = Some(OriginFamily::V4);
+                        }
+                        q4.extend(addrs);
+                        if !started_any {
+                            let _ = start_one(
+                                &mut set, &mut q4, &mut q6, &mut prefer,
+                                &mut last_family, &mut last_start, &mut started_any,
+                                &mut connect,
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        meta.n_v4 = Some(0);
+                        last_err = Some(e);
+                    }
+                }
+            }
+            r = &mut v6, if v6_pending => {
+                v6_pending = false;
+                meta.lookup_aaaa_us = Some(elapsed_us(t0));
+                match r {
+                    Ok(addrs) => {
+                        meta.n_v6 = Some(addrs.len() as u32);
+                        if started_any && last_family != Some(OriginFamily::V6) && !addrs.is_empty() {
+                            prefer = Some(OriginFamily::V6);
+                        }
+                        q6.extend(addrs);
+                        if !started_any {
+                            let _ = start_one(
+                                &mut set, &mut q4, &mut q6, &mut prefer,
+                                &mut last_family, &mut last_start, &mut started_any,
+                                &mut connect,
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        meta.n_v6 = Some(0);
+                        last_err = Some(e);
+                    }
+                }
+            }
+            Some(joined) = set.join_next(), if !set.is_empty() => {
+                match joined {
+                    Ok((family, Ok(tcp))) => {
+                        set.abort_all();
+                        while set.join_next().await.is_some() {}
+                        meta.winner = match family {
+                            OriginFamily::V4 => "v4",
+                            OriginFamily::V6 => "v6",
+                        };
+                        return Ok(OriginDial { stream: tcp, meta });
+                    }
+                    Ok((_, Err(e))) => {
+                        last_err = Some(e);
+                        let _ = start_one(
+                            &mut set, &mut q4, &mut q6, &mut prefer,
+                            &mut last_family, &mut last_start, &mut started_any,
+                            &mut connect,
+                        );
+                    }
+                    Err(_) => {}
+                }
+            }
+            _ = tokio::time::sleep(cad_wait), if more => {
+                let _ = start_one(
+                    &mut set, &mut q4, &mut q6, &mut prefer,
+                    &mut last_family, &mut last_start, &mut started_any,
+                    &mut connect,
+                );
+            }
+        }
+    }
+}
 
 /// Interleave families, then each addr → connect+nodelay.
 pub async fn race_origin_addrs(addrs: Vec<SocketAddr>, cad: Duration) -> io::Result<TcpStream> {
@@ -787,5 +1075,157 @@ mod tests {
         assert!(interleave_families(vec![]).is_empty());
         let v4: SocketAddr = "192.0.2.1:443".parse().unwrap();
         assert_eq!(interleave_families(vec![v4]), vec![v4]);
+    }
+
+    #[tokio::test]
+    async fn lookup_aaaa_hang_starts_v4_connect_immediately() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+        let cad = Duration::from_millis(20);
+        let t0 = Instant::now();
+        let v4: FamilyLookup = Box::pin(async move { Ok(vec![addr]) });
+        let v6: FamilyLookup = Box::pin(async {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            Ok(Vec::new())
+        });
+        let tcp = race_origin_lookups(v4, v6, cad).await.unwrap();
+        drop(tcp);
+        assert!(
+            t0.elapsed() < Duration::from_millis(80),
+            "hanging AAAA lookup must not block TTFB, elapsed={:?}",
+            t0.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn sequential_join_then_race_waits_for_slow_family() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+        let t0 = Instant::now();
+        let v4 = async { Ok::<Vec<SocketAddr>, io::Error>(vec![addr]) };
+        let v6 = async {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            Ok::<Vec<SocketAddr>, io::Error>(Vec::new())
+        };
+        let (a, b) = tokio::join!(v4, v6);
+        let mut addrs = a.unwrap();
+        addrs.extend(b.unwrap());
+        let tcp = race_origin_addrs(addrs, Duration::from_millis(20))
+            .await
+            .unwrap();
+        drop(tcp);
+        assert!(
+            t0.elapsed() >= Duration::from_millis(180),
+            "sequential join must wait for the slow family, elapsed={:?}",
+            t0.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn lookup_empty_v6_does_not_delay_v4() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+        let t0 = Instant::now();
+        let v4: FamilyLookup = Box::pin(async move { Ok(vec![addr]) });
+        let v6: FamilyLookup = Box::pin(async { Ok(Vec::new()) });
+        let tcp = race_origin_lookups(v4, v6, Duration::from_millis(80))
+            .await
+            .unwrap();
+        drop(tcp);
+        assert!(
+            t0.elapsed() < Duration::from_millis(80),
+            "empty AAAA must not delay IPv4"
+        );
+    }
+
+    #[tokio::test]
+    async fn lookup_v4_empty_waits_for_v6() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+        let t0 = Instant::now();
+        let v4: FamilyLookup = Box::pin(async { Ok(Vec::new()) });
+        let v6: FamilyLookup = Box::pin(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            Ok(vec![addr])
+        });
+        let r = race_origin_lookups(v4, v6, Duration::from_millis(20)).await;
+        // v6 addr is IPv4 loopback; connect still works. elapsed ~30ms not CAD-only.
+        let _ = r; // may fail if we filter v6-only addrs that are ipv4
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(25),
+            "must wait for AAAA when A is empty, elapsed={elapsed:?}"
+        );
+        assert!(elapsed < Duration::from_millis(120));
+    }
+
+    #[tokio::test]
+    async fn second_family_joins_race_prefers_other_family() {
+        use std::sync::Mutex;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ok = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+        let v4a: SocketAddr = "192.0.2.1:443".parse().unwrap();
+        let v4b: SocketAddr = "192.0.2.2:443".parse().unwrap();
+        let v6a: SocketAddr = "[2001:db8::1]:443".parse().unwrap();
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let order_c = order.clone();
+        let v4: FamilyLookup = Box::pin(async move { Ok(vec![v4a, v4b]) });
+        let v6: FamilyLookup = Box::pin(async move {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            Ok(vec![v6a])
+        });
+        let tcp = race_origin_lookups_meta(v4, v6, Duration::from_millis(20), move |addr| {
+            order_c.lock().unwrap().push(addr);
+            if addr.is_ipv6() {
+                Box::pin(TcpStream::connect(ok)) as OriginConnect
+            } else {
+                Box::pin(std::future::pending()) as OriginConnect
+            }
+        })
+        .await
+        .unwrap();
+        drop(tcp.stream);
+        let started = order.lock().unwrap().clone();
+        assert!(started.len() >= 2, "started={started:?}");
+        assert!(started[0].is_ipv4(), "first start is v4");
+        assert!(
+            started.iter().any(|a| a.is_ipv6()),
+            "v6 must join before remaining v4, started={started:?}"
+        );
+        let v6_at = started.iter().position(|a| a.is_ipv6()).unwrap();
+        assert_eq!(
+            v6_at, 1,
+            "next start after first v4 is v6, started={started:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn lookup_hard_fail_one_family_uses_the_other() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+        let v4: FamilyLookup = Box::pin(async move { Ok(vec![addr]) });
+        let v6: FamilyLookup = Box::pin(async { Err(io::Error::other("servfail")) });
+        let tcp = race_origin_lookups(v4, v6, Duration::from_millis(20))
+            .await
+            .unwrap();
+        drop(tcp);
     }
 }
