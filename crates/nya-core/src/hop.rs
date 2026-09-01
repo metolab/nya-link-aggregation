@@ -210,6 +210,15 @@ pub enum HopOutcome {
     CopyErr,
 }
 
+impl HopRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Client => "client",
+            Self::Server => "server",
+        }
+    }
+}
+
 impl HopOutcome {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -289,6 +298,55 @@ impl HopSample {
         push(&mut parts, "crx_at_gap", self.crx_at_gap);
         push(&mut parts, "origin_at_gap", self.origin_at_gap);
         parts.join(" ")
+    }
+
+    /// Marker span at copy-end. Does not wrap `copy_bidirectional`.
+    /// Default traces (`nya_otel=info`) carry first_rx / ofirst / max_gap so
+    /// soak `tls≪ttfb` can be attributed without `nya_core::hop=debug`.
+    pub fn emit_otel_span(&self) {
+        let span = tracing::info_span!(
+            target: "nya_otel",
+            "nya.hop",
+            otel.kind = "internal",
+            nya.host = %self.host,
+            nya.stream_id = self.stream_id,
+            nya.hop_role = self.role.as_str(),
+            nya.outcome = self.outcome.as_str(),
+            nya.copy_us = tracing::field::Empty,
+            nya.open_us = tracing::field::Empty,
+            nya.first_rx_us = tracing::field::Empty,
+            nya.last_rx_us = tracing::field::Empty,
+            nya.first_tx_us = tracing::field::Empty,
+            nya.dial_us = tracing::field::Empty,
+            nya.origin_first_rx_us = tracing::field::Empty,
+            nya.origin_last_rx_us = tracing::field::Empty,
+            nya.client_first_rx_us = tracing::field::Empty,
+            nya.client_last_rx_us = tracing::field::Empty,
+            nya.crx_at_olast = tracing::field::Empty,
+            nya.max_gap_us = tracing::field::Empty,
+            nya.crx_at_gap = tracing::field::Empty,
+            nya.origin_at_gap = tracing::field::Empty,
+        );
+        fn rec(span: &tracing::Span, name: &'static str, v: Option<u64>) {
+            if let Some(v) = v {
+                span.record(name, v);
+            }
+        }
+        rec(&span, "nya.copy_us", self.copy_us);
+        rec(&span, "nya.open_us", self.open_us);
+        rec(&span, "nya.first_rx_us", self.first_rx_us);
+        rec(&span, "nya.last_rx_us", self.last_rx_us);
+        rec(&span, "nya.first_tx_us", self.first_tx_us);
+        rec(&span, "nya.dial_us", self.dial_us);
+        rec(&span, "nya.origin_first_rx_us", self.origin_first_rx_us);
+        rec(&span, "nya.origin_last_rx_us", self.origin_last_rx_us);
+        rec(&span, "nya.client_first_rx_us", self.client_first_rx_us);
+        rec(&span, "nya.client_last_rx_us", self.client_last_rx_us);
+        rec(&span, "nya.crx_at_olast", self.crx_at_olast);
+        rec(&span, "nya.max_gap_us", self.max_gap);
+        rec(&span, "nya.crx_at_gap", self.crx_at_gap);
+        rec(&span, "nya.origin_at_gap", self.origin_at_gap);
+        let _g = span.entered();
     }
 
     /// One `tail=` grammar for the info snapshot.

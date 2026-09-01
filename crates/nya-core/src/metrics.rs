@@ -622,6 +622,7 @@ impl ProcessCounters {
             hops = %sample.format_debug_fields(),
             "hop"
         );
+        sample.emit_otel_span();
         match sample.role {
             HopRole::Client => {
                 observe_us_as_ms(&self.hop_open_ms, sample.open_us);
@@ -981,6 +982,50 @@ mod tests {
         assert!(
             !ev.iter().any(|(l, t)| l == "INFO" && t == "nya_core::hop"),
             "{ev:?}"
+        );
+    }
+
+    #[test]
+    fn record_hop_emits_nya_hop_span() {
+        use std::sync::Arc;
+        use tracing::span::{Attributes, Id, Record};
+        use tracing::{Event, Metadata, Subscriber};
+
+        struct CapArc(Arc<Mutex<Vec<String>>>);
+        impl Subscriber for CapArc {
+            fn enabled(&self, _: &Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, attrs: &Attributes) -> Id {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(attrs.metadata().name().to_string());
+                Id::from_u64(1)
+            }
+            fn record(&self, _: &Id, _: &Record<'_>) {}
+            fn record_follows_from(&self, _: &Id, _: &Id) {}
+            fn event(&self, _: &Event<'_>) {}
+            fn enter(&self, _: &Id) {}
+            fn exit(&self, _: &Id) {}
+        }
+        let store = Arc::new(Mutex::new(Vec::new()));
+        tracing::subscriber::with_default(CapArc(store.clone()), || {
+            let pc = ProcessCounters::default();
+            pc.record_hop(HopSample {
+                role: HopRole::Client,
+                stream_id: 1,
+                host: "example.com".into(),
+                copy_us: Some(40_000),
+                open_us: Some(80),
+                first_rx_us: Some(12_000),
+                ..Default::default()
+            });
+        });
+        let names = store.lock().unwrap().clone();
+        assert!(
+            names.iter().any(|n| n == "nya.hop"),
+            "expected nya.hop marker span, got {names:?}"
         );
     }
 

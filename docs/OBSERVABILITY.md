@@ -335,7 +335,8 @@ goodput = data / wire                    // 重传的 STREAM_DATA 算 data，诚
 | `mark_degraded` | **met** `path_degraded` 在 `steer::maintain` 调用处 | PathState 内部不打 |
 | `next_ping` / ping 发出 | **no** 日志；字节走 Q6 `send_frame` | |
 | writer 队列满 | 已由 `frame_send_drop`；**dbg** 当 `urgent` 失败时 `path, urgent=true` | bulk 满是预期，不要 info |
-| `spawn_path_io` 读写/EOF/bad frame | 现有 warn/debug，保持 | |
+| `spawn_path_io` 读写/EOF/bad frame | 仍活着时 **ops info** `path eof`（peer 关连接，无 silent/read-failed）；本地 silent-tear 完成仍 **debug**；read/write fail **warn** | 六路同 down 不能再是无原因 `path down` |
+| `path write stalled` | **ops info** 每 episode 一次 | congested-not-tear；`waited_ms` / `deadline_ms` |
 | overlay 字节 | **met** 仅 `send_frame`（TX）与 decode 成功（RX），见 Q6 | **不**在 `send_on_path` |
 
 #### `nya-core::scheduler`
@@ -415,7 +416,7 @@ goodput = data / wire                    // 重传的 STREAM_DATA 算 data，诚
 | SOCKS 握手/请求解析失败 | **met** `inbound_reject` + 现有 warn | **全部**：`not socks5`、`bad socks ver`、非 CONNECT（0x07）、坏 atyp（0x08）。不只 CONNECT/atyp |
 | `open_stream` 失败 | **ops warn** 已有 + **met** `inbound_open_fail`；**dbg** `nya_core::hop` `outcome=open_fail`（`open_us` only） | socks 与 forward 都计 |
 | 成功 `open_stream` 即将 copy | **met** `inbound_accept`；**不要** info | |
-| copy 结束 | **no** info；**dbg** `target=nya_core::hop` `event=hop`（`open_us` / `first_rx_us` / `last_rx_us` / `copy_us`）；**met** snapshot-only hop hists（不进 catalog / `n_counter`） | |
+| copy 结束 | **no** info 日志；**dbg** `target=nya_core::hop`；**OTLP** marker span `nya.hop`（`nya.first_rx_us` / `nya.copy_us` / …）；**met** snapshot-only hop hists（不进 catalog / `n_counter`） | 不包 `copy_bidirectional` |
 
 #### `nya-server::lib`（`serve_one`）
 
@@ -433,7 +434,7 @@ goodput = data / wire                    // 重传的 STREAM_DATA 算 data，诚
 | --- | --- | --- |
 | `"outbound connected"` | **dbg**（现 info 降级）+ **met** `outbound_dial_ok` 经由 `inc.process()` | |
 | dial 失败 | **ops warn** 已有 + **met** `outbound_dial_fail`；**dbg** hop `outcome=dial_fail`（`dial_us` only）；已 `reset(DialFailed)` | 保留 warn |
-| copy 结束 | **no** info；**dbg** `nya_core::hop`（`dial_us` / `ofirst` / `olast` / `max_gap` / `crx_at_gap` / `origin_at_gap` / `crx_at_olast`）；**met** snapshot-only origin hop hists | |
+| copy 结束 | **no** info 日志；**dbg** `nya_core::hop`；**OTLP** marker span `nya.hop`（`nya.dial_us` / `nya.origin_first_rx_us` / `nya.max_gap_us` / …）；**met** snapshot-only origin hop hists | 不包 copy |
 
 #### `nya-e2e`
 
@@ -789,7 +790,7 @@ curl `samples.csv` 的 `ts` 是**请求结束**时间；join：`host` + `copy_us
 - max-gap ≈ remainder 且 `origin_at_gap ≈ olast ≈ copy`、`crx_at_gap ≪ olast` → GET 之后源站思考
 - max-gap 是握手量级、`first_rx≈tls ≪ copy`、最终 `crx≈copy` → overlay 在握手后延迟了 GET
 
-debug hop：`RUST_LOG=nya_core::hop=debug`。默认 info 期刊不打每条流。
+debug hop 日志：`RUST_LOG=nya_core::hop=debug`。默认 info 期刊不打每条流。默认 OTLP traces 有 marker span `nya.hop`（copy 结束瞬间，不包 copy），属性 `nya.first_rx_us` / `nya.origin_first_rx_us` / `nya.max_gap_us` 等，用来把 soak `tls≪ttfb` 归因成 overlay vs 源站。
 
 完整 Q1–Q8 字段仍在 `format_snapshot_metrics` / Prometheus / OTLP metrics。
 
@@ -1204,6 +1205,7 @@ stderr 上 SDK `ExportError` 默认 `off`。`nya_obs` 对 BatchLog/BatchSpan 失
 | `nya.path.up` | path 注册瞬间（毫秒） | internal |
 | `nya.inbound.socks5` / `nya.inbound.forward` | 到 `open_stream` 返回；属性 `nya.open_us`。**不**包 `copy_bidirectional` | server |
 | `nya.outbound.dial` | `TcpStream::connect`；属性 `nya.dial_us`。**不**包 copy | client |
+| `nya.hop` | copy 结束（或 open/dial fail）的 **marker**；属性 `nya.copy_us` / `nya.first_rx_us` / `nya.origin_first_rx_us` / `nya.max_gap_us` 等。**不**包 copy | client / server |
 
 失败：`otel.status_code=ERROR`。无协议 `traceparent`。
 

@@ -184,6 +184,10 @@ impl PathState {
         self.write_stalled.store(v, Ordering::SeqCst);
     }
 
+    pub fn up_age(&self) -> Duration {
+        self.up_since.lock().unwrap().elapsed()
+    }
+
     /// Eligible for new sticky assignment: up, not enqueue-blocked, not flush-stalled.
     pub fn is_schedulable(&self) -> bool {
         self.is_up() && !self.is_congested() && !self.is_write_stalled()
@@ -627,7 +631,15 @@ pub fn spawn_path_io<T>(
             loop {
                 match reader.next().await {
                     None => {
-                        debug!(path = %path_r.name, "path eof");
+                        if path_r.is_alive() {
+                            info!(
+                                path = %path_r.name,
+                                path_id = path_r.id,
+                                "path eof"
+                            );
+                        } else {
+                            debug!(path = %path_r.name, "path eof");
+                        }
                         return Ok(());
                     }
                     Some(Err(e)) => {
@@ -737,7 +749,7 @@ pub fn spawn_path_io<T>(
                             }
                         }
                     }
-                    out = rx.recv() => {
+                    out = rx.recv(), if !path_w.is_write_stalled() => {
                         let Some(frame) = out else {
                             return Err(std::io::Error::new(
                                 std::io::ErrorKind::BrokenPipe,

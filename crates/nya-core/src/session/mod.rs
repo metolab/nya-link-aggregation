@@ -439,11 +439,11 @@ impl Session {
     }
 
     pub(crate) fn write_deadline(&self, path_id: u32) -> Duration {
-        let this_unknown = self
+        let young_or_unknown = self
             .get_path(path_id)
-            .map(|p| !p.rtt_known())
+            .map(|p| !p.rtt_known() || p.up_age() < self.inner.cfg.tuning.unknown_degrade_min)
             .unwrap_or(true);
-        if this_unknown || self.min_alive_fast_rtt().is_none() {
+        if young_or_unknown || self.min_alive_fast_rtt().is_none() {
             self.inner.cfg.tuning.unknown_degrade_min
         } else {
             self.retry_after(path_id)
@@ -2378,6 +2378,11 @@ mod tests {
         inject_named(client, id, &format!("t#{id}"), 7)
     }
 
+    fn age_path(p: &PathState, ago: Duration) {
+        let now = Instant::now();
+        *p.up_since.lock().unwrap() = now.checked_sub(ago).unwrap_or(now);
+    }
+
     fn inject_named(client: &Session, id: u32, name: &str, rtt_ms: u64) -> Arc<PathState> {
         let (tx, _rx) = mpsc::channel(8);
         let p = PathState::new(id, name.into(), tx);
@@ -3247,6 +3252,7 @@ mod tests {
             .get_path(stall_id)
             .unwrap()
             .record_rtt(Duration::from_millis(7));
+        age_path(&client.get_path(stall_id).unwrap(), Duration::from_secs(1));
         let _live = inject_live(&client, 99, "live#0", 7);
         let ping = Frame::Ping(nya_proto::Ping {
             seq: 1,
@@ -3295,9 +3301,29 @@ mod tests {
             .get_path(id)
             .unwrap()
             .record_rtt(Duration::from_millis(7));
+        age_path(&client.get_path(id).unwrap(), Duration::from_secs(1));
         assert_eq!(
             client.write_deadline(id),
             client.inner.cfg.tuning.loss_timeout_floor
+        );
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn write_deadline_just_joined_known_rtt_is_unknown_degrade_min() {
+        let client = Session::new_client(SessionConfig::default());
+        let (a, _peer) = duplex(64);
+        let _done = client.start_path("new".into(), a);
+        let id = *client.inner.paths.lock().unwrap().keys().next().unwrap();
+        client
+            .get_path(id)
+            .unwrap()
+            .record_rtt(Duration::from_millis(7));
+        let _live = inject_live(&client, 99, "live#0", 7);
+        assert_eq!(
+            client.write_deadline(id),
+            client.inner.cfg.tuning.unknown_degrade_min,
+            "first pong does not make a just-joined dest a 20ms writer"
         );
         client.shutdown();
     }
@@ -3322,6 +3348,36 @@ mod tests {
         assert!(
             !p.is_write_stalled(),
             "unknown dest write_deadline is 300ms, not 20ms"
+        );
+        assert_eq!(client.snapshot().path_down, 0);
+        drop(done);
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn write_stall_just_joined_after_pong_does_not_stall_at_20ms() {
+        let client = Session::new_client(SessionConfig::default());
+        let (a, _peer) = duplex(8);
+        let done = client.start_path("new".into(), a);
+        let id = *client.inner.paths.lock().unwrap().keys().next().unwrap();
+        client
+            .get_path(id)
+            .unwrap()
+            .record_rtt(Duration::from_millis(7));
+        let _live = inject_live(&client, 99, "live#0", 7);
+        let ping = Frame::Ping(nya_proto::Ping {
+            seq: 1,
+            sent_at_ms: 0,
+        });
+        for _ in 0..80 {
+            let _ = client.send_on_path(id, ping.clone());
+        }
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let p = client.get_path(id).expect("just-joined dest stays up");
+        assert!(p.is_alive());
+        assert!(
+            !p.is_write_stalled(),
+            "just-joined dest keeps 300ms write_deadline after first pong"
         );
         assert_eq!(client.snapshot().path_down, 0);
         drop(done);
@@ -3356,6 +3412,7 @@ mod tests {
                 .record_rtt(Duration::from_millis(7));
         }
         let stall_id = ids[0];
+        age_path(&client.get_path(stall_id).unwrap(), Duration::from_secs(1));
         let ping = Frame::Ping(nya_proto::Ping {
             seq: 1,
             sent_at_ms: 0,
