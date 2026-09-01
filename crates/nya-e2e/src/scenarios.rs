@@ -1201,12 +1201,7 @@ pub async fn prod_like_blocked_writer_no_drop_storm() -> Result<ScenarioReport> 
         "min_alive={min} drop_delta={drop_d} hedge_delta={hedge_d} mig_blocked={mig_d} path_down {}→{}",
         snap0.path_down, r.snap.path_down
     ));
-    if min < 5
-        || drop_d > 2
-        || hedge_d > 32
-        || mig_d > 16
-        || r.snap.session_all_down_resets != 0
-    {
+    if min < 5 || drop_d > 2 || hedge_d > 32 || mig_d > 16 || r.snap.session_all_down_resets != 0 {
         r.sla.min_success = 2.0;
         r.notes.push("blocked writer storm or sibling tear".into());
     }

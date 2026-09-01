@@ -617,10 +617,7 @@ mod tests {
         let v6a: SocketAddr = "[2001:db8::1]:443".parse().unwrap();
         let v6b: SocketAddr = "[2001:db8::2]:443".parse().unwrap();
         let v4: SocketAddr = "192.0.2.1:443".parse().unwrap();
-        assert_eq!(
-            interleave_families(vec![v6a, v6b, v4]),
-            vec![v6a, v4, v6b]
-        );
+        assert_eq!(interleave_families(vec![v6a, v6b, v4]), vec![v6a, v4, v6b]);
         assert_eq!(interleave_families(vec![v4, v6a]), vec![v4, v6a]);
     }
 
@@ -664,10 +661,7 @@ mod tests {
         let tcp = race_origin_connects(
             vec![
                 Box::pin(async {
-                    Err(io::Error::new(
-                        io::ErrorKind::ConnectionRefused,
-                        "refused",
-                    ))
+                    Err(io::Error::new(io::ErrorKind::ConnectionRefused, "refused"))
                 }),
                 Box::pin(async move { TcpStream::connect(addr).await }),
             ],

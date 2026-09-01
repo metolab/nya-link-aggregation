@@ -524,13 +524,7 @@ impl PathState {
 
     /// Always clear the pending/late ping. Skip `record_rtt` when the
     /// sample rode behind bulk inflight. No wall-clock fallback.
-    pub fn on_pong_record(
-        &self,
-        seq: u64,
-        _sent_at_ms: u64,
-        record: bool,
-        cap: Option<Duration>,
-    ) {
+    pub fn on_pong_record(&self, seq: u64, _sent_at_ms: u64, record: bool, cap: Option<Duration>) {
         let started = {
             let mut pending = self.pending_ping.lock().unwrap();
             pending.remove(&seq)

@@ -355,9 +355,8 @@ impl Session {
                     let cap = if path.rtt_known() {
                         Some(health::loss_timeout(
                             &self.inner.cfg,
-                            self.min_alive_fast_rtt().unwrap_or_else(|| {
-                                crate::scheduler::path_loss_rtt(&path)
-                            }),
+                            self.min_alive_fast_rtt()
+                                .unwrap_or_else(|| crate::scheduler::path_loss_rtt(&path)),
                         ))
                     } else {
                         Some(self.inner.cfg.tuning.unknown_degrade_min)
@@ -470,7 +469,8 @@ impl Session {
             unacked
                 .iter()
                 .filter(|(_, u)| {
-                    u.last_sent.elapsed() >= self.retry_after(u.path_id) && now >= u.retry_not_before
+                    u.last_sent.elapsed() >= self.retry_after(u.path_id)
+                        && now >= u.retry_not_before
                 })
                 .map(|(off, u)| (*off, u.path_id, u.data.clone(), u.tried.clone()))
                 .collect()
@@ -3186,13 +3186,7 @@ mod tests {
         let client = Session::new_client(SessionConfig::default());
         let mut held = Vec::new();
         for i in 1..=6u32 {
-            held.push(inject_live_cap(
-                &client,
-                i,
-                &format!("p{i}#0"),
-                7,
-                8,
-            ));
+            held.push(inject_live_cap(&client, i, &format!("p{i}#0"), 7, 8));
         }
         fill_urgent(&client, 1);
         assert!(held[0].0.is_congested());
@@ -3254,10 +3248,7 @@ mod tests {
             client.get_path(stall_id).is_none(),
             "blocked writer must path_failed that dest"
         );
-        assert!(
-            client.get_path(99).is_some(),
-            "sibling dest must stay up"
-        );
+        assert!(client.get_path(99).is_some(), "sibling dest must stay up");
         let _ = tokio::time::timeout(Duration::from_millis(500), done).await;
         client.shutdown();
     }
@@ -3292,10 +3283,10 @@ mod tests {
             }
             let mut msg = Msg(String::new());
             event.record(&mut msg);
-            self.0.lock().unwrap().push((
-                event.metadata().level().as_str().to_string(),
-                msg.0,
-            ));
+            self.0
+                .lock()
+                .unwrap()
+                .push((event.metadata().level().as_str().to_string(), msg.0));
         }
         fn enter(&self, _: &tracing::Id) {}
         fn exit(&self, _: &tracing::Id) {}
