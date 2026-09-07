@@ -21,14 +21,29 @@ pub fn register(src: Arc<dyn Fn() -> ProcessSnapshot + Send + Sync>) {
         match desc.kind {
             InstrumentKind::Counter => {
                 let name = desc.name;
+                let labeled = !desc.label_keys.is_empty();
                 let _ = meter
                     .u64_observable_counter(name)
                     .with_description(desc.help)
                     .with_callback(move |obs| {
                         let snap = scrape();
-                        let mut s = PickCounter { name, value: 0 };
+                        let mut s = PickCounter {
+                            name,
+                            value: 0,
+                            points: Vec::new(),
+                        };
                         visit_metrics(&snap, &mut s);
-                        obs.observe(s.value, &[]);
+                        if labeled {
+                            for (labels, v) in s.points {
+                                let kvs: Vec<KeyValue> = labels
+                                    .into_iter()
+                                    .map(|(k, val)| KeyValue::new(k, val))
+                                    .collect();
+                                obs.observe(v, &kvs);
+                            }
+                        } else {
+                            obs.observe(s.value, &[]);
+                        }
                     })
                     .build();
             }
@@ -142,12 +157,30 @@ fn scrape() -> ProcessSnapshot {
 struct PickCounter {
     name: &'static str,
     value: u64,
+    points: Vec<(Vec<(String, String)>, u64)>,
 }
 
 impl MetricSink for PickCounter {
     fn counter(&mut self, name: &'static str, _help: &'static str, value: u64) {
         if name == self.name {
             self.value = value;
+        }
+    }
+    fn counter_labeled(
+        &mut self,
+        name: &'static str,
+        _help: &'static str,
+        labels: &[(&'static str, &str)],
+        value: u64,
+    ) {
+        if name == self.name {
+            self.points.push((
+                labels
+                    .iter()
+                    .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                    .collect(),
+                value,
+            ));
         }
     }
     fn gauge(&mut self, _n: &'static str, _h: &'static str, _l: &[(&'static str, &str)], _v: u64) {}

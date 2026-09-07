@@ -190,6 +190,7 @@ fn emit_snapshot(ps: &ProcessSnapshot, tail: Option<HopSample>) {
         picks_unk = s.picks_unknown_rtt,
         recycle = s.path_outlier_recycle,
         corr = s.correlated_silence,
+        pick_rtt = s.pick_rtt_us / 1000,
         open_p99_ms,
         first_rx_p99_ms,
         last_rx_p99_ms,
@@ -222,7 +223,7 @@ fn format_paths(paths: &[crate::metrics::PathSnap]) -> String {
         .iter()
         .map(|p| {
             format!(
-                "{}={}/{}/{}ms {} inf={} st={} cong={} rx={} tx={} ping={} q={}/{}{}{}",
+                "{}={}/{}/{}ms {} inf={} st={} cong={} rx={} tx={} ping={} q={}/{}{}{}{}",
                 p.name,
                 p.rtt_us / 1000,
                 p.stable_rtt_us / 1000,
@@ -238,6 +239,11 @@ fn format_paths(paths: &[crate::metrics::PathSnap]) -> String {
                 p.queued_bulk,
                 if p.backup { " bak" } else { "" },
                 if p.rtt_known { "" } else { " unk" },
+                if p.picks > 0 {
+                    format!(" p={}", p.picks)
+                } else {
+                    String::new()
+                },
             )
         })
         .collect::<Vec<_>>()
@@ -420,9 +426,12 @@ mod tests {
         assert!(names.contains("nya_path_rtt_us"));
         assert!(names.contains("nya_failover_ms_bucket"));
         let n_counter = names.iter().filter(|n| n.ends_with("_total")).count();
-        assert_eq!(n_counter, 52, "{names:?}");
+        assert_eq!(n_counter, 54, "{names:?}");
         assert!(names.contains("nya_path_outlier_recycle_total"));
         assert!(names.contains("nya_correlated_silence_total"));
+        assert!(names.contains("nya_reset_retry_total"));
+        assert!(names.contains("nya_path_picks_total"));
+        assert!(names.contains("nya_pick_rtt_us"));
         let kv = format_snapshot_metrics(&ps);
         assert!(kv.contains("nya_failbacks_total=3"), "{kv}");
         assert!(kv.contains("nya_streams_held=2"), "{kv}");

@@ -167,6 +167,8 @@ pub struct Counters {
     pub data_retransmit: AtomicU64,
     pub data_hedge: AtomicU64,
     pub close_retry: AtomicU64,
+    pub reset_retry: AtomicU64,
+    pub pick_rtt_us: AtomicU64,
     pub probe_miss: AtomicU64,
     pub window_blocks: AtomicU64,
     pub picks_unknown_rtt: AtomicU64,
@@ -214,6 +216,8 @@ impl Default for Counters {
             data_retransmit: AtomicU64::new(0),
             data_hedge: AtomicU64::new(0),
             close_retry: AtomicU64::new(0),
+            reset_retry: AtomicU64::new(0),
+            pick_rtt_us: AtomicU64::new(0),
             probe_miss: AtomicU64::new(0),
             window_blocks: AtomicU64::new(0),
             picks_unknown_rtt: AtomicU64::new(0),
@@ -266,6 +270,7 @@ pub struct PathSnap {
     pub queued_urgent: u64,
     pub queued_bulk: u64,
     pub backup: bool,
+    pub picks: u64,
 }
 
 /// Named WAN link (`a` / `b`), rolled up from its TCP connections (`a#0`, `a#1`).
@@ -389,6 +394,8 @@ pub struct Snapshot {
     pub data_retransmit: u64,
     pub data_hedge: u64,
     pub close_retry: u64,
+    pub reset_retry: u64,
+    pub pick_rtt_us: u64,
     pub probe_miss: u64,
     pub window_blocks: u64,
     pub picks_unknown_rtt: u64,
@@ -441,6 +448,10 @@ impl Snapshot {
         self.data_retransmit += other.data_retransmit;
         self.data_hedge += other.data_hedge;
         self.close_retry += other.close_retry;
+        self.reset_retry += other.reset_retry;
+        if other.pick_rtt_us != 0 {
+            self.pick_rtt_us = other.pick_rtt_us;
+        }
         self.probe_miss += other.probe_miss;
         self.window_blocks += other.window_blocks;
         self.picks_unknown_rtt += other.picks_unknown_rtt;
@@ -490,6 +501,8 @@ impl Counters {
             data_retransmit: self.data_retransmit.load(Ordering::Relaxed),
             data_hedge: self.data_hedge.load(Ordering::Relaxed),
             close_retry: self.close_retry.load(Ordering::Relaxed),
+            reset_retry: self.reset_retry.load(Ordering::Relaxed),
+            pick_rtt_us: self.pick_rtt_us.load(Ordering::Relaxed),
             probe_miss: self.probe_miss.load(Ordering::Relaxed),
             window_blocks: self.window_blocks.load(Ordering::Relaxed),
             picks_unknown_rtt: self.picks_unknown_rtt.load(Ordering::Relaxed),
@@ -541,6 +554,7 @@ impl Counters {
                     queued_urgent: p.queued_urgent(),
                     queued_bulk: p.queued_bulk(),
                     backup: false,
+                    picks: p.picks.load(Ordering::Relaxed),
                 })
                 .collect(),
             links: Vec::new(),

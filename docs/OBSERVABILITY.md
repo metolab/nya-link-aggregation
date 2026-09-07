@@ -115,7 +115,7 @@ nya-server outbound            TcpStream::connect(target)
 - 默认启用 Prometheus crate、OpenTelemetry、tracing-jaeger、log 文件轮转、statsd/UDP。
 - 分布式追踪（overlay 单进程，span 跨路径的 ROI 低）。
 - 改 e2e SLA 阈值（25 failbacks/min 等）；只提供更好的内部数字给现有判定。
-- 修 graceful close 后 `streams` HashMap 可能残留（超出观测范围；计数用 `counted_close` CAS，不 GC）。
+- （已收回）修 graceful close 后 `streams` HashMap 可能残留：活会话上 `counted_close` / linger / Reset 会 GC HashMap；计数仍用 `counted_close` CAS。部署前 hangover 要 bounce 会话。
 - 把 `failbacks` 改成包含同 link——e2e chatter 语义冻结。
 - 把 overlay stall / `failover_ms` 当作 e2e `gap_around` 的同一指标。
 - 在 `Session::new` 里 spawn 观测任务（单测 / e2e 会话必须保持除现有 maintain tick 以外无额外副作用）。
@@ -179,7 +179,7 @@ flowchart TB
 
 | # | 问题 | 信号（overlay 实际能量的） | 好的样子（非正式） |
 | --- | --- | --- | --- |
-| Q1 | 流有没有跑完？ | `streams_opened`、`streams_closed`、`stream_resets_*`（含 shutdown 计入 `session_dead`）、`inbound_open_fail`、`outbound_dial_fail` | 稳态 `closed / (closed+reset)` 高；`DialFailed` 是目标侧；进程退出时 teardown 会抬高 `session_dead`，看稳态窗口不要看进程寿命 |
+| Q1 | 流有没有跑完？ | `streams_opened`、`streams_closed`、`stream_resets_*`（含 shutdown 计入 `session_dead`）、`inbound_open_fail`、`outbound_dial_fail`、`nya_reset_retry_total`、`nya_streams_held` vs `nya_streams_live` | 稳态 `closed / (closed+reset)` 高；`DialFailed` 是目标侧；进程退出时 teardown 会抬高 `session_dead`，看稳态窗口不要看进程寿命。活会话上 `held` 不应在 204 短流上单调堆积 |
 | Q2 | 发送或乱序交付有没有卡住？ | `stall_ms` histogram（离开 stall 时 observe）、`streams_stalled` gauge | **不是**「应用 TCP 空闲 / 慢消费者」。定义见下：send-unacked stall ∪ recv-**hole** stall。p99 与路径 `degrade_timeout` 同量级 |
 | Q3 | 路径静默后多久切走？ | `failover_ms` histogram：**每个路径事件一次**，值为该 path 的 `last_rx_ago` | overlay 静默时长，与 e2e `failover_observed_ms`（应用 ping `gap_around`）**同量级、不同口径**。快路径 ≪ 1s |
 | Q4 | 切换在救命还是 chatter？ | `migrates`、`failbacks`（跨 link）、`failbacks_upgrade`、`hol_rebalances`（含首次 bulk）、`failbacks_same_link` | soak 下 `failbacks/min < 25`（已有 e2e 门）；无故障时跨 link failback 接近 0 |
@@ -768,7 +768,7 @@ streams = "<粘滞表，最多 64 条，多出 +N>"
 "snapshot"
 ```
 
-Hop p99 来自 `ProcessCounters` snapshot-only histograms（`STALL_MS_BOUNDS`），**不**进 `visit_metrics` / Prometheus（`n_counter` 仍为 50）。客户端只 observe `open` / `first_rx` / `last_rx`；服务端只 observe `dial` / `origin_first` / `origin_last`。`copy` / `cfirst` / `clast` / `crx_at_olast` / `max_gap` / `crx_at_gap` / `origin_at_gap` 只走 debug + `tail=`。
+Hop p99 来自 `ProcessCounters` snapshot-only histograms（`STALL_MS_BOUNDS`），**不**进 `visit_metrics` / Prometheus（`n_counter` 为 54：含 `nya_reset_retry_total`、`nya_path_picks_total`）。`nya_pick_rtt_us` 是 gauge。info 有 `pick_rtt`（ms；未知 dest 为 0）。`nya_path_picks_total` 是 path/link 标签的 counter，5-tuple recycle 时 series 从 0 再走（看 `_created`）。客户端只 observe `open` / `first_rx` / `last_rx`；服务端只 observe `dial` / `origin_first` / `origin_last`。`copy` / `cfirst` / `clast` / `crx_at_olast` / `max_gap` / `crx_at_gap` / `origin_at_gap` 只走 debug + `tail=`。
 
 `tail=` 语法（µs；无时长门）：
 
@@ -1275,7 +1275,7 @@ OTLP = `visit_metrics` 投影，cumulative。histogram 是 `_bucket`/`_sum`/`_co
 9. **scheduler 保持纯函数。** `format_candidates` 语法冻结，score = `pick_from` 公式。
 10. **metrics 不含 host / PSK / exporter / 完整 session_id。** 非 loopback 拒 bind。
 11. **ProcessCounters 挂在 `Inner`，永远有 `Session::process()`。** `sessions_live` 随 `dead` CAS。握手四个 fail 原子。`reconnect_ok` 只在 path up。harness 无需 `start()`。
-12. **Q1 生命周期：** `open_stream` 先 pick 再 alloc。`counted_close` CAS 是 `streams_closed` XOR `stream_resets_*` 以及 lifetime/stall observe 的唯一门（`close_send` / `on_peer_close` / `reset_stream` / `on_peer_reset` / `mark_dead`）。`reset.swap` 只防第二帧。`mark_dead` 对剩余 id 调 `reset_stream(SessionDead)`（Drop 不发帧）。不 GC HashMap、不 join pump。
+12. **Q1 生命周期：** `open_stream` 先 pick 再 alloc。`counted_close` CAS 是 `streams_closed` XOR `stream_resets_*` 以及 lifetime/stall observe 的唯一门（`close_send` / `on_peer_close` / `reset_stream` / `on_peer_reset` / `mark_dead`）。`reset.swap` 只防第二帧。`mark_dead` 对剩余 id 调 `reset_stream(SessionDead)`（Drop 不发帧）。活会话上 `counted_close` / linger / hygiene Reset 会从 HashMap 摘掉；不 idle-GC 无 FIN 的 in-flight；不 join pump。
 13. **ProcessSnapshot v1 = 求和 + 扁平 paths**；`sessions.len()>1` 时 `path` = `{4hex}:{name}`。默认 snapshot 间隔 10s。`failover_ms` 用 `last_rx_ago`。不要 json feature。
 14. **首次 bulk `hol_place_bulk` 计入 `hol_rebalances`**，`reason=hol_initial`。
 15. **stall 进入时冻 `stall_from_ms`，离开才 observe。** send 无 ACK 用 `Unacked.last_sent`；recv 无交付用 `recv_hole_since_ms`。`opened_ms` 只给寿命。禁止 `now-0` 和离开时重算 `last_*`。maintain 扫描是固定税。

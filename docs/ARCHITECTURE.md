@@ -94,7 +94,7 @@ offset 进度（`session::{streams,steer}`，5ms tick）：
 - **路径 down**：那条 TCP 上的 unacked / Open / Close **立刻**换到仍活的路上；路径拆/重拨是池卫生，不挡 TTFB。
 - **HOL**：same-link bulk vs interactive；last-send 只是诊断和 HOL 放置，不是发送契约。`maybe_failback` 已从 maintain 去掉。
 
-HOL 隔离靠「每链路多连接 + bulk 避开交互连接」，不是把流钉死在一条 TCP 上。
+HOL 隔离靠「每链路多连接 + bulk 避开交互连接」，不是把流钉死在一条 TCP 上。交互帧（`<= interactive_max` 1500 字节）和控制帧走 urgent；bulk 队列满 **不** `set_congested`。不要靠加大 `chan` 修 TTFB。未知 RTT 的替换 5-tuple 在已有已知、schedulable 姐妹时进不了 fastest class。
 
 ## 流控制
 
@@ -102,10 +102,11 @@ HOL 隔离靠「每链路多连接 + bulk 避开交互连接」，不是把流�
 - `STREAM_DATA` 带 offset，接收端 `BTreeMap` 重排
 - 未确认数据记在发送路径的 inflight 上；ACK 时减去，并对小帧采样 RTT（bulk ACK 不当时延）
 - 服务端出站拨号失败会 `IncomingStream::reset(DialFailed)`，对端收到 `STREAM_RESET`
+- 活会话上流表：`counted_close` / 半关闭 linger / hygiene `STREAM_RESET` 会从 `Inner.streams` 摘掉。第一 closer 的 Close 重试停在对端 `recv_fin` 或 `close_linger`，**不用** multiplexed `path.last_rx` 当 Close ACK（Pong ≠ Close 送达）。第二 closer 仍在 `observe_stream_end` 立刻 `forget_close`。hygiene Reset 有与 Close 同形的 side table（换路重试；没有 dest 也 `remember`）。linger 仍不是产品 `stream_resets_timeout`。部署前已经堆在表里的 hangover 不会被新二进制排空，需要 bounce 会话。
 
 ## 可观测性
 
-`Counters` 挂在每个 `Session` 上，进程边缘（入站 / 出站 / 握手 / 重连）走 `ProcessCounters`（始终在 `Inner` 上）。默认每 10s 一条 `nya_core::obs` snapshot；`[obs].metrics_listen` 默认关。info 计分卡带 `mig`/`hol`/`hedge`/`rtx`/`fb_slink`/`picks_unk`/`recycle`/`corr`；进程边缘 hop p99 与 interval-max `tail=` 也在这条 snapshot 上，**不是**调度输入。决策点（pick / migrate / failback / HOL）仍是结构化 `debug!`。class raise/drop、correlated silence、outlier recycle、unknown-session recreate 走 **info**。热路径（STREAM_DATA / ACK / Ping）不打日志。可选 OTLP 在独立 crate `nya-obs`（只从二进制 `main` 安装）；名字来自 `visit_metrics` 一份 catalog。
+`Counters` 挂在每个 `Session` 上，进程边缘（入站 / 出站 / 握手 / 重连）走 `ProcessCounters`（始终在 `Inner` 上）。默认每 10s 一条 `nya_core::obs` snapshot；`[obs].metrics_listen` 默认关。info 计分卡带 `mig`/`hol`/`hedge`/`rtx`/`fb_slink`/`picks_unk`/`recycle`/`corr`/`pick_rtt`（最后一次真正发出 StreamOpen 的 dest 的 fast RTT，未知为 0；不是调度输入）；进程边缘 hop p99 与 interval-max `tail=` 也在这条 snapshot 上，**不是**调度输入。决策点（pick / migrate / failback / HOL）仍是结构化 `debug!`。class raise/drop、correlated silence、outlier recycle、unknown-session recreate 走 **info**。热路径（STREAM_DATA / ACK / Ping）不打日志。可选 OTLP 在独立 crate `nya-obs`（只从二进制 `main` 安装）；名字来自 `visit_metrics` 一份 catalog。
 
 线路状态按 `link_key` 汇总（`a#0`/`a#1` → `a`）：up/deg 连接数、RTT 范围、sticky、inflight、队列、rx 新鲜/最旧。`paths=` 可带 ` bak`。迁移原因拆成 speculative / path_down / ensure_sticky / send-blocked；另有 retransmit/hedge、probe_miss、未知 RTT pick。snapshot 带压缩 `streams=`（不进 Prometheus 标签）。
 

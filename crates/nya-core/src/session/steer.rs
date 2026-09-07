@@ -24,6 +24,7 @@ use super::Session;
 ///
 /// - Exact N−1 quiet (original peer-stall).
 /// - Or a cross-link cluster: ≥3 quiet spanning ≥2 named links.
+///
 /// All-N (`quiet == alive`) never holds. One named link (H8) never holds.
 fn correlated_hold(
     alive: usize,
@@ -237,6 +238,7 @@ impl Session {
         }
         self.retry_opens();
         self.retry_closes();
+        self.retry_resets();
         self.expire_early_data();
         self.expire_recv_closes();
 

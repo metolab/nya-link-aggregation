@@ -56,12 +56,13 @@ impl Session {
             target: target.clone(),
         });
         self.remember_open(id, path_id, target.clone());
-        if !self.send_on_path(path_id, open.clone()) {
-            if let Some(alt) = self.pick_retry(path_id) {
-                if self.send_on_path(alt, open) {
-                    self.set_sticky(id, alt);
-                    self.remember_open(id, alt, target);
-                }
+        if self.send_on_path(path_id, open.clone()) {
+            self.note_pick(path_id);
+        } else if let Some(alt) = self.pick_retry(path_id) {
+            if self.send_on_path(alt, open) {
+                self.set_sticky(id, alt);
+                self.remember_open(id, alt, target);
+                self.note_pick(alt);
             }
         }
         Ok(tun)
@@ -564,6 +565,7 @@ impl Session {
     }
 
     pub(super) fn on_peer_reset(&self, id: u32, reason: ResetReason) {
+        self.forget_reset(id);
         self.finish_stream(id, Some(reason), false);
     }
 }

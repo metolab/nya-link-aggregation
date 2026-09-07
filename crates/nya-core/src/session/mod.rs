@@ -17,7 +17,9 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, Notify};
 use tracing::{debug, info, warn};
 
-use nya_proto::{Frame, Pong, ResetReason, StreamClose, StreamData, StreamOpen, Target};
+use nya_proto::{
+    Frame, Pong, ResetReason, StreamClose, StreamData, StreamOpen, StreamReset, Target,
+};
 
 use crate::cfg::SessionConfig;
 use crate::health;
@@ -44,6 +46,17 @@ struct CloseUnacked {
     tried: Vec<u32>,
     second_closer: bool,
     final_offset: Option<u64>,
+}
+
+type CloseRetrySnap = (u32, u32, bool, Vec<u32>, Instant, Option<u64>);
+type ResetRetrySnap = (u32, u32, Vec<u32>, Instant, ResetReason);
+
+struct ResetUnacked {
+    path_id: u32,
+    sent_at: Instant,
+    started_at: Instant,
+    tried: Vec<u32>,
+    reason: ResetReason,
 }
 
 struct PendingEarly {
@@ -98,6 +111,7 @@ pub(crate) struct Inner {
     last_lived: Mutex<HashMap<String, Duration>>,
     opens: Mutex<HashMap<u32, OpenUnacked>>,
     closes: Mutex<HashMap<u32, CloseUnacked>>,
+    resets: Mutex<HashMap<u32, ResetUnacked>>,
     pending_early: Mutex<HashMap<u32, Vec<PendingEarly>>>,
     session_fp: Mutex<String>,
     /// Table-owned server sessions only. e2e duplex pairs stay alive so a
@@ -148,6 +162,7 @@ impl Session {
             last_lived: Mutex::new(HashMap::new()),
             opens: Mutex::new(HashMap::new()),
             closes: Mutex::new(HashMap::new()),
+            resets: Mutex::new(HashMap::new()),
             pending_early: Mutex::new(HashMap::new()),
             session_fp: Mutex::new(String::new()),
             reap_on_all_down: AtomicBool::new(false),
@@ -228,6 +243,7 @@ impl Session {
         for id in ids {
             self.finish_stream(id, Some(ResetReason::SessionDead), send_frame);
         }
+        self.inner.resets.lock().unwrap().clear();
         // After SessionClose / Reset hit the writer queues, wake path IO
         // so Idle close can flush urgent then close_notify.
         self.inner.dead_notify.notify_waiters();
@@ -372,6 +388,7 @@ impl Session {
         self.rehome_unacked_from(path_id);
         self.retry_open_from(path_id);
         self.retry_close_from(path_id);
+        self.retry_reset_from(path_id);
         self.inner.paths.lock().unwrap().remove(&path_id);
         if !self.has_alive_path() {
             *self.inner.all_down_since.lock().unwrap() = Some(Instant::now());
@@ -725,17 +742,9 @@ impl Session {
         }
     }
 
-    fn close_rx_after_send(&self, path_id: u32, sent_at: Instant) -> bool {
-        let Some(p) = self.get_path(path_id) else {
-            return false;
-        };
-        let last = *p.last_rx.lock().unwrap();
-        last > sent_at
-    }
-
     fn retry_closes(&self) {
         self.reap_closes();
-        let snapshot: Vec<(u32, u32, bool, Vec<u32>, Instant, Option<u64>)> = self
+        let snapshot: Vec<CloseRetrySnap> = self
             .inner
             .closes
             .lock()
@@ -762,10 +771,6 @@ impl Session {
                 }
             }
             if sent_at.elapsed() < self.retry_after(from) {
-                continue;
-            }
-            if self.close_rx_after_send(from, sent_at) {
-                self.forget_close(id);
                 continue;
             }
             let Some(alt) = self.pick_retry_tried(&tried) else {
@@ -824,6 +829,129 @@ impl Session {
                 self.inner
                     .metrics
                     .close_retry
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn remember_reset(&self, id: u32, path_id: u32, reason: ResetReason) {
+        let mut g = self.inner.resets.lock().unwrap();
+        if let Some(r) = g.get_mut(&id) {
+            r.path_id = path_id;
+            r.sent_at = Instant::now();
+            r.reason = reason;
+            if path_id != 0 {
+                Self::push_tried(&mut r.tried, path_id);
+            }
+            return;
+        }
+        let now = Instant::now();
+        g.insert(
+            id,
+            ResetUnacked {
+                path_id,
+                sent_at: now,
+                started_at: now,
+                tried: if path_id == 0 {
+                    Vec::new()
+                } else {
+                    vec![path_id]
+                },
+                reason,
+            },
+        );
+    }
+
+    fn forget_reset(&self, id: u32) {
+        self.inner.resets.lock().unwrap().remove(&id);
+    }
+
+    fn reap_resets(&self) {
+        let linger = self.inner.cfg.tuning.close_linger;
+        let drop: Vec<u32> = self
+            .inner
+            .resets
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, r)| r.started_at.elapsed() >= linger)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in drop {
+            self.forget_reset(id);
+        }
+    }
+
+    fn retry_resets(&self) {
+        self.reap_resets();
+        let snapshot: Vec<ResetRetrySnap> = self
+            .inner
+            .resets
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, r)| (*id, r.path_id, r.tried.clone(), r.sent_at, r.reason))
+            .collect();
+        for (id, from, tried, sent_at, reason) in snapshot {
+            if sent_at.elapsed() < self.retry_after(from) {
+                continue;
+            }
+            let Some(alt) = self.pick_retry_tried(&tried) else {
+                continue;
+            };
+            if self.send_on_path(
+                alt,
+                Frame::StreamReset(StreamReset {
+                    stream_id: id,
+                    reason,
+                }),
+            ) {
+                if let Some(r) = self.inner.resets.lock().unwrap().get_mut(&id) {
+                    r.path_id = alt;
+                    r.sent_at = Instant::now();
+                    Self::push_tried(&mut r.tried, alt);
+                }
+                self.inner
+                    .metrics
+                    .reset_retry
+                    .fetch_add(1, Ordering::Relaxed);
+                debug!(stream_id = id, from, to = alt, "reset_retry");
+            } else if let Some(r) = self.inner.resets.lock().unwrap().get_mut(&id) {
+                r.sent_at = Instant::now();
+                Self::push_tried(&mut r.tried, alt);
+            }
+        }
+    }
+
+    fn retry_reset_from(&self, dead: u32) {
+        let snapshot: Vec<(u32, Vec<u32>, ResetReason)> = self
+            .inner
+            .resets
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, r)| r.path_id == dead || r.path_id == 0)
+            .map(|(id, r)| (*id, r.tried.clone(), r.reason))
+            .collect();
+        for (id, tried, reason) in snapshot {
+            let Some(alt) = self.pick_retry_tried(&tried) else {
+                continue;
+            };
+            if self.send_on_path(
+                alt,
+                Frame::StreamReset(StreamReset {
+                    stream_id: id,
+                    reason,
+                }),
+            ) {
+                if let Some(r) = self.inner.resets.lock().unwrap().get_mut(&id) {
+                    r.path_id = alt;
+                    r.sent_at = Instant::now();
+                    Self::push_tried(&mut r.tried, alt);
+                }
+                self.inner
+                    .metrics
+                    .reset_retry
                     .fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -1132,16 +1260,39 @@ impl Session {
             let why = reset_reason.unwrap_or(ResetReason::SessionDead);
             let _ = st.inbound_tx.try_send(crate::stream::Inbound::Reset(why));
             st.send_wait.notify_waiters();
-            if send_frame {
-                if let Some(p) = self.pick_pref(PickPref::Any) {
-                    self.send_on_path(
-                        p,
-                        Frame::StreamReset(nya_proto::StreamReset {
-                            stream_id: id,
-                            reason: why,
-                        }),
-                    );
+            let live = send_frame && !self.inner.dead.load(Ordering::Relaxed);
+            if live {
+                match self.pick_pref(PickPref::Any) {
+                    Some(p) => {
+                        self.remember_reset(id, p, why);
+                        if !self.send_on_path(
+                            p,
+                            Frame::StreamReset(StreamReset {
+                                stream_id: id,
+                                reason: why,
+                            }),
+                        ) {
+                            if let Some(alt) = self.pick_retry(p) {
+                                self.remember_reset(id, alt, why);
+                                if self.send_on_path(
+                                    alt,
+                                    Frame::StreamReset(StreamReset {
+                                        stream_id: id,
+                                        reason: why,
+                                    }),
+                                ) {
+                                    self.inner
+                                        .metrics
+                                        .reset_retry
+                                        .fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                        }
+                    }
+                    None => self.remember_reset(id, 0, why),
                 }
+            } else {
+                self.forget_reset(id);
             }
         }
         if st
@@ -1308,6 +1459,15 @@ impl Session {
                 .picks_unknown_over_known
                 .fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    pub(crate) fn note_pick(&self, path_id: u32) {
+        let Some(p) = self.get_path(path_id) else {
+            return;
+        };
+        let rtt = if p.rtt_known() { p.rtt_us() } else { 0 };
+        self.inner.metrics.pick_rtt_us.store(rtt, Ordering::Relaxed);
+        p.picks.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn alive_path_names(&self) -> Vec<String> {
@@ -1615,8 +1775,10 @@ mod tests {
 
     #[tokio::test]
     async fn table_session_all_down_reaps() {
-        let mut cfg = SessionConfig::default();
-        cfg.all_down_timeout = Duration::ZERO;
+        let cfg = SessionConfig {
+            all_down_timeout: Duration::ZERO,
+            ..SessionConfig::default()
+        };
         let table = SessionTable::new(cfg);
         let id = [8u8; 16];
         let (s, _rx) = table.create_with_incoming(id).unwrap();
@@ -1712,7 +1874,18 @@ mod tests {
     }
 
     async fn pair_echo(names: &[&str]) -> (Session, Session) {
-        let (client, server, incoming) = pair();
+        pair_echo_cfg(names, {
+            let mut cfg = SessionConfig::default();
+            cfg.tuning.loss_timeout_floor = Duration::from_millis(150);
+            cfg.all_down_timeout = Duration::from_secs(2);
+            cfg
+        })
+        .await
+    }
+
+    async fn pair_echo_cfg(names: &[&str], cfg: SessionConfig) -> (Session, Session) {
+        let client = Session::new_client(cfg.clone());
+        let (server, incoming) = Session::new_server(cfg);
         tokio::spawn(echo_server(incoming));
         for name in names {
             let (ca, sa) = duplex(64 * 1024);
@@ -2667,6 +2840,438 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn close_retry_continues_while_path_pongs() {
+        let mut cfg = SessionConfig::default();
+        cfg.tuning.close_linger = Duration::from_millis(400);
+        cfg.tuning.loss_timeout_floor = Duration::from_millis(20);
+        let client = Session::new_client(cfg);
+        let (p1, _w1, _u1) = inject_live(&client, 1, "a#0", 7);
+        let _p2 = inject_live(&client, 2, "b#0", 7);
+        let tun = client
+            .open_stream(Target {
+                host: "t".into(),
+                port: 1,
+            })
+            .await
+            .unwrap();
+        drop(tun);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        *p1.last_rx.lock().unwrap() = Instant::now();
+        let before = client.snapshot().close_retry;
+        for _ in 0..8 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            *p1.last_rx.lock().unwrap() = Instant::now();
+            client.debug_maintain();
+        }
+        assert!(
+            client.snapshot().close_retry > before,
+            "Pong/last_rx must not cancel first-closer Close retry"
+        );
+        assert!(
+            client.inner.closes.lock().unwrap().contains_key(
+                &client
+                    .inner
+                    .streams
+                    .lock()
+                    .unwrap()
+                    .keys()
+                    .next()
+                    .copied()
+                    .or_else(|| client.inner.closes.lock().unwrap().keys().next().copied())
+                    .unwrap_or(1)
+            ) || !client.inner.closes.lock().unwrap().is_empty(),
+            "Close table must still hold the id until recv_fin or linger"
+        );
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn reset_retry_rehomes_when_enqueue_fails() {
+        let client = Session::new_client(SessionConfig::default());
+        let (p1, _w1, _u1) = inject_live(&client, 1, "a#0", 7);
+        let _p2 = inject_live(&client, 2, "b#0", 7);
+        let tun = client
+            .open_stream(Target {
+                host: "t".into(),
+                port: 1,
+            })
+            .await
+            .unwrap();
+        let id = tun.id;
+        let pref = client.pick_pref(PickPref::Any).expect("dest");
+        let stuffed = client.get_path(pref).expect("path");
+        stuff_urgent_keep_schedulable(&stuffed);
+        assert!(stuffed.is_schedulable());
+        let _ = p1;
+        let before = client.snapshot().reset_retry;
+        client.finish_stream(id, Some(ResetReason::Timeout), true);
+        assert!(
+            client.snapshot().reset_retry > before,
+            "failed first Reset enqueue must rehome and count reset_retry"
+        );
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn reset_retry_remembers_when_pick_pref_none() {
+        let mut cfg = SessionConfig::default();
+        cfg.tuning.close_linger = Duration::from_millis(400);
+        let client = Session::new_client(cfg);
+        let (_p, _w, _u) = inject_live(&client, 1, "a#0", 7);
+        let tun = client
+            .open_stream(Target {
+                host: "t".into(),
+                port: 1,
+            })
+            .await
+            .unwrap();
+        let id = tun.id;
+        let pid = *client.inner.paths.lock().unwrap().keys().next().unwrap();
+        client.path_failed(pid);
+        client.finish_stream(id, Some(ResetReason::Timeout), true);
+        assert!(
+            client.inner.resets.lock().unwrap().contains_key(&id),
+            "must remember Reset even with no dest"
+        );
+        let _p2 = inject_live(&client, 2, "b#0", 7);
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        client.debug_maintain();
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn reset_retry_stops_at_close_linger() {
+        let mut cfg = SessionConfig::default();
+        cfg.tuning.close_linger = Duration::from_millis(30);
+        let client = Session::new_client(cfg);
+        client.remember_reset(9, 0, ResetReason::Timeout);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        client.debug_maintain();
+        assert!(
+            client.inner.resets.lock().unwrap().is_empty(),
+            "reap_resets must drop after close_linger"
+        );
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn on_peer_reset_forgets_reset_table() {
+        let client = Session::new_client(SessionConfig::default());
+        let _p = inject_live(&client, 1, "a#0", 7);
+        let tun = client
+            .open_stream(Target {
+                host: "t".into(),
+                port: 1,
+            })
+            .await
+            .unwrap();
+        let id = tun.id;
+        client.remember_reset(id, 1, ResetReason::Timeout);
+        client.on_peer_reset(id, ResetReason::PeerReset);
+        assert!(
+            client.inner.resets.lock().unwrap().is_empty(),
+            "peer Reset must forget our Reset table"
+        );
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn second_closer_does_not_retry_until_linger() {
+        let (client, server) = pair_echo(&["a", "b"]).await;
+        let mut tun = client
+            .open_stream(Target {
+                host: "echo".into(),
+                port: 1,
+            })
+            .await
+            .unwrap();
+        tun.write_all(b"ping").await.unwrap();
+        let mut buf = [0u8; 4];
+        tun.read_exact(&mut buf).await.unwrap();
+        drop(tun);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            client.snapshot().close_retry < 10,
+            "second closer must not Close-storm; close_retry={}",
+            client.snapshot().close_retry
+        );
+        assert!(client.inner.closes.lock().unwrap().is_empty());
+        client.shutdown();
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn in_flight_copy_not_reaped_before_fin() {
+        let mut cfg = SessionConfig::default();
+        cfg.tuning.close_linger = Duration::from_millis(40);
+        let (client, server) = pair_echo_cfg(&["a"], cfg).await;
+        let mut tun = client
+            .open_stream(Target {
+                host: "echo".into(),
+                port: 1,
+            })
+            .await
+            .unwrap();
+        tun.write_all(b"ping").await.unwrap();
+        let mut buf = [0u8; 4];
+        tun.read_exact(&mut buf).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert_eq!(
+            client.inner.streams.lock().unwrap().len(),
+            1,
+            "in-flight must survive 2× linger"
+        );
+        assert_eq!(server.inner.streams.lock().unwrap().len(), 1);
+        assert_eq!(client.snapshot().stream_reaps_linger, 0);
+        drop(tun);
+        client.shutdown();
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn server_leftover_close_swallowed_reset_retried() {
+        let mut cfg = SessionConfig::default();
+        cfg.tuning.close_linger = Duration::from_millis(80);
+        cfg.tuning.loss_timeout_floor = Duration::from_millis(20);
+        let client = Session::new_client(cfg.clone());
+        let (server, incoming) = Session::new_server(cfg);
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            let mut incoming = incoming;
+            while let Some(inc) = incoming.recv().await {
+                held.push(inc);
+            }
+            let _ = held;
+        });
+        let (p1, mut cw1, mut cu1) = inject_live(&client, 1, "a#0", 7);
+        let (_p2, mut cw2, mut cu2) = inject_live(&client, 2, "b#0", 7);
+        let _s1 = inject_live(&server, 1, "a#0", 7);
+        let _s2 = inject_live(&server, 2, "b#0", 7);
+
+        fn take(w: &mut mpsc::Receiver<Frame>, u: &mut mpsc::Receiver<Frame>) -> Option<Frame> {
+            u.try_recv().ok().or_else(|| w.try_recv().ok())
+        }
+
+        let mut tun = client
+            .open_stream(Target {
+                host: "echo".into(),
+                port: 1,
+            })
+            .await
+            .unwrap();
+        let mut open = None;
+        for _ in 0..32 {
+            if let Some(Frame::StreamOpen(o)) = take(&mut cw1, &mut cu1) {
+                open = Some(o);
+                break;
+            }
+            if let Some(Frame::StreamOpen(o)) = take(&mut cw2, &mut cu2) {
+                open = Some(o);
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let open = open.expect("client sent StreamOpen");
+        server.handle_frame(1, Frame::StreamOpen(open.clone()));
+        tun.write_all(b"hi").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        while take(&mut cw1, &mut cu1).is_some() {}
+        while take(&mut cw2, &mut cu2).is_some() {}
+        drop(tun);
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        // Swallow Close on every path; do not feed the server.
+        loop {
+            let f = take(&mut cw1, &mut cu1).or_else(|| take(&mut cw2, &mut cu2));
+            match f {
+                Some(Frame::StreamClose(_)) => {}
+                Some(_) => {}
+                None => break,
+            }
+        }
+        *p1.last_rx.lock().unwrap() = Instant::now();
+        stuff_urgent_keep_schedulable(&p1);
+        let deadline = Instant::now() + Duration::from_millis(250);
+        while Instant::now() < deadline {
+            client.debug_maintain();
+            server.debug_maintain();
+            while let Some(f) = take(&mut cw1, &mut cu1).or_else(|| take(&mut cw2, &mut cu2)) {
+                if matches!(f, Frame::StreamReset(_)) {
+                    server.handle_frame(2, f);
+                }
+            }
+            if server.inner.streams.lock().unwrap().is_empty() && client.snapshot().reset_retry >= 1
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            server.inner.streams.lock().unwrap().len(),
+            0,
+            "server leftover must reap after Reset rehome"
+        );
+        assert!(
+            client.snapshot().reset_retry >= 1,
+            "Yuusei miss is Reset rehome, not Close retry alone"
+        );
+        client.shutdown();
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn note_pick_credits_alt_when_primary_enqueue_fails() {
+        let client = Session::new_client(SessionConfig::default());
+        let (p1, _w1, _u1) = inject_live(&client, 1, "a#0", 80);
+        let p2 = inject_live(&client, 2, "b#0", 7);
+        stuff_urgent_keep_schedulable(&p1);
+        let _tun = client
+            .open_stream(Target {
+                host: "t".into(),
+                port: 1,
+            })
+            .await
+            .unwrap();
+        let rtt = client.snapshot().pick_rtt_us;
+        assert!(
+            (6_000..=10_000).contains(&rtt),
+            "pick_rtt_us should be the alt 7ms dest, got {rtt}"
+        );
+        let snaps = client.snapshot();
+        let p1s = snaps.paths.iter().find(|p| p.name == "a#0").unwrap();
+        let p2s = snaps.paths.iter().find(|p| p.name == "b#0").unwrap();
+        assert_eq!(
+            p1s.picks, 0,
+            "primary enqueue failed; must not credit picks"
+        );
+        assert_eq!(p2s.picks, 1);
+        let _ = p2;
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn note_pick_unknown_stores_zero() {
+        let client = Session::new_client(SessionConfig::default());
+        let (_p, _w, _u) = inject_live(&client, 1, "a#0", 0);
+        // rtt 0 ms store still sets ewma 0 → unknown
+        client
+            .inner
+            .paths
+            .lock()
+            .unwrap()
+            .get(&1)
+            .unwrap()
+            .rtt_ewma_us
+            .store(0, Ordering::Relaxed);
+        let _tun = client
+            .open_stream(Target {
+                host: "t".into(),
+                port: 1,
+            })
+            .await
+            .unwrap();
+        assert_eq!(client.snapshot().pick_rtt_us, 0);
+        assert!(client.snapshot().picks_unknown_rtt >= 1);
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn open_stream_pick_rtt_prefers_fast_dest() {
+        let client = Session::new_client(SessionConfig::default());
+        let _slow = inject_live(&client, 1, "soy#0", 80);
+        let _fast = inject_live(&client, 2, "akcdn#0", 7);
+        let _tun = client
+            .open_stream(Target {
+                host: "t".into(),
+                port: 1,
+            })
+            .await
+            .unwrap();
+        let rtt = client.snapshot().pick_rtt_us;
+        assert!(
+            (6_000..=10_000).contains(&rtt),
+            "pick_rtt_us should be 7ms dest, got {rtt}"
+        );
+        let snaps = client.snapshot();
+        assert_eq!(
+            snaps
+                .paths
+                .iter()
+                .find(|p| p.name == "akcdn#0")
+                .unwrap()
+                .picks,
+            1
+        );
+        assert_eq!(
+            snaps
+                .paths
+                .iter()
+                .find(|p| p.name == "soy#0")
+                .unwrap()
+                .picks,
+            0
+        );
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn path_failed_does_not_tear_sisters() {
+        let client = Session::new_client(SessionConfig::default());
+        let a = inject_named(&client, 1, "soy#0", 7);
+        let b = inject_named(&client, 2, "soy#1", 7);
+        client.path_failed(1);
+        assert!(b.is_alive());
+        assert!(!a.is_alive());
+        assert_eq!(client.snapshot().path_down, 1);
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn short_lived_unknown_not_pick_best_with_known_fresh_sister() {
+        let client = Session::new_client(SessionConfig::default());
+        let _known = inject_live(&client, 1, "akcdn#0", 7);
+        inject_named(&client, 2, "soy#0", 7);
+        client.path_failed(2);
+        let (_unk, _w, _u) = inject_live(&client, 3, "soy#0", 0);
+        client
+            .inner
+            .paths
+            .lock()
+            .unwrap()
+            .get(&3)
+            .unwrap()
+            .rtt_ewma_us
+            .store(0, Ordering::Relaxed);
+        let _tun = client
+            .open_stream(Target {
+                host: "t".into(),
+                port: 1,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            client
+                .snapshot()
+                .paths
+                .iter()
+                .find(|p| p.name == "akcdn#0")
+                .unwrap()
+                .picks,
+            1
+        );
+        assert_eq!(
+            client
+                .snapshot()
+                .paths
+                .iter()
+                .find(|p| p.name == "soy#0")
+                .unwrap()
+                .picks,
+            0
+        );
+        client.shutdown();
+    }
+
+    #[tokio::test]
     async fn reset_after_graceful_does_not_double_count() {
         let (client, server, incoming) = pair();
         tokio::spawn(echo_server(incoming));
@@ -2770,6 +3375,19 @@ mod tests {
             }
         }
         panic!("urgent queue did not fill");
+    }
+
+    /// Fill urgent without `set_congested`, so `pick_pref` still returns this dest.
+    fn stuff_urgent_keep_schedulable(p: &PathState) {
+        let ping = Frame::Ping(nya_proto::Ping {
+            seq: 1,
+            sent_at_ms: 0,
+        });
+        loop {
+            if p.urgent.try_send(ping.clone()).is_err() {
+                return;
+            }
+        }
     }
 
     fn age_rx(p: &PathState, ms: u64) {

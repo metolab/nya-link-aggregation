@@ -72,6 +72,23 @@ pub fn metric_descriptors() -> Vec<MetricDesc> {
                 label_keys: Vec::new(),
             });
         }
+        fn counter_labeled(
+            &mut self,
+            name: &'static str,
+            help: &'static str,
+            labels: &[(&'static str, &str)],
+            _value: u64,
+        ) {
+            if self.0.iter().any(|d| d.name == name) {
+                return;
+            }
+            self.0.push(MetricDesc {
+                name,
+                help,
+                kind: InstrumentKind::Counter,
+                label_keys: labels.iter().map(|(k, _)| *k).collect(),
+            });
+        }
     }
     let mut ps = ProcessSnapshot::default();
     ps.session.failover_ms = HistSnap::zeroed(FAILOVER_MS_BOUNDS);
@@ -106,6 +123,16 @@ pub trait MetricSink {
         bounds: &'static [u64],
         snap: &HistSnap,
     );
+    fn counter_labeled(
+        &mut self,
+        name: &'static str,
+        help: &'static str,
+        labels: &[(&'static str, &str)],
+        value: u64,
+    ) {
+        let _ = labels;
+        self.counter(name, help, value);
+    }
 }
 
 /// Walk `ps`. Name order is part of the catalog contract.
@@ -164,6 +191,11 @@ pub fn visit_metrics(ps: &ProcessSnapshot, sink: &mut impl MetricSink) {
         "nya_close_retry_total",
         "STREAM_CLOSE rehomes onto another path",
         s.close_retry,
+    );
+    sink.counter(
+        "nya_reset_retry_total",
+        "STREAM_RESET rehomes onto another path",
+        s.reset_retry,
     );
     sink.counter(
         "nya_probe_miss_total",
@@ -363,6 +395,12 @@ pub fn visit_metrics(ps: &ProcessSnapshot, sink: &mut impl MetricSink) {
         s.streams_held,
     );
     sink.gauge("nya_sessions_live", "live sessions", &[], p.sessions_live);
+    sink.gauge(
+        "nya_pick_rtt_us",
+        "fast RTT of last open_stream pick",
+        &[],
+        s.pick_rtt_us,
+    );
 
     sink.histogram(
         "nya_failover_ms",
@@ -443,6 +481,12 @@ pub fn visit_metrics(ps: &ProcessSnapshot, sink: &mut impl MetricSink) {
     for pth in &s.paths {
         let lab = [("path", pth.name.as_str()), ("link", pth.link.as_str())];
         sink.gauge("nya_path_rtt_us", "path fast RTT", &lab, pth.rtt_us);
+        sink.counter_labeled(
+            "nya_path_picks_total",
+            "open_stream picks onto this dest",
+            &lab,
+            pth.picks,
+        );
         sink.gauge(
             "nya_path_stable_rtt_us",
             "path stable RTT",
@@ -538,6 +582,15 @@ pub fn prometheus_metric_names(_ps: &ProcessSnapshot) -> BTreeSet<String> {
             self.0.insert(format!("{name}_sum"));
             self.0.insert(format!("{name}_count"));
         }
+        fn counter_labeled(
+            &mut self,
+            name: &'static str,
+            _help: &'static str,
+            _labels: &[(&'static str, &str)],
+            _value: u64,
+        ) {
+            self.0.insert(name.to_string());
+        }
     }
     // Empty snapshot still emits unlabeled + hists; inject dummy path/link so
     // labeled names are part of the static set.
@@ -574,6 +627,35 @@ impl MetricSink for PrometheusTextSink {
     fn counter(&mut self, name: &'static str, help: &'static str, value: u64) {
         write_help_type(&mut self.o, name, help, "counter");
         self.o.push_str(name);
+        self.o.push(' ');
+        self.o.push_str(&value.to_string());
+        self.o.push('\n');
+    }
+
+    fn counter_labeled(
+        &mut self,
+        name: &'static str,
+        help: &'static str,
+        labels: &[(&'static str, &str)],
+        value: u64,
+    ) {
+        if !self.o.contains(&format!("# TYPE {name} ")) {
+            write_help_type(&mut self.o, name, help, "counter");
+        }
+        self.o.push_str(name);
+        if !labels.is_empty() {
+            self.o.push('{');
+            for (i, (k, val)) in labels.iter().enumerate() {
+                if i > 0 {
+                    self.o.push(',');
+                }
+                self.o.push_str(k);
+                self.o.push_str("=\"");
+                self.o.push_str(&prometheus_label(val));
+                self.o.push('"');
+            }
+            self.o.push('}');
+        }
         self.o.push(' ');
         self.o.push_str(&value.to_string());
         self.o.push('\n');
@@ -672,6 +754,15 @@ struct SnapshotKv(String);
 impl MetricSink for SnapshotKv {
     fn counter(&mut self, name: &'static str, _help: &'static str, value: u64) {
         self.push_kv(name, None, value);
+    }
+    fn counter_labeled(
+        &mut self,
+        name: &'static str,
+        _help: &'static str,
+        labels: &[(&'static str, &str)],
+        value: u64,
+    ) {
+        self.push_kv(name, Some(labels), value);
     }
     fn gauge(
         &mut self,

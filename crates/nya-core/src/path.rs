@@ -69,6 +69,8 @@ pub struct PathState {
     pub failover_recorded: AtomicBool,
     urgent_queued: AtomicU64,
     bulk_queued: AtomicU64,
+    /// `open_stream` hits that actually sent StreamOpen on this dest.
+    pub picks: AtomicU64,
 }
 
 impl PathState {
@@ -115,6 +117,7 @@ impl PathState {
             failover_recorded: AtomicBool::new(false),
             urgent_queued: AtomicU64::new(0),
             bulk_queued: AtomicU64::new(0),
+            picks: AtomicU64::new(0),
         })
     }
 
