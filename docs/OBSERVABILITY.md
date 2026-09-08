@@ -1275,7 +1275,7 @@ OTLP = `visit_metrics` 投影，cumulative。histogram 是 `_bucket`/`_sum`/`_co
 9. **scheduler 保持纯函数。** `format_candidates` 语法冻结，score = `pick_from` 公式。
 10. **metrics 不含 host / PSK / exporter / 完整 session_id。** 非 loopback 拒 bind。
 11. **ProcessCounters 挂在 `Inner`，永远有 `Session::process()`。** `sessions_live` 随 `dead` CAS。握手四个 fail 原子。`reconnect_ok` 只在 path up。harness 无需 `start()`。
-12. **Q1 生命周期：** `open_stream` 先 pick 再 alloc。`counted_close` CAS 是 `streams_closed` XOR `stream_resets_*` 以及 lifetime/stall observe 的唯一门（`close_send` / `on_peer_close` / `reset_stream` / `on_peer_reset` / `mark_dead`）。`reset.swap` 只防第二帧。`mark_dead` 对剩余 id 调 `reset_stream(SessionDead)`（Drop 不发帧）。活会话上 `counted_close` / linger / hygiene Reset 会从 HashMap 摘掉；不 idle-GC 无 FIN 的 in-flight；不 join pump。
+12. **Q1 生命周期：** `open_stream` 先 pick 再 alloc。`counted_close` CAS 是 `streams_closed` XOR `stream_resets_*` 以及 lifetime/stall observe 的唯一门（`close_send` / `on_peer_close` / `reset_stream` / `on_peer_reset` / `mark_dead`）。`reset.swap` 只防第二帧。`mark_dead` 对剩余 id 调 `reset_stream(SessionDead)`（Drop 不发帧）。活会话上 `counted_close` / linger / hygiene Reset 会从 HashMap 摘掉；progress-fine linger 可在**不**发 hygiene Reset 的情况下 GC HashMap（`nya_reset_retry_total` 只剩 leftover / 无进度；`nya_stream_reaps_linger_total` 覆盖静默摘表与偶发 Timeout 记 linger）。不 idle-GC 无 FIN 的 in-flight；不 join pump。
 13. **ProcessSnapshot v1 = 求和 + 扁平 paths**；`sessions.len()>1` 时 `path` = `{4hex}:{name}`。默认 snapshot 间隔 10s。`failover_ms` 用 `last_rx_ago`。不要 json feature。
 14. **首次 bulk `hol_place_bulk` 计入 `hol_rebalances`**，`reason=hol_initial`。
 15. **stall 进入时冻 `stall_from_ms`，离开才 observe。** send 无 ACK 用 `Unacked.last_sent`；recv 无交付用 `recv_hole_since_ms`。`opened_ms` 只给寿命。禁止 `now-0` 和离开时重算 `last_*`。maintain 扫描是固定税。

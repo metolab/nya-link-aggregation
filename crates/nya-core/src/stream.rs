@@ -101,7 +101,10 @@ impl StreamState {
     }
 
     pub fn is_steerable(&self) -> bool {
-        !self.reset.load(Ordering::Relaxed) && !self.counted_close.load(Ordering::Relaxed)
+        !self.reset.load(Ordering::Relaxed)
+            && !self.counted_close.load(Ordering::Relaxed)
+            && !self.send_fin_sent.load(Ordering::Relaxed)
+            && !self.recv_fin.load(Ordering::Relaxed)
     }
 
     pub fn note_close_started(&self) {

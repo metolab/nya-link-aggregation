@@ -473,6 +473,17 @@ impl Session {
         pick_retry_path(&self.path_list(), &self.inner.cfg, tried)
     }
 
+    /// Close/Reset timer-rehome: refuse `pick_retry_path`'s cycle rung.
+    /// DATA (`retry_expired_unacked`) still uses [`Self::pick_retry_tried`].
+    fn pick_retry_untried(&self, tried: &[u32]) -> Option<u32> {
+        let alt = self.pick_retry_tried(tried)?;
+        if tried.contains(&alt) {
+            None
+        } else {
+            Some(alt)
+        }
+    }
+
     /// Min **fast** EWMA among alive, RTT-known dests. Honest dest RTT, not
     /// frozen class. Shared by [`Self::retry_after`] and StreamAck sample cap.
     pub(super) fn min_alive_fast_rtt(&self) -> Option<Duration> {
@@ -762,18 +773,21 @@ impl Session {
             })
             .collect();
         for (id, from, second, tried, sent_at, final_offset) in snapshot {
-            if !second {
-                if let Some(st) = self.get_stream(id) {
-                    if st.recv_fin.load(Ordering::Relaxed) {
-                        self.forget_close(id);
-                        continue;
-                    }
+            match self.get_stream(id) {
+                None => {
+                    self.forget_close(id);
+                    continue;
                 }
+                Some(st) if !second && st.recv_fin.load(Ordering::Relaxed) => {
+                    self.forget_close(id);
+                    continue;
+                }
+                Some(_) => {}
             }
             if sent_at.elapsed() < self.retry_after(from) {
                 continue;
             }
-            let Some(alt) = self.pick_retry_tried(&tried) else {
+            let Some(alt) = self.pick_retry_untried(&tried) else {
                 continue;
             };
             if self.send_on_path(
@@ -795,23 +809,33 @@ impl Session {
                 debug!(stream_id = id, from, to = alt, "close_retry");
             } else if let Some(c) = self.inner.closes.lock().unwrap().get_mut(&id) {
                 c.sent_at = Instant::now();
-                Self::push_tried(&mut c.tried, alt);
             }
         }
     }
 
     fn retry_close_from(&self, dead: u32) {
-        let snapshot: Vec<(u32, Vec<u32>, Option<u64>)> = self
+        let snapshot: Vec<(u32, Vec<u32>, Option<u64>, bool)> = self
             .inner
             .closes
             .lock()
             .unwrap()
             .iter()
             .filter(|(_, c)| c.path_id == dead)
-            .map(|(id, c)| (*id, c.tried.clone(), c.final_offset))
+            .map(|(id, c)| (*id, c.tried.clone(), c.final_offset, c.second_closer))
             .collect();
-        for (id, tried, final_offset) in snapshot {
-            let Some(alt) = self.pick_retry_tried(&tried) else {
+        for (id, tried, final_offset, second) in snapshot {
+            match self.get_stream(id) {
+                None => {
+                    self.forget_close(id);
+                    continue;
+                }
+                Some(st) if !second && st.recv_fin.load(Ordering::Relaxed) => {
+                    self.forget_close(id);
+                    continue;
+                }
+                Some(_) => {}
+            }
+            let Some(alt) = self.pick_retry_untried(&tried) else {
                 continue;
             };
             if self.send_on_path(
@@ -896,7 +920,7 @@ impl Session {
             if sent_at.elapsed() < self.retry_after(from) {
                 continue;
             }
-            let Some(alt) = self.pick_retry_tried(&tried) else {
+            let Some(alt) = self.pick_retry_untried(&tried) else {
                 continue;
             };
             if self.send_on_path(
@@ -918,7 +942,6 @@ impl Session {
                 debug!(stream_id = id, from, to = alt, "reset_retry");
             } else if let Some(r) = self.inner.resets.lock().unwrap().get_mut(&id) {
                 r.sent_at = Instant::now();
-                Self::push_tried(&mut r.tried, alt);
             }
         }
     }
@@ -934,7 +957,7 @@ impl Session {
             .map(|(id, r)| (*id, r.tried.clone(), r.reason))
             .collect();
         for (id, tried, reason) in snapshot {
-            let Some(alt) = self.pick_retry_tried(&tried) else {
+            let Some(alt) = self.pick_retry_untried(&tried) else {
                 continue;
             };
             if self.send_on_path(
@@ -963,6 +986,10 @@ impl Session {
         let acked = st.send_acked.load(Ordering::Relaxed);
         let next = st.send_next.load(Ordering::Relaxed);
         if acked < next {
+            return false;
+        }
+        let off = st.recv_close_off.load(Ordering::Relaxed);
+        if off != u64::MAX && st.recv_next.load(Ordering::Relaxed) < off {
             return false;
         }
         if recv_fin {
@@ -1246,6 +1273,35 @@ impl Session {
         }
     }
 
+    /// Progress-fine linger: HashMap remove without wire Reset.
+    /// `forget_reset` only on the `counted_close` CAS-winner path.
+    pub(crate) fn linger_reap_progress_fine(&self, id: u32) {
+        let Some(st) = self.get_stream(id) else {
+            return;
+        };
+        if !self.overlay_progress_fine(&st) {
+            self.reset_stream(id, ResetReason::Timeout);
+            return;
+        }
+        if st
+            .counted_close
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+        if !self.overlay_progress_fine(&st) {
+            self.observe_stream_end(&st, Some(ResetReason::Timeout));
+            self.finish_stream(id, Some(ResetReason::Timeout), true);
+            return;
+        }
+        self.observe_stream_end(&st, Some(ResetReason::Timeout));
+        if !st.recv_fin.swap(true, Ordering::SeqCst) {
+            let _ = st.inbound_tx.try_send(crate::stream::Inbound::Close);
+        }
+        self.remove_held_stream(id);
+    }
+
     pub(crate) fn finish_stream(
         &self,
         id: u32,
@@ -1343,6 +1399,7 @@ impl Session {
                     .fetch_add(1, Ordering::Relaxed);
                 debug!(stream_id = st.id, reason = "linger", "stream end");
                 self.forget_close(st.id);
+                self.forget_reset(st.id);
                 return;
             }
             Some(reason) => {
@@ -1735,7 +1792,7 @@ impl SessionTable {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nya_proto::{StreamAck, StreamClose, Target};
+    use nya_proto::{StreamAck, StreamClose, StreamData, StreamOpen, Target};
     use std::pin::Pin;
     use std::task::{Context, Poll};
     use tokio::io::{duplex, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
@@ -3114,6 +3171,445 @@ mod tests {
             client.snapshot().reset_retry >= 1,
             "Yuusei miss is Reset rehome, not Close retry alone"
         );
+        client.shutdown();
+        server.shutdown();
+    }
+
+    fn age_close_sent(client: &Session) {
+        let mut g = client.inner.closes.lock().unwrap();
+        for c in g.values_mut() {
+            c.sent_at = Instant::now() - Duration::from_millis(400);
+        }
+    }
+
+    fn drain_frames(w: &mut mpsc::Receiver<Frame>, u: &mut mpsc::Receiver<Frame>) -> Vec<Frame> {
+        let mut out = Vec::new();
+        while let Ok(f) = u.try_recv() {
+            out.push(f);
+        }
+        while let Ok(f) = w.try_recv() {
+            out.push(f);
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn close_retry_stops_when_stream_gone() {
+        let client = Session::new_client(SessionConfig::default());
+        let _p = inject_live(&client, 1, "a#0", 7);
+        client.remember_close(7, 1, false, None);
+        age_close_sent(&client);
+        let r0 = client.snapshot().close_retry;
+        client.debug_maintain();
+        assert!(
+            client.inner.closes.lock().unwrap().is_empty(),
+            "HashMap-gone must forget Close"
+        );
+        assert_eq!(
+            client.snapshot().close_retry,
+            r0,
+            "must not send Close for a missing stream"
+        );
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn close_retry_does_not_cycle_tried_paths() {
+        let client = Session::new_client(SessionConfig::default());
+        let _p1 = inject_live(&client, 1, "a#0", 7);
+        let _p2 = inject_live(&client, 2, "b#0", 7);
+        let tun = client
+            .open_stream(Target {
+                host: "t".into(),
+                port: 1,
+            })
+            .await
+            .unwrap();
+        let id = tun.id;
+        client.remember_close(id, 1, false, None);
+        age_close_sent(&client);
+        client.debug_maintain();
+        let after_first = client.snapshot().close_retry;
+        assert!(after_first >= 1, "first timer rehome must count");
+        age_close_sent(&client);
+        client.debug_maintain();
+        age_close_sent(&client);
+        let r = client.snapshot().close_retry;
+        client.debug_maintain();
+        assert_eq!(
+            client.snapshot().close_retry,
+            r,
+            "must not cycle tried live paths"
+        );
+        assert!(
+            client.inner.closes.lock().unwrap().contains_key(&id),
+            "table stays until linger"
+        );
+        drop(tun);
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn close_retry_first_closer_six_path_capped() {
+        let client = Session::new_client(SessionConfig::default());
+        for i in 1..=6 {
+            let _ = inject_live(&client, i, &format!("l{i}#0"), 7);
+        }
+        let tun = client
+            .open_stream(Target {
+                host: "t".into(),
+                port: 1,
+            })
+            .await
+            .unwrap();
+        let id = tun.id;
+        client.remember_close(id, 1, false, None);
+        for _ in 0..12 {
+            age_close_sent(&client);
+            client.debug_maintain();
+        }
+        assert!(
+            client.snapshot().close_retry <= 6,
+            "close_retry={} must be <= path count",
+            client.snapshot().close_retry
+        );
+        let r = client.snapshot().close_retry;
+        age_close_sent(&client);
+        client.debug_maintain();
+        assert_eq!(
+            client.snapshot().close_retry,
+            r,
+            "further maintains must not spray"
+        );
+        drop(tun);
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn close_retry_completed_short_stream_capped() {
+        let (client, server) =
+            pair_echo_cfg(&["a", "b", "c", "d", "e", "f"], SessionConfig::default()).await;
+        let mut tun = client
+            .open_stream(Target {
+                host: "echo".into(),
+                port: 1,
+            })
+            .await
+            .unwrap();
+        tun.write_all(b"ping").await.unwrap();
+        let mut buf = [0u8; 4];
+        tun.read_exact(&mut buf).await.unwrap();
+        drop(tun);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            client.snapshot().close_retry <= 6,
+            "control: graceful echo close_retry={}",
+            client.snapshot().close_retry
+        );
+        client.shutdown();
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn close_retry_enqueue_fail_does_not_burn_dest() {
+        let client = Session::new_client(SessionConfig::default());
+        let (p1, w1, u1) = inject_live(&client, 1, "a#0", 7);
+        let (p2, mut w2, mut u2) = inject_live(&client, 2, "b#0", 7);
+        let tun = client
+            .open_stream(Target {
+                host: "t".into(),
+                port: 1,
+            })
+            .await
+            .unwrap();
+        let id = tun.id;
+        client.remember_close(id, 1, false, None);
+        stuff_urgent_keep_schedulable(&p1);
+        stuff_urgent_keep_schedulable(&p2);
+        age_close_sent(&client);
+        let r0 = client.snapshot().close_retry;
+        client.debug_maintain();
+        assert_eq!(
+            client.snapshot().close_retry,
+            r0,
+            "full urgent must not count"
+        );
+        {
+            let g = client.inner.closes.lock().unwrap();
+            let c = g.get(&id).expect("close table");
+            assert!(
+                !c.tried.contains(&2) || c.tried == vec![1],
+                "failed alt must not enter tried: {:?}",
+                c.tried
+            );
+        }
+        age_close_sent(&client);
+        while u2.try_recv().is_ok() {}
+        while w2.try_recv().is_ok() {}
+        client.debug_maintain();
+        assert!(
+            client.snapshot().close_retry > r0,
+            "drained dest must still be eligible after enqueue-fail"
+        );
+        let _ = (p1, p2, w1, u1, w2, u2);
+        drop(tun);
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn expire_recv_close_does_not_fin_holes() {
+        let mut cfg = SessionConfig::default();
+        cfg.tuning.loss_timeout_floor = Duration::from_millis(20);
+        let (server, mut incoming) = Session::new_server(cfg);
+        let _p1 = inject_live(&server, 1, "a#0", 7);
+        let _p2 = inject_live(&server, 2, "b#0", 7);
+        server.handle_frame(
+            1,
+            Frame::StreamOpen(StreamOpen {
+                stream_id: 1,
+                target: Target {
+                    host: "t".into(),
+                    port: 1,
+                },
+            }),
+        );
+        let _inc = incoming.try_recv().expect("accepted");
+        server.handle_frame(
+            2,
+            Frame::StreamData(StreamData {
+                stream_id: 1,
+                offset: 100,
+                data: vec![0; 50],
+            }),
+        );
+        server.handle_frame(
+            2,
+            Frame::StreamClose(StreamClose {
+                stream_id: 1,
+                final_offset: Some(200),
+            }),
+        );
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        server.debug_maintain();
+        let st = server.get_stream(1).expect("stream");
+        assert!(!st.recv_fin.load(Ordering::Relaxed), "holes must not FIN");
+        assert_eq!(st.recv_next.load(Ordering::Relaxed), 0);
+        server.handle_frame(
+            1,
+            Frame::StreamData(StreamData {
+                stream_id: 1,
+                offset: 0,
+                data: vec![1; 200],
+            }),
+        );
+        let st = server.get_stream(1).expect("stream");
+        assert!(
+            st.recv_fin.load(Ordering::Relaxed) || st.recv_next.load(Ordering::Relaxed) >= 200,
+            "contiguous DATA must fill then FIN"
+        );
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn expire_recv_close_fins_when_contiguous() {
+        let (server, mut incoming) = Session::new_server(SessionConfig::default());
+        let _p = inject_live(&server, 1, "a#0", 7);
+        server.handle_frame(
+            1,
+            Frame::StreamOpen(StreamOpen {
+                stream_id: 1,
+                target: Target {
+                    host: "t".into(),
+                    port: 1,
+                },
+            }),
+        );
+        let _inc = incoming.try_recv().expect("accepted");
+        server.handle_frame(
+            1,
+            Frame::StreamClose(StreamClose {
+                stream_id: 1,
+                final_offset: Some(0),
+            }),
+        );
+        server.debug_maintain();
+        let st = server.get_stream(1).expect("stream");
+        assert!(st.recv_fin.load(Ordering::Relaxed));
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn linger_progress_fine_does_not_send_reset() {
+        let mut cfg = SessionConfig::default();
+        cfg.tuning.close_linger = Duration::from_millis(80);
+        let client = Session::new_client(cfg);
+        let (_p1, mut w1, mut u1) = inject_live(&client, 1, "a#0", 7);
+        let (_p2, mut w2, mut u2) = inject_live(&client, 2, "b#0", 7);
+        let mut tun = client
+            .open_stream(Target {
+                host: "t".into(),
+                port: 1,
+            })
+            .await
+            .unwrap();
+        tun.write_all(b"hi").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let id = tun.id;
+        let next = {
+            let st = client.get_stream(id).unwrap();
+            st.send_next.load(Ordering::Relaxed)
+        };
+        client.handle_frame(
+            1,
+            Frame::StreamAck(StreamAck {
+                stream_id: id,
+                acked_offset: next,
+                window: 128 * 1024,
+            }),
+        );
+        drop(tun);
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        client.debug_maintain();
+        let frames: Vec<_> = drain_frames(&mut w1, &mut u1)
+            .into_iter()
+            .chain(drain_frames(&mut w2, &mut u2))
+            .collect();
+        assert!(
+            !frames.iter().any(|f| matches!(f, Frame::StreamReset(_))),
+            "progress-fine linger must not send Reset"
+        );
+        assert_eq!(client.inner.streams.lock().unwrap().len(), 0);
+        assert!(client.inner.resets.lock().unwrap().is_empty());
+        assert!(client.snapshot().stream_reaps_linger >= 1);
+        assert_eq!(client.snapshot().stream_resets_timeout, 0);
+        assert_eq!(client.snapshot().reset_retry, 0);
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn linger_silent_cas_loss_preserves_reset_table() {
+        let client = Session::new_client(SessionConfig::default());
+        let _p = inject_live(&client, 1, "a#0", 7);
+        let tun = client
+            .open_stream(Target {
+                host: "t".into(),
+                port: 1,
+            })
+            .await
+            .unwrap();
+        let id = tun.id;
+        let st = client.get_stream(id).unwrap();
+        st.send_fin_sent.store(true, Ordering::Relaxed);
+        client.handle_frame(
+            1,
+            Frame::StreamAck(StreamAck {
+                stream_id: id,
+                acked_offset: st.send_next.load(Ordering::Relaxed),
+                window: 128 * 1024,
+            }),
+        );
+        client.remember_reset(id, 1, ResetReason::Timeout);
+        st.counted_close.store(true, Ordering::SeqCst);
+        client.linger_reap_progress_fine(id);
+        assert!(
+            client.inner.resets.lock().unwrap().contains_key(&id),
+            "lost CAS must not wipe leftover Reset"
+        );
+        drop(tun);
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn leftover_drains_via_close_retry_when_progress_fine() {
+        let mut cfg = SessionConfig::default();
+        cfg.tuning.close_linger = Duration::from_millis(80);
+        cfg.tuning.loss_timeout_floor = Duration::from_millis(20);
+        let client = Session::new_client(cfg.clone());
+        let (server, incoming) = Session::new_server(cfg);
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            let mut incoming = incoming;
+            while let Some(inc) = incoming.recv().await {
+                held.push(inc);
+            }
+            let _ = held;
+        });
+        let (_p1, mut cw1, mut cu1) = inject_live(&client, 1, "a#0", 7);
+        let (_p2, mut cw2, mut cu2) = inject_live(&client, 2, "b#0", 7);
+        let _s1 = inject_live(&server, 1, "a#0", 7);
+        let _s2 = inject_live(&server, 2, "b#0", 7);
+
+        fn take(w: &mut mpsc::Receiver<Frame>, u: &mut mpsc::Receiver<Frame>) -> Option<Frame> {
+            u.try_recv().ok().or_else(|| w.try_recv().ok())
+        }
+
+        let tun = client
+            .open_stream(Target {
+                host: "echo".into(),
+                port: 1,
+            })
+            .await
+            .unwrap();
+        let mut open = None;
+        for _ in 0..32 {
+            if let Some(Frame::StreamOpen(o)) = take(&mut cw1, &mut cu1) {
+                open = Some(o);
+                break;
+            }
+            if let Some(Frame::StreamOpen(o)) = take(&mut cw2, &mut cu2) {
+                open = Some(o);
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let open = open.expect("client sent StreamOpen");
+        server.handle_frame(1, Frame::StreamOpen(open.clone()));
+        let id = tun.id;
+        client.handle_frame(
+            1,
+            Frame::StreamAck(StreamAck {
+                stream_id: id,
+                acked_offset: 0,
+                window: 128 * 1024,
+            }),
+        );
+        drop(tun);
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        let mut fed = false;
+        loop {
+            let f = take(&mut cw1, &mut cu1).or_else(|| take(&mut cw2, &mut cu2));
+            match f {
+                Some(Frame::StreamClose(c)) if !fed => {
+                    server.handle_frame(2, Frame::StreamClose(c));
+                    fed = true;
+                }
+                Some(Frame::StreamClose(_)) => {}
+                Some(Frame::StreamReset(_)) => panic!("progress-fine leftover must not Reset"),
+                Some(_) => {}
+                None => break,
+            }
+        }
+        age_close_sent(&client);
+        client.debug_maintain();
+        server.debug_maintain();
+        loop {
+            let f = take(&mut cw1, &mut cu1).or_else(|| take(&mut cw2, &mut cu2));
+            match f {
+                Some(Frame::StreamClose(c)) => {
+                    server.handle_frame(2, Frame::StreamClose(c));
+                    fed = true;
+                }
+                Some(Frame::StreamReset(_)) => panic!("progress-fine leftover must not Reset"),
+                Some(_) => {}
+                None => break,
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        client.debug_maintain();
+        server.debug_maintain();
+        assert!(fed, "Close must land on dest 2");
+        assert_eq!(server.inner.streams.lock().unwrap().len(), 0);
+        assert_eq!(client.snapshot().reset_retry, 0);
         client.shutdown();
         server.shutdown();
     }

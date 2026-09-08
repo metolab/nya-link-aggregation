@@ -357,7 +357,13 @@ impl Session {
             self.remove_held_stream(id);
         }
         for id in timeout_ids {
-            self.reset_stream(id, ResetReason::Timeout);
+            match self.get_stream(id) {
+                Some(st) if self.overlay_progress_fine(&st) => {
+                    self.linger_reap_progress_fine(id);
+                }
+                Some(_) => self.reset_stream(id, ResetReason::Timeout),
+                None => {}
+            }
         }
     }
 

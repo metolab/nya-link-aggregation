@@ -5,7 +5,7 @@
 | **Title** | Live-session stream-table reap; pick-hit RTT observability; flap/HOL non-goals |
 | **Author** | nya-link-aggregation maintainers |
 | **Date** | 2026-09-07 |
-| **Status** | Draft |
+| **Status** | Implemented-with-regression (Close/Reset delivery superseded by [`design-close-reset-delivery-regression.md`](design-close-reset-delivery-regression.md)) |
 | **Audience** | Senior engineers who already know `nya-core` session / scheduler / health, `nya-client` `run_link`, `nya-server` outbound, and `nya-e2e` SLA |
 | **Predecessor** | Freeze `2c34217` (`session: reap table slot on death; snapshot live sfp`). `PROTOCOL_VERSION=2` / ALPN `nya/2`. Close-retry series: `docs/design-close-retry-silent-pick.md`. |
 | **Compatibility** | `PROTOCOL_VERSION` **stays 2**. No new TOML keys. `[session]` stays `deny_unknown_fields` (`cfg.rs` L130–137: four keys). One production `Tuning::STANDARD`. Tests clone-and-mutate. Version stays `0.1.0` in mechanism PRs; `0.1.1` is a later release-docs tag (`docs/RELEASE.md`). |
@@ -14,6 +14,8 @@
 ---
 
 ## Overview
+
+v0.1.2 leftover goal held (Yuusei `streams_held` 81→0). Close cycle + `expire_recv_closes` hole-FIN + progress-fine linger Reset are the post-deploy regression; pick-hit RTT / P2 / P3 stand. `expire_recv_closes` “unchanged” (this doc later) is the clause the successor retracts.
 
 Production on 2026-09-07 shows the overlay is not the TTFB story. Overlay extra is ~1 GZ–HK RTT (p50 9–12 ms for every host); Cloudflare on the same overlay is p50 17–24 ms; `open_us` is tens of microseconds; `migrates=0`; stream success ~100%; `all_down=0`. Origin dial / `origin_first` tails (`173.249.210.102:80`, `boilhkt`, soy TLS timeout, 07:00Z weather) are destination or underlay and stay out of this design.
 

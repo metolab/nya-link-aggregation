@@ -313,6 +313,7 @@ impl Session {
             return Ok(());
         }
         st.note_close_started();
+        self.unstick(&st);
         let second = st.recv_fin.load(Ordering::Relaxed);
         let final_offset = Some(st.send_next.load(Ordering::Relaxed));
         let close = StreamClose {
@@ -361,6 +362,12 @@ impl Session {
         }
         if st.send_fin_sent.load(Ordering::Relaxed) && st.recv_fin.load(Ordering::Relaxed) {
             self.maybe_count_graceful(&st);
+            return;
+        }
+        // Progress-fine half-close stays until reap_closed_streams so Close
+        // retry can still land. Immediate linger_reap here would drop the
+        // Close table and reopen leftover. No-progress still Timeout-Resets.
+        if self.overlay_progress_fine(&st) {
             return;
         }
         self.finish_stream(id, Some(ResetReason::Timeout), true);
@@ -524,6 +531,7 @@ impl Session {
         if !st.recv_fin.swap(true, Ordering::SeqCst) {
             let _ = st.inbound_tx.try_send(Inbound::Close);
         }
+        self.unstick(st);
         self.forget_close(st.id);
         self.maybe_count_graceful(st);
     }
@@ -539,11 +547,8 @@ impl Session {
         self.apply_recv_fin(st);
     }
 
-    /// Peer Close beat in-flight DATA. Wait one loss_timeout, then FIN anyway.
+    /// Belt: FIN only when `recv_next >= off`. Not a clock.
     pub(super) fn expire_recv_closes(&self) {
-        let wait = health::loss_timeout(&self.inner.cfg, self.min_known_rtt());
-        let wait_ms = wait.as_millis() as u64;
-        let now = crate::metrics::mono_ms();
         let sts: Vec<Arc<StreamState>> = self
             .inner
             .streams
@@ -553,14 +558,7 @@ impl Session {
             .cloned()
             .collect();
         for st in sts {
-            let off = st.recv_close_off.load(Ordering::Relaxed);
-            if off == u64::MAX || st.recv_fin.load(Ordering::Relaxed) {
-                continue;
-            }
-            let start = st.close_started_ms.load(Ordering::Relaxed);
-            if start != 0 && now.saturating_sub(start) >= wait_ms {
-                self.apply_recv_fin(&st);
-            }
+            self.try_finish_recv_close(&st);
         }
     }
 

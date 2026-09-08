@@ -102,7 +102,7 @@ HOL 隔离靠「每链路多连接 + bulk 避开交互连接」，不是把流�
 - `STREAM_DATA` 带 offset，接收端 `BTreeMap` 重排
 - 未确认数据记在发送路径的 inflight 上；ACK 时减去，并对小帧采样 RTT（bulk ACK 不当时延）
 - 服务端出站拨号失败会 `IncomingStream::reset(DialFailed)`，对端收到 `STREAM_RESET`
-- 活会话上流表：`counted_close` / 半关闭 linger / hygiene `STREAM_RESET` 会从 `Inner.streams` 摘掉。第一 closer 的 Close 重试停在对端 `recv_fin` 或 `close_linger`，**不用** multiplexed `path.last_rx` 当 Close ACK（Pong ≠ Close 送达）。第二 closer 仍在 `observe_stream_end` 立刻 `forget_close`。hygiene Reset 有与 Close 同形的 side table（换路重试；没有 dest 也 `remember`）。linger 仍不是产品 `stream_resets_timeout`。部署前已经堆在表里的 hangover 不会被新二进制排空，需要 bounce 会话。
+- 活会话上流表：`counted_close` / 半关闭 linger / hygiene `STREAM_RESET` 会从 `Inner.streams` 摘掉。第一 closer 的 Close 重试停在对端 `recv_fin`、HashMap-gone、或 `close_linger`（`retry_close_from` 同一套），**不用** multiplexed `path.last_rx` 当 Close ACK（Pong ≠ Close 送达）。第二 closer 仍在 `observe_stream_end` 立刻 `forget_close`。Close/Reset 换路**不**走 `pick_retry_path` 的 cycle rung（DATA 仍走）；`push_tried` 只在 Close/Reset **发送成功**时记。`expire_recv_closes` 不在空洞上强制 FIN（`maintain` 上的 belt 只 `try_finish_recv_close`）。progress-fine linger 只摘 HashMap、**不**发 `STREAM_RESET`（`forget_reset` 仅 `counted_close` CAS 赢家）；无进度 linger 仍 Reset 换路。linger 仍不是产品 `stream_resets_timeout`。部署前 hangover 需要 bounce 会话。
 
 ## 可观测性
 
@@ -110,7 +110,7 @@ HOL 隔离靠「每链路多连接 + bulk 避开交互连接」，不是把流�
 
 线路状态按 `link_key` 汇总（`a#0`/`a#1` → `a`）：up/deg 连接数、RTT 范围、sticky、inflight、队列、rx 新鲜/最旧。`paths=` 可带 ` bak`。迁移原因拆成 speculative / path_down / ensure_sticky / send-blocked；另有 retransmit/hedge、probe_miss、未知 RTT pick。snapshot 带压缩 `streams=`（不进 Prometheus 标签）。
 
-业务计分卡：流完成比、send-unacked ∪ recv-hole stall（进入钟是 `loss_timeout`）、每路径一次 `failover_ms`（`last_rx_ago`）、overlay goodput。换路重传计入 `data_retransmit` / `data_hedge`（跨 `link_key` 为 hedge）；Close 换路计 `close_retry`。半关闭 linger 计 `stream_reaps_linger`，**不是**产品 `stream_resets_timeout`。Soak 看 `(closed - linger) / opened`。e2e 产品门是 **新流 first-byte** 与 Close-swallowed（`prod_like_*`），不是 ping 1500 ms。见 [OBSERVABILITY.md](OBSERVABILITY.md)。
+业务计分卡：流完成比、send-unacked ∪ recv-hole stall（进入钟是 `loss_timeout`）、每路径一次 `failover_ms`（`last_rx_ago`）、overlay goodput。换路重传计入 `data_retransmit` / `data_hedge`（跨 `link_key` 为 hedge）；Close 换路计 `close_retry`。半关闭 linger 计 `stream_reaps_linger`（含 progress-fine 静默摘表），**不是**产品 `stream_resets_timeout`。Soak 看 `(closed - linger) / opened`。e2e 产品门是 **新流 first-byte** 与 Close-swallowed（`prod_like_*`），不是 ping 1500 ms。见 [OBSERVABILITY.md](OBSERVABILITY.md)。Close/Reset 送达语义见 [design-close-reset-delivery-regression.md](design-close-reset-delivery-regression.md)。
 
 ## 配置分层
 
