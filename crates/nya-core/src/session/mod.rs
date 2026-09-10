@@ -409,7 +409,7 @@ impl Session {
         }
     }
 
-    fn merge_pending_acks(&self, dead: u32, taken: HashMap<u32, StreamAck>) {
+    pub(crate) fn merge_pending_acks(&self, dead: u32, taken: HashMap<u32, StreamAck>) {
         if taken.is_empty() {
             return;
         }
@@ -4385,6 +4385,40 @@ mod tests {
             p2.pending_acks.lock().unwrap().contains_key(&st.id),
             "ACK must land on an alive alt"
         );
+        drop(tun);
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn ack_taken_batch_merges_on_path_failed() {
+        let client = Session::new_client(SessionConfig::default());
+        let (p1, _w1, _u1) = inject_live(&client, 1, "a#0", 7);
+        let (p2, _w2, _u2) = inject_live(&client, 2, "b#0", 7);
+        let tun = client
+            .open_stream(Target {
+                host: "t".into(),
+                port: 1,
+            })
+            .await
+            .unwrap();
+        let st = client.get_stream(tun.id).unwrap();
+        st.recv_next.store(200, Ordering::Relaxed);
+        client.send_ack(&st, p1.id);
+        let batch = p1.take_acks(8);
+        assert!(
+            !batch.is_empty(),
+            "writer-taken batch must leave the live map"
+        );
+        client.path_failed(p1.id);
+        assert!(
+            p2.pending_acks.lock().unwrap().get(&st.id).is_none(),
+            "in-flight batch is not in the first path_failed take"
+        );
+        p1.restore_acks(batch);
+        client.merge_pending_acks(p1.id, p1.take_all_acks());
+        let g = p2.pending_acks.lock().unwrap();
+        let ack = g.get(&st.id).expect("leftover must merge onto alt");
+        assert_eq!(ack.acked_offset, 200);
         drop(tun);
         client.shutdown();
     }

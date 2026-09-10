@@ -772,10 +772,16 @@ pub fn spawn_path_io<T>(
         struct RestoreAcks<'a> {
             path: &'a PathState,
             rest: VecDeque<StreamAck>,
+            in_flight: Option<StreamAck>,
         }
 
         impl Drop for RestoreAcks<'_> {
             fn drop(&mut self) {
+                // Park on this Arc only. A concurrent path_failed may already
+                // have removed the dest; spawn_path_io merges leftovers onto alt.
+                if let Some(ack) = self.in_flight.take() {
+                    self.path.merge_ack(ack);
+                }
                 self.path.restore_acks(self.rest.drain(..));
             }
         }
@@ -853,9 +859,14 @@ pub fn spawn_path_io<T>(
                         let mut guard = RestoreAcks {
                             path: &path_w,
                             rest: VecDeque::from(path_w.take_acks(ACK_FLUSH_K)),
+                            in_flight: None,
                         };
                         while let Some(ack) = guard.rest.pop_front() {
-                            let sid = ack.stream_id;
+                            guard.in_flight = Some(ack);
+                            let (sid, frame) = {
+                                let ack = guard.in_flight.as_ref().expect("ACK in flight");
+                                (ack.stream_id, Frame::StreamAck(ack.clone()))
+                            };
                             match write_one(
                                 &mut writer,
                                 &mut close_rx,
@@ -863,18 +874,18 @@ pub fn spawn_path_io<T>(
                                 ping_max,
                                 &session_w,
                                 &path_w,
-                                Frame::StreamAck(ack.clone()),
+                                frame,
                             )
                             .await
                             {
                                 WriteOne::Sent { stalled } => {
+                                    guard.in_flight = None;
                                     if !stalled {
                                         path_w.set_write_stalled(false);
                                     }
                                     session_w.note_ack_sent(&path_w, sid);
                                 }
                                 WriteOne::Interrupted => {
-                                    guard.rest.push_front(ack);
                                     flush_urgent_then_close(
                                         &mut writer,
                                         &mut urgent,
@@ -886,7 +897,6 @@ pub fn spawn_path_io<T>(
                                     return Ok(());
                                 }
                                 WriteOne::Io(e) => {
-                                    guard.rest.push_front(ack);
                                     warn!(path = %path_w.name, error = %e, "path ack failed");
                                     return Err(e);
                                 }
@@ -1074,6 +1084,9 @@ pub fn spawn_path_io<T>(
             }
         }
         session.path_failed(path.id);
+        // Drop parked unsent rows on this Arc. If maintain already path_failed,
+        // that call was a no-op; merge leftovers onto alt from the local Arc.
+        session.merge_pending_acks(path.id, path.take_all_acks());
         let _ = done.send(());
         debug!(path = %path.name, "path io exit");
     });
