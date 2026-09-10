@@ -18,15 +18,15 @@ use tokio::sync::{mpsc, Notify};
 use tracing::{debug, info, warn};
 
 use nya_proto::{
-    Frame, Pong, ResetReason, StreamClose, StreamData, StreamOpen, StreamReset, Target,
+    Frame, Pong, ResetReason, StreamAck, StreamClose, StreamData, StreamOpen, StreamReset, Target,
 };
 
 use crate::cfg::SessionConfig;
 use crate::health;
 use crate::metrics::HistSnap;
 use crate::metrics::{
-    flatten_paths, Counters, ProcessCounters, ProcessSnapshot, Snapshot, FAILOVER_MS_BOUNDS,
-    LIFETIME_MS_BOUNDS, STALL_MS_BOUNDS,
+    flatten_paths, Counters, ProcessCounters, ProcessSnapshot, Snapshot, ACK_FLUSH_US_BOUNDS,
+    FAILOVER_MS_BOUNDS, LIFETIME_MS_BOUNDS, STALL_MS_BOUNDS,
 };
 use crate::path::{spawn_path_io, PathState, STATE_DOWN};
 use crate::scheduler::{pick_path_pref, pick_retry_path, PickPref};
@@ -385,13 +385,64 @@ impl Session {
         info!(path = %path.name, path_id, "path down");
         self.inner.metrics.path_down.fetch_add(1, Ordering::Relaxed);
         self.observe_failover(&path);
+        let taken = {
+            let mut g = path.pending_acks.lock().unwrap();
+            std::mem::take(&mut *g)
+        };
         self.rehome_unacked_from(path_id);
         self.retry_open_from(path_id);
         self.retry_close_from(path_id);
         self.retry_reset_from(path_id);
         self.inner.paths.lock().unwrap().remove(&path_id);
+        self.merge_pending_acks(path_id, taken);
         if !self.has_alive_path() {
             *self.inner.all_down_since.lock().unwrap() = Some(Instant::now());
+        }
+    }
+
+    fn merge_pending_acks(&self, dead: u32, taken: HashMap<u32, StreamAck>) {
+        if taken.is_empty() {
+            return;
+        }
+        let Some(alt) = self.pick_retry(dead) else {
+            return;
+        };
+        let Some(dest2) = self.get_path(alt) else {
+            return;
+        };
+        {
+            let mut g = dest2.pending_acks.lock().unwrap();
+            for (id, ack) in taken {
+                match g.entry(id) {
+                    std::collections::hash_map::Entry::Occupied(e)
+                        if e.get().acked_offset >= ack.acked_offset => {}
+                    std::collections::hash_map::Entry::Occupied(mut e) => {
+                        e.insert(ack);
+                    }
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        e.insert(ack);
+                    }
+                }
+            }
+        }
+        dest2.ack_wait.notify_one();
+    }
+
+    pub(crate) fn note_ack_sent(&self, path: &PathState, stream_id: u32) {
+        if path.pending_acks.lock().unwrap().contains_key(&stream_id) {
+            path.ack_wait.notify_one();
+            return;
+        }
+        let Some(st) = self.get_stream(stream_id) else {
+            return;
+        };
+        st.ack_dirty.store(false, Ordering::Relaxed);
+        let from = st.ack_flush_from_ms.swap(0, Ordering::Relaxed);
+        if from != 0 {
+            let us = crate::metrics::mono_ms()
+                .saturating_sub(from)
+                .saturating_mul(1000);
+            self.inner.metrics.ack_flush_us.observe(us);
         }
     }
 
@@ -1770,6 +1821,7 @@ impl SessionTable {
             failover_ms: HistSnap::zeroed(FAILOVER_MS_BOUNDS),
             stall_ms: HistSnap::zeroed(STALL_MS_BOUNDS),
             stream_lifetime_ms: HistSnap::zeroed(LIFETIME_MS_BOUNDS),
+            ack_flush_us: HistSnap::zeroed(ACK_FLUSH_US_BOUNDS),
             ..Snapshot::default()
         };
         for (_, snap) in &sessions {
@@ -1882,6 +1934,7 @@ impl SessionTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stream::StreamState;
     use nya_proto::{StreamAck, StreamClose, StreamData, StreamOpen, Target};
     use std::pin::Pin;
     use std::task::{Context, Poll};
@@ -4008,6 +4061,308 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ack_overwrite_does_not_use_urgent_chan() {
+        let client = Session::new_client(SessionConfig::default());
+        let (p, _w, _u) = inject_live(&client, 1, "a#0", 7);
+        let tun = client
+            .open_stream(Target {
+                host: "t".into(),
+                port: 1,
+            })
+            .await
+            .unwrap();
+        let st = client.get_stream(tun.id).unwrap();
+        stuff_urgent_keep_schedulable(&p);
+        let drop0 = client.snapshot().frame_send_drop;
+        let cong0 = p.is_congested();
+        let q0 = p.queued_urgent();
+        client.send_ack(&st, p.id);
+        assert_eq!(p.queued_urgent(), q0);
+        assert_eq!(client.snapshot().frame_send_drop, drop0);
+        assert_eq!(p.is_congested(), cong0);
+        assert!(
+            p.pending_acks.lock().unwrap().contains_key(&st.id),
+            "ACK must land in the overwrite register"
+        );
+        let ping = Frame::Ping(nya_proto::Ping {
+            seq: 1,
+            sent_at_ms: 0,
+        });
+        assert!(
+            p.urgent.try_send(ping).is_err(),
+            "urgent must stay full; ACK is not an mpsc slot"
+        );
+        drop(tun);
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn ack_coalesce_keeps_latest_offset() {
+        let client = Session::new_client(SessionConfig::default());
+        let (p, _w, _u) = inject_live(&client, 1, "a#0", 7);
+        let tun = client
+            .open_stream(Target {
+                host: "t".into(),
+                port: 1,
+            })
+            .await
+            .unwrap();
+        let st = client.get_stream(tun.id).unwrap();
+        st.recv_next.store(100, Ordering::Relaxed);
+        client.send_ack(&st, p.id);
+        st.recv_next.store(200, Ordering::Relaxed);
+        client.send_ack(&st, p.id);
+        let g = p.pending_acks.lock().unwrap();
+        assert_eq!(g.len(), 1);
+        let ack = g.get(&st.id).expect("coalesced ACK");
+        assert_eq!(ack.acked_offset, 200);
+        drop(tun);
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn ack_unblocks_window_when_urgent_full() {
+        let client = Session::new_client(SessionConfig::default());
+        let (server, mut incoming) = Session::new_server(SessionConfig::default());
+        let (a, b) = duplex(64 * 1024);
+        let _cd = client.start_path("a#0".into(), a);
+        let _sd = server.start_path("a#0".into(), b);
+        client.wait_alive(1, Duration::from_secs(1)).await.unwrap();
+        server.wait_alive(1, Duration::from_secs(1)).await.unwrap();
+        let tun = client
+            .open_stream(Target {
+                host: "t".into(),
+                port: 1,
+            })
+            .await
+            .unwrap();
+        let inc = tokio::time::timeout(Duration::from_secs(1), incoming.recv())
+            .await
+            .expect("incoming")
+            .expect("stream");
+        let sid = tun.id;
+        let cst = client.get_stream(sid).unwrap();
+        cst.send_window.store(0, Ordering::Relaxed);
+        let sp = server.path_list()[0].clone();
+        stuff_urgent_keep_schedulable(&sp);
+        let drop0 = server.snapshot().frame_send_drop;
+        let cong0 = sp.is_congested();
+        let blocked = tokio::spawn(async move {
+            let mut tun = tun;
+            tun.write_all(b"x").await
+        });
+        let deadline = Instant::now() + Duration::from_millis(500);
+        loop {
+            if client.snapshot().window_blocks > 0 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "send must block on window");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let sst = server.get_stream(sid).unwrap();
+        server.send_ack(&sst, sp.id);
+        tokio::time::timeout(Duration::from_secs(1), blocked)
+            .await
+            .expect("ACK register must unblock window_ok while urgent is full")
+            .unwrap()
+            .unwrap();
+        assert_eq!(server.snapshot().frame_send_drop, drop0);
+        assert_eq!(sp.is_congested(), cong0);
+        drop(inc);
+        client.shutdown();
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn ack_idle_writer_emits_before_ping_interval() {
+        let cfg = SessionConfig {
+            ping_interval_min: Duration::from_millis(200),
+            ping_interval_max: Duration::from_millis(200),
+            ..SessionConfig::default()
+        };
+        let client = Session::new_client(cfg);
+        let (a, mut peer) = duplex(64 * 1024);
+        let _done = client.start_path("a#0".into(), a);
+        let p = client.path_list()[0].clone();
+        p.record_rtt(Duration::from_millis(7));
+        age_rx(&p, 1000);
+        let first = tokio::time::timeout(Duration::from_millis(400), read_len_frame(&mut peer))
+            .await
+            .expect("first ping");
+        assert!(matches!(first, Frame::Ping(_)), "{first:?}");
+        let (tx, _rx) = mpsc::channel(8);
+        let st = StreamState::new(7, tx, client.inner.cfg.tuning.initial_window);
+        client.inner.streams.lock().unwrap().insert(7, st.clone());
+        let t0 = Instant::now();
+        client.send_ack(&st, p.id);
+        let f = tokio::time::timeout(Duration::from_millis(30), read_len_frame(&mut peer))
+            .await
+            .expect("ACK must not wait for ping cadence");
+        match f {
+            Frame::StreamAck(a) => assert_eq!(a.stream_id, 7),
+            other => panic!("expected STREAM_ACK, got {other:?}"),
+        }
+        assert!(
+            t0.elapsed() < Duration::from_millis(50),
+            "idle ACK {:?} must be ≪ ping_interval_max",
+            t0.elapsed()
+        );
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn ack_dirty_survives_in_flight_overwrite() {
+        let client = Session::new_client(SessionConfig::default());
+        let (a, mut peer) = duplex(8);
+        let _done = client.start_path("a#0".into(), a);
+        let p = client.path_list()[0].clone();
+        let tun = client
+            .open_stream(Target {
+                host: "t".into(),
+                port: 1,
+            })
+            .await
+            .unwrap();
+        let st = client.get_stream(tun.id).unwrap();
+        let _open = tokio::time::timeout(Duration::from_secs(1), read_len_frame(&mut peer))
+            .await
+            .expect("StreamOpen");
+        st.recv_next.store(100, Ordering::Relaxed);
+        client.send_ack(&st, p.id);
+        let deadline = Instant::now() + Duration::from_millis(500);
+        loop {
+            if !p.pending_acks.lock().unwrap().contains_key(&st.id) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "gen1 must be taken for write_one"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        st.recv_next.store(200, Ordering::Relaxed);
+        client.send_ack(&st, p.id);
+        assert!(st.ack_dirty.load(Ordering::Relaxed));
+        assert_eq!(
+            p.pending_acks
+                .lock()
+                .unwrap()
+                .get(&st.id)
+                .map(|a| a.acked_offset),
+            Some(200),
+            "gen2 must sit in the map during gen1 write_one"
+        );
+        let gen1 = tokio::time::timeout(Duration::from_secs(1), read_len_frame(&mut peer))
+            .await
+            .expect("gen1 ACK");
+        match gen1 {
+            Frame::StreamAck(a) => assert_eq!(a.acked_offset, 100),
+            other => panic!("expected gen1 ACK, got {other:?}"),
+        }
+        assert!(
+            st.ack_dirty.load(Ordering::Relaxed),
+            "Sent of gen1 must not clear dirty while gen2 is pending"
+        );
+        drop(tun);
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn ack_take_k_does_not_starve_ping() {
+        let cfg = SessionConfig {
+            ping_interval_min: Duration::from_millis(500),
+            ping_interval_max: Duration::from_millis(500),
+            ..SessionConfig::default()
+        };
+        let client = Session::new_client(cfg);
+        let (a, mut peer) = duplex(8);
+        let _done = client.start_path("a#0".into(), a);
+        let p = client.path_list()[0].clone();
+        p.record_rtt(Duration::from_millis(7));
+        {
+            let mut g = p.pending_acks.lock().unwrap();
+            for i in 1..=16u32 {
+                g.insert(
+                    i,
+                    StreamAck {
+                        stream_id: i,
+                        acked_offset: 0,
+                        window: 1,
+                    },
+                );
+            }
+        }
+        p.ack_wait.notify_one();
+        let deadline = Instant::now() + Duration::from_millis(500);
+        loop {
+            if p.ack_pending() <= crate::path::ACK_FLUSH_K as u64 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "writer must take K ACKs");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        age_rx(&p, 1000);
+        let mut acks = 0u32;
+        loop {
+            let f = tokio::time::timeout(Duration::from_secs(1), read_len_frame(&mut peer))
+                .await
+                .expect("frame");
+            match f {
+                Frame::StreamAck(_) => {
+                    acks += 1;
+                    assert!(
+                        acks <= crate::path::ACK_FLUSH_K as u32,
+                        "ping-due must run before ACK {acks} (K=8)"
+                    );
+                }
+                Frame::Ping(_) => break,
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        assert_eq!(acks, crate::path::ACK_FLUSH_K as u32);
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn ack_moves_on_path_failed() {
+        let client = Session::new_client(SessionConfig::default());
+        let (p1, _w1, _u1) = inject_live(&client, 1, "a#0", 7);
+        let (p2, _w2, _u2) = inject_live(&client, 2, "b#0", 7);
+        let tun = client
+            .open_stream(Target {
+                host: "t".into(),
+                port: 1,
+            })
+            .await
+            .unwrap();
+        let st = client.get_stream(tun.id).unwrap();
+        p2.pending_acks.lock().unwrap().insert(
+            st.id,
+            StreamAck {
+                stream_id: st.id,
+                acked_offset: 100,
+                window: 1,
+            },
+        );
+        st.recv_next.store(200, Ordering::Relaxed);
+        client.send_ack(&st, p1.id);
+        assert_eq!(
+            p1.pending_acks
+                .lock()
+                .unwrap()
+                .get(&st.id)
+                .map(|a| a.acked_offset),
+            Some(200)
+        );
+        client.path_failed(p1.id);
+        let g = p2.pending_acks.lock().unwrap();
+        let ack = g.get(&st.id).expect("merged onto alt");
+        assert_eq!(ack.acked_offset, 200, "max offset must win");
+        drop(tun);
+        client.shutdown();
+    }
+
+    #[tokio::test]
     async fn hol_leftover_interactive_does_not_pin_after_linger_stall() {
         let mut cfg = SessionConfig::default();
         cfg.tuning.close_linger = Duration::from_millis(40);
@@ -4313,6 +4668,15 @@ mod tests {
                 return;
             }
         }
+    }
+
+    async fn read_len_frame(r: &mut (impl AsyncRead + Unpin)) -> Frame {
+        let mut hdr = [0u8; 4];
+        r.read_exact(&mut hdr).await.unwrap();
+        let n = u32::from_be_bytes(hdr) as usize;
+        let mut buf = vec![0u8; n];
+        r.read_exact(&mut buf).await.unwrap();
+        Frame::decode(&buf).unwrap()
     }
 
     fn age_rx(p: &PathState, ms: u64) {

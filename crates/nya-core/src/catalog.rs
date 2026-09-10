@@ -4,7 +4,8 @@
 use std::collections::BTreeSet;
 
 use crate::metrics::{
-    percentile, HistSnap, ProcessSnapshot, FAILOVER_MS_BOUNDS, LIFETIME_MS_BOUNDS, STALL_MS_BOUNDS,
+    percentile, HistSnap, ProcessSnapshot, ACK_FLUSH_US_BOUNDS, FAILOVER_MS_BOUNDS,
+    LIFETIME_MS_BOUNDS, STALL_MS_BOUNDS,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -94,6 +95,7 @@ pub fn metric_descriptors() -> Vec<MetricDesc> {
     ps.session.failover_ms = HistSnap::zeroed(FAILOVER_MS_BOUNDS);
     ps.session.stall_ms = HistSnap::zeroed(STALL_MS_BOUNDS);
     ps.session.stream_lifetime_ms = HistSnap::zeroed(LIFETIME_MS_BOUNDS);
+    ps.session.ack_flush_us = HistSnap::zeroed(ACK_FLUSH_US_BOUNDS);
     ps.session.links.push(crate::metrics::LinkSnap {
         name: "_".into(),
         ..Default::default()
@@ -420,6 +422,12 @@ pub fn visit_metrics(ps: &ProcessSnapshot, sink: &mut impl MetricSink) {
         LIFETIME_MS_BOUNDS,
         &s.stream_lifetime_ms,
     );
+    sink.histogram(
+        "nya_ack_flush_us",
+        "STREAM_ACK register store to wire, microseconds",
+        ACK_FLUSH_US_BOUNDS,
+        &s.ack_flush_us,
+    );
 
     for ln in &s.links {
         let l = ln.name.as_str();
@@ -545,6 +553,12 @@ pub fn visit_metrics(ps: &ProcessSnapshot, sink: &mut impl MetricSink) {
             pth.queued_bulk,
         );
         sink.gauge(
+            "nya_path_ack_pending",
+            "STREAM_ACK overwrite register depth",
+            &lab,
+            pth.ack_pending,
+        );
+        sink.gauge(
             "nya_path_rtt_known",
             "1 if RTT sampled",
             &lab,
@@ -598,6 +612,7 @@ pub fn prometheus_metric_names(_ps: &ProcessSnapshot) -> BTreeSet<String> {
     ps.session.failover_ms = HistSnap::zeroed(FAILOVER_MS_BOUNDS);
     ps.session.stall_ms = HistSnap::zeroed(STALL_MS_BOUNDS);
     ps.session.stream_lifetime_ms = HistSnap::zeroed(LIFETIME_MS_BOUNDS);
+    ps.session.ack_flush_us = HistSnap::zeroed(ACK_FLUSH_US_BOUNDS);
     ps.session.links.push(crate::metrics::LinkSnap {
         name: "_".into(),
         ..Default::default()

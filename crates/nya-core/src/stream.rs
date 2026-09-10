@@ -41,6 +41,14 @@ pub struct StreamState {
     pub inbound_tx: mpsc::Sender<Inbound>,
     pub recv_next: AtomicU64,
     pub recv_buf: Mutex<BTreeMap<u64, Vec<u8>>>,
+    /// Bytes currently in `recv_buf`. PR 2 accounts; advertise formula is PR 5.
+    pub recv_buffered: AtomicU64,
+    /// Last STREAM_DATA arrival path. 0 = none.
+    pub last_recv_path: AtomicU32,
+    pub ack_dirty: AtomicBool,
+    pub ack_gen: AtomicU64,
+    /// 0 = not waiting. Set when dirty goes 0→1; kept until that gen is Sent.
+    pub ack_flush_from_ms: AtomicU64,
     pub recv_fin: AtomicBool,
     /// `u64::MAX` = no peer Close yet. Else the sender's `send_next` at FIN.
     pub recv_close_off: AtomicU64,
@@ -81,6 +89,11 @@ impl StreamState {
             inbound_tx,
             recv_next: AtomicU64::new(0),
             recv_buf: Mutex::new(BTreeMap::new()),
+            recv_buffered: AtomicU64::new(0),
+            last_recv_path: AtomicU32::new(0),
+            ack_dirty: AtomicBool::new(false),
+            ack_gen: AtomicU64::new(0),
+            ack_flush_from_ms: AtomicU64::new(0),
             recv_fin: AtomicBool::new(false),
             recv_close_off: AtomicU64::new(u64::MAX),
             send_fin_sent: AtomicBool::new(false),

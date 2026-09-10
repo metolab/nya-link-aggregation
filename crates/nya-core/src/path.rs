@@ -6,11 +6,11 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use futures_util::{Sink, SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
 use tracing::{debug, info, warn};
 
-use nya_proto::{Frame, Ping, MAX_FRAME_SIZE};
+use nya_proto::{Frame, Ping, StreamAck, MAX_FRAME_SIZE};
 
 use crate::session::Session;
 use crate::tuning::Tuning;
@@ -18,6 +18,9 @@ use crate::tuning::Tuning;
 pub const STATE_UP: u8 = 1;
 pub const STATE_DEGRADED: u8 = 2;
 pub const STATE_DOWN: u8 = 3;
+
+/// Same cap as `push_tried` FIFO-8. Not a Tuning field.
+pub(crate) const ACK_FLUSH_K: usize = 8;
 
 /// `a#0` / `a#1` share a link; names without `#` are their own link.
 pub fn link_key(name: &str) -> &str {
@@ -29,8 +32,12 @@ pub struct PathState {
     pub name: String,
     /// Bulk / large STREAM_DATA.
     pub writer: mpsc::Sender<Frame>,
-    /// ACKs, pings, and small STREAM_DATA — must not wait behind bulk.
+    /// Close/Open/Reset, pings, and small STREAM_DATA — must not wait behind bulk.
     pub urgent: mpsc::Sender<Frame>,
+    /// Latest STREAM_ACK per stream. Overwrite register; not an mpsc slot.
+    pub pending_acks: std::sync::Mutex<HashMap<u32, StreamAck>>,
+    /// Writer wakeup when `pending_acks` gains an entry.
+    pub ack_wait: Notify,
     pub rtt_ewma_us: AtomicU64,
     pub rtt_stable_us: AtomicU64,
     /// Two-sided class membership. 0 = unset (`class_rtt()` falls back to fast).
@@ -91,6 +98,8 @@ impl PathState {
             name,
             writer,
             urgent,
+            pending_acks: std::sync::Mutex::new(HashMap::new()),
+            ack_wait: Notify::new(),
             rtt_ewma_us: AtomicU64::new(0),
             rtt_stable_us: AtomicU64::new(0),
             rtt_class_us: AtomicU64::new(0),
@@ -266,6 +275,16 @@ impl PathState {
 
     pub fn queued_bulk(&self) -> u64 {
         self.bulk_queued.load(Ordering::Relaxed)
+    }
+
+    pub fn ack_pending(&self) -> u64 {
+        self.pending_acks.lock().unwrap().len() as u64
+    }
+
+    pub(crate) fn take_acks(&self, k: usize) -> Vec<StreamAck> {
+        let mut g = self.pending_acks.lock().unwrap();
+        let ids: Vec<u32> = g.keys().copied().take(k).collect();
+        ids.into_iter().filter_map(|id| g.remove(&id)).collect()
     }
 
     pub fn note_enqueue(&self, urgent: bool) {
@@ -736,6 +755,7 @@ pub fn spawn_path_io<T>(
                     && path_w.is_alive()
                     && !session_w.is_dead()
                     && path_w.should_send_ping(path_w.last_rx_ago(), ping_every);
+                let acks_ready = path_w.ack_pending() > 0;
 
                 tokio::select! {
                     biased;
@@ -783,6 +803,52 @@ pub fn spawn_path_io<T>(
                             WriteOne::Io(e) => {
                                 warn!(path = %path_w.name, error = %e, "path ping failed");
                                 return Err(e);
+                            }
+                        }
+                    }
+                    // STREAM_ACK is not StreamData; hold_stream_data does not apply.
+                    _ = async {
+                        if acks_ready {
+                            std::future::ready(()).await;
+                        } else {
+                            path_w.ack_wait.notified().await;
+                        }
+                    } => {
+                        let batch = path_w.take_acks(ACK_FLUSH_K);
+                        for ack in batch {
+                            let sid = ack.stream_id;
+                            match write_one(
+                                &mut writer,
+                                &mut close_rx,
+                                deadline,
+                                ping_max,
+                                &session_w,
+                                &path_w,
+                                Frame::StreamAck(ack),
+                            )
+                            .await
+                            {
+                                WriteOne::Sent { stalled } => {
+                                    if !stalled {
+                                        path_w.set_write_stalled(false);
+                                    }
+                                    session_w.note_ack_sent(&path_w, sid);
+                                }
+                                WriteOne::Interrupted => {
+                                    flush_urgent_then_close(
+                                        &mut writer,
+                                        &mut urgent,
+                                        &session_w,
+                                        &path_w,
+                                        ping_max,
+                                    )
+                                    .await;
+                                    return Ok(());
+                                }
+                                WriteOne::Io(e) => {
+                                    warn!(path = %path_w.name, error = %e, "path ack failed");
+                                    return Err(e);
+                                }
                             }
                         }
                     }

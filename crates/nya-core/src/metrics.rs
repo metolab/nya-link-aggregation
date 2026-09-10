@@ -17,6 +17,9 @@ pub const STREAM_SNAP_CAP: usize = 64;
 pub const FAILOVER_MS_BOUNDS: &[u64] = &[5, 10, 20, 50, 100, 200, 500, 1000, 2000];
 pub const STALL_MS_BOUNDS: &[u64] = &[20, 50, 100, 200, 500, 1000, 2000, 5000, 10000];
 pub const LIFETIME_MS_BOUNDS: &[u64] = &[100, 500, 1000, 5000, 30_000, 60_000, 300_000];
+pub const ACK_FLUSH_US_BOUNDS: &[u64] = &[
+    500, 1_000, 2_000, 5_000, 10_000, 20_000, 50_000, 100_000, 200_000,
+];
 
 fn epoch() -> Instant {
     static EPOCH: OnceLock<Instant> = OnceLock::new();
@@ -198,6 +201,7 @@ pub struct Counters {
     pub failover_ms: Histogram,
     pub stall_ms: Histogram,
     pub stream_lifetime_ms: Histogram,
+    pub ack_flush_us: Histogram,
 }
 
 impl Default for Counters {
@@ -246,6 +250,7 @@ impl Default for Counters {
             failover_ms: Histogram::new(FAILOVER_MS_BOUNDS),
             stall_ms: Histogram::new(STALL_MS_BOUNDS),
             stream_lifetime_ms: Histogram::new(LIFETIME_MS_BOUNDS),
+            ack_flush_us: Histogram::new(ACK_FLUSH_US_BOUNDS),
         }
     }
 }
@@ -269,6 +274,7 @@ pub struct PathSnap {
     pub pending_ping: u64,
     pub queued_urgent: u64,
     pub queued_bulk: u64,
+    pub ack_pending: u64,
     pub backup: bool,
     pub picks: u64,
 }
@@ -427,6 +433,7 @@ pub struct Snapshot {
     pub failover_ms: HistSnap,
     pub stall_ms: HistSnap,
     pub stream_lifetime_ms: HistSnap,
+    pub ack_flush_us: HistSnap,
     pub paths: Vec<PathSnap>,
     pub links: Vec<LinkSnap>,
     pub streams: Vec<StreamSnap>,
@@ -482,6 +489,7 @@ impl Snapshot {
         self.failover_ms.merge_add(&other.failover_ms);
         self.stall_ms.merge_add(&other.stall_ms);
         self.stream_lifetime_ms.merge_add(&other.stream_lifetime_ms);
+        self.ack_flush_us.merge_add(&other.ack_flush_us);
     }
 }
 
@@ -533,6 +541,7 @@ impl Counters {
             failover_ms: self.failover_ms.snap(),
             stall_ms: self.stall_ms.snap(),
             stream_lifetime_ms: self.stream_lifetime_ms.snap(),
+            ack_flush_us: self.ack_flush_us.snap(),
             paths: paths
                 .iter()
                 .map(|p| PathSnap {
@@ -553,6 +562,7 @@ impl Counters {
                     pending_ping: p.pending_ping_count(),
                     queued_urgent: p.queued_urgent(),
                     queued_bulk: p.queued_bulk(),
+                    ack_pending: p.ack_pending(),
                     backup: false,
                     picks: p.picks.load(Ordering::Relaxed),
                 })
@@ -833,6 +843,10 @@ mod tests {
         assert_eq!(
             snap.stream_lifetime_ms.buckets.len(),
             LIFETIME_MS_BOUNDS.len() + 1
+        );
+        assert_eq!(
+            snap.ack_flush_us.buckets.len(),
+            ACK_FLUSH_US_BOUNDS.len() + 1
         );
     }
 

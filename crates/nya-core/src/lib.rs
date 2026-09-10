@@ -51,8 +51,8 @@ pub use hop::{
 };
 pub use metrics::{
     percentile, rollup_links, HistSnap, Histogram, LinkSnap, PathSnap, ProcessCounters,
-    ProcessSnapshot, Snapshot as SessionSnapshot, FAILOVER_MS_BOUNDS, LIFETIME_MS_BOUNDS,
-    STALL_MS_BOUNDS,
+    ProcessSnapshot, Snapshot as SessionSnapshot, ACK_FLUSH_US_BOUNDS, FAILOVER_MS_BOUNDS,
+    LIFETIME_MS_BOUNDS, STALL_MS_BOUNDS,
 };
 pub use session::{IncomingStream, Session, SessionError, SessionTable};
 pub use stream::TunnelStream;

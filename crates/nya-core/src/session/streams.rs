@@ -389,9 +389,7 @@ impl Session {
                 Err(actual) => cur = actual,
             }
         }
-        if let Some(p) = self.pick_pref(PickPref::Interactive) {
-            self.send_ack(&st, p);
-        }
+        self.send_ack(&st, st.last_recv_path.load(Ordering::Relaxed));
     }
 
     pub(super) fn on_data(&self, path_id: u32, data: StreamData) {
@@ -409,6 +407,7 @@ impl Session {
         if st.reset.load(Ordering::Relaxed) || st.recv_fin.load(Ordering::Relaxed) {
             return;
         }
+        st.last_recv_path.store(path_id, Ordering::Relaxed);
         let close_off = st.recv_close_off.load(Ordering::Relaxed);
         if close_off != u64::MAX && data.offset >= close_off {
             return;
@@ -419,7 +418,16 @@ impl Session {
             self.send_ack(&st, path_id);
             return;
         }
-        buf.insert(data.offset, data.data);
+        let new_len = data.data.len() as u64;
+        if let Some(old) = buf.insert(data.offset, data.data) {
+            let old_len = old.len() as u64;
+            let _ = st
+                .recv_buffered
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                    Some(v.saturating_sub(old_len))
+                });
+        }
+        st.recv_buffered.fetch_add(new_len, Ordering::Relaxed);
         drop(buf);
         self.drain_recv(&st, path_id);
     }
@@ -432,6 +440,11 @@ impl Session {
                 break;
             };
             let len = chunk.len() as u64;
+            let _ = st
+                .recv_buffered
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                    Some(v.saturating_sub(len))
+                });
             st.recv_next.store(next + len, Ordering::Relaxed);
             st.buffered_in.fetch_add(len, Ordering::Relaxed);
             drop(buf);
@@ -443,6 +456,7 @@ impl Session {
                 st.recv_next.store(next, Ordering::Relaxed);
                 st.buffered_in.fetch_sub(len, Ordering::Relaxed);
                 st.recv_buf.lock().unwrap().insert(next, chunk);
+                st.recv_buffered.fetch_add(len, Ordering::Relaxed);
                 break;
             }
             st.last_recv_ms
@@ -452,19 +466,41 @@ impl Session {
         self.try_finish_recv_close(st);
     }
 
-    fn send_ack(&self, st: &StreamState, path_id: u32) {
-        let acked = st.recv_next.load(Ordering::Relaxed);
-        let window = st.advertised_window();
-        let frame = Frame::StreamAck(StreamAck {
+    pub(super) fn send_ack(&self, st: &StreamState, path_id: u32) {
+        let ack = StreamAck {
             stream_id: st.id,
-            acked_offset: acked,
-            window,
-        });
-        if !self.send_on_path(path_id, frame.clone()) {
-            if let Some(p) = self.pick_pref(crate::scheduler::PickPref::Interactive) {
-                self.send_on_path(p, frame);
+            acked_offset: st.recv_next.load(Ordering::Relaxed),
+            window: st.advertised_window(),
+        };
+        let dest = if self.get_path(path_id).is_some_and(|p| p.is_alive()) {
+            Some(path_id)
+        } else {
+            let sticky = st.sticky.load(Ordering::Relaxed);
+            if sticky != 0 && self.get_path(sticky).is_some_and(|p| p.is_alive()) {
+                Some(sticky)
+            } else {
+                self.pick_pref(PickPref::Interactive)
             }
+        };
+        let Some(dest) = dest else {
+            Self::mark_ack_dirty(st);
+            return;
+        };
+        let Some(p) = self.get_path(dest) else {
+            Self::mark_ack_dirty(st);
+            return;
+        };
+        p.pending_acks.lock().unwrap().insert(st.id, ack);
+        Self::mark_ack_dirty(st);
+        p.ack_wait.notify_one();
+    }
+
+    fn mark_ack_dirty(st: &StreamState) {
+        if !st.ack_dirty.swap(true, Ordering::Relaxed) {
+            st.ack_flush_from_ms
+                .store(crate::metrics::mono_ms().max(1), Ordering::Relaxed);
         }
+        st.ack_gen.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(super) fn on_ack(&self, ack: StreamAck) {
