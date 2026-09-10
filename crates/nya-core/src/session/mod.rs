@@ -6235,6 +6235,127 @@ mod tests {
         client.shutdown();
     }
 
+    #[tokio::test]
+    async fn advertised_window_counts_recv_buf() {
+        let client = Session::new_client(SessionConfig::default());
+        let (p, _w, _u) = inject_live(&client, 1, "a#0", 7);
+        let tun = client
+            .open_stream(Target {
+                host: "t".into(),
+                port: 1,
+            })
+            .await
+            .unwrap();
+        let st = client.get_stream(tun.id).unwrap();
+        let floor = st.initial_window;
+        assert_eq!(st.recv_cap.load(Ordering::Relaxed), floor);
+        assert_eq!(st.advertised_window(), floor);
+        client.on_data(
+            p.id,
+            StreamData {
+                stream_id: tun.id,
+                offset: 100,
+                data: vec![0xab; 50],
+            },
+        );
+        assert_eq!(
+            st.recv_buf.lock().unwrap().get(&100).map(|v| v.len()),
+            Some(50),
+            "hole must stay in recv_buf"
+        );
+        assert_eq!(st.recv_buffered.load(Ordering::Relaxed), 50);
+        assert_eq!(st.buffered_in.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            st.advertised_window(),
+            floor - 50,
+            "advertise must shrink by recv_buf bytes"
+        );
+        st.buffered_in.store(10, Ordering::Relaxed);
+        assert_eq!(
+            st.advertised_window(),
+            floor - 60,
+            "must subtract buffered_in and recv_buffered, not one"
+        );
+        drop(tun);
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn recv_cap_grows_with_bdp_and_not_below_floor() {
+        let client = Session::new_client(SessionConfig::default());
+        let (p, _w, _u) = inject_live(&client, 1, "a#0", 7);
+        let (_p2, _w2, _u2) = inject_live(&client, 2, "b#0", 10);
+        let tun = client
+            .open_stream(Target {
+                host: "t".into(),
+                port: 1,
+            })
+            .await
+            .unwrap();
+        let st = client.get_stream(tun.id).unwrap();
+        st.sticky.store(p.id, Ordering::Relaxed);
+        let floor = st.initial_window;
+        let ceil = floor.saturating_mul(client.inner.cfg.tuning.chan as u32);
+        assert_eq!(st.recv_cap.load(Ordering::Relaxed), floor);
+        assert_eq!(ceil, 8 * 1024 * 1024);
+
+        // 50 MB/s × 7 ms × 2 = 700 KiB, above 128 KiB floor.
+        st.deliver_rate_ewma.store(50_000_000, Ordering::Relaxed);
+        client.debug_maintain();
+        let cap = st.recv_cap.load(Ordering::Relaxed);
+        let expect = {
+            let bdp = 50_000_000.0 * Duration::from_millis(7).as_secs_f64();
+            let twice = 2.0 * bdp;
+            twice as u32
+        };
+        assert!(cap > floor, "cap {cap} must grow above floor {floor}");
+        assert!(cap <= ceil, "cap {cap} must not exceed ceil {ceil}");
+        assert_eq!(cap, expect);
+
+        st.deliver_rate_ewma.store(0, Ordering::Relaxed);
+        client.debug_maintain();
+        assert_eq!(
+            st.recv_cap.load(Ordering::Relaxed),
+            floor,
+            "zero rate must not grow"
+        );
+
+        st.deliver_rate_ewma.store(50_000_000, Ordering::Relaxed);
+        p.rtt_ewma_us.store(0, Ordering::Relaxed);
+        client.debug_maintain();
+        let cap = st.recv_cap.load(Ordering::Relaxed);
+        let expect_pool = {
+            let bdp = 50_000_000.0 * Duration::from_millis(10).as_secs_f64();
+            (2.0 * bdp) as u32
+        };
+        assert_eq!(
+            cap, expect_pool,
+            "unknown sticky RTT must use min_alive_fast, not unknown_rtt_us"
+        );
+
+        p.state.store(crate::path::STATE_DOWN, Ordering::Relaxed);
+        client.inner.paths.lock().unwrap().remove(&2);
+        client.debug_maintain();
+        assert_eq!(
+            st.recv_cap.load(Ordering::Relaxed),
+            floor,
+            "no alive known RTT must not grow"
+        );
+
+        p.state.store(crate::path::STATE_UP, Ordering::Relaxed);
+        p.rtt_ewma_us.store(7_000, Ordering::Relaxed);
+        st.deliver_rate_ewma.store(u64::MAX / 2, Ordering::Relaxed);
+        client.debug_maintain();
+        assert_eq!(
+            st.recv_cap.load(Ordering::Relaxed),
+            ceil,
+            "huge rate must clamp to initial_window * chan"
+        );
+
+        drop(tun);
+        client.shutdown();
+    }
+
     struct WarnCap(std::sync::Arc<Mutex<Vec<(String, String)>>>);
     impl tracing::Subscriber for WarnCap {
         fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {

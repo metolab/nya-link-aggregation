@@ -201,6 +201,7 @@ impl Session {
         }
 
         self.reap_closed_streams();
+        self.tune_recv_windows();
         let streams: Vec<_> = self
             .inner
             .streams

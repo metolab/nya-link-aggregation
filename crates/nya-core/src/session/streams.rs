@@ -518,6 +518,7 @@ impl Session {
     }
 
     fn drain_recv(&self, st: &StreamState, ack_path: u32) {
+        let mut delivered = 0u64;
         loop {
             let mut buf = st.recv_buf.lock().unwrap();
             let next = st.recv_next.load(Ordering::Relaxed);
@@ -544,11 +545,73 @@ impl Session {
                 st.recv_buffered.fetch_add(len, Ordering::Relaxed);
                 break;
             }
+            delivered += len;
             st.last_recv_ms
                 .store(crate::metrics::mono_ms().max(1), Ordering::Relaxed);
         }
+        if delivered > 0 {
+            st.note_deliver(delivered);
+            self.tune_recv_cap(st);
+        }
         self.send_ack(st, ack_path);
         self.try_finish_recv_close(st);
+    }
+
+    pub(crate) fn tune_recv_windows(&self) {
+        let streams: Vec<_> = self
+            .inner
+            .streams
+            .lock()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect();
+        for st in streams {
+            self.tune_recv_cap(&st);
+        }
+    }
+
+    fn tune_recv_cap(&self, st: &StreamState) {
+        st.recv_cap
+            .store(self.recv_cap_target(st), Ordering::Relaxed);
+    }
+
+    fn recv_cap_target(&self, st: &StreamState) -> u32 {
+        let floor = st.initial_window;
+        let ceil = floor.saturating_mul(self.inner.cfg.tuning.chan as u32);
+        let rate = st.deliver_rate_ewma.load(Ordering::Relaxed);
+        let Some(rtt) = self.bdp_rtt(st) else {
+            return floor;
+        };
+        if rate == 0 {
+            return floor;
+        }
+        let bdp = rate as f64 * rtt.as_secs_f64();
+        if !bdp.is_finite() {
+            return floor;
+        }
+        let twice = 2.0 * bdp;
+        if twice >= f64::from(ceil) {
+            ceil
+        } else if twice <= f64::from(floor) {
+            floor
+        } else {
+            twice as u32
+        }
+    }
+
+    /// Sticky fast EWMA if that dest is alive and known; else pool min.
+    /// Unknown 20 ms is not an RTT — do not grow.
+    fn bdp_rtt(&self, st: &StreamState) -> Option<Duration> {
+        let sticky = st.sticky.load(Ordering::Relaxed);
+        if sticky != 0 {
+            if let Some(p) = self.get_path(sticky) {
+                if p.is_alive() && p.rtt_known() {
+                    return Some(p.rtt());
+                }
+            }
+        }
+        self.min_alive_fast_rtt()
     }
 
     pub(super) fn send_ack(&self, st: &StreamState, path_id: u32) {

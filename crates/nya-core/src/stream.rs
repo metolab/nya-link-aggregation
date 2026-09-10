@@ -57,6 +57,11 @@ pub struct StreamState {
     pub bulk: AtomicBool,
     pub buffered_in: AtomicU64,
     pub initial_window: u32,
+    /// BDP advertise cap. Floor = `initial_window`; ceil = floor * chan.
+    pub recv_cap: AtomicU32,
+    /// `drain_recv` bytes/s EWMA (α = 1/8). 0 until a second successful drain.
+    pub deliver_rate_ewma: AtomicU64,
+    last_deliver: Mutex<Option<Instant>>,
     last_stick_change: Mutex<Instant>,
     /// 0 = never. Written when `send_acked` advances.
     pub last_ack_ms: AtomicU64,
@@ -99,6 +104,9 @@ impl StreamState {
             bulk: AtomicBool::new(false),
             buffered_in: AtomicU64::new(0),
             initial_window,
+            recv_cap: AtomicU32::new(initial_window),
+            deliver_rate_ewma: AtomicU64::new(0),
+            last_deliver: Mutex::new(None),
             last_stick_change: Mutex::new(Instant::now()),
             last_ack_ms: AtomicU64::new(0),
             last_recv_ms: AtomicU64::new(0),
@@ -144,9 +152,42 @@ impl StreamState {
     }
 
     pub fn advertised_window(&self) -> u32 {
-        (self.initial_window as u64)
-            .saturating_sub(self.buffered_in.load(Ordering::Relaxed))
+        // recv_buf is the BDP buffer; duplex stays initial_window.
+        let cap = u64::from(self.recv_cap.load(Ordering::Relaxed));
+        cap.saturating_sub(self.buffered_in.load(Ordering::Relaxed))
+            .saturating_sub(self.recv_buffered.load(Ordering::Relaxed))
             .min(u32::MAX as u64) as u32
+    }
+
+    /// dt==0 would be +inf B/s; skip rather than grow from a collapsed Instant.
+    pub(crate) fn note_deliver(&self, len: u64) {
+        if len == 0 {
+            return;
+        }
+        let now = Instant::now();
+        let mut last = self.last_deliver.lock().unwrap();
+        let Some(prev) = *last else {
+            *last = Some(now);
+            return;
+        };
+        let dt = now.saturating_duration_since(prev);
+        if dt.is_zero() {
+            return;
+        }
+        *last = Some(now);
+        drop(last);
+        let sample = (len as f64 / dt.as_secs_f64()) as u64;
+        if sample == 0 {
+            return;
+        }
+        let old = self.deliver_rate_ewma.load(Ordering::Relaxed);
+        // α = 1/8, same 7/8 as class RTT — not a Tuning field.
+        let ewma = if old == 0 {
+            sample
+        } else {
+            old.saturating_mul(7).saturating_add(sample) / 8
+        };
+        self.deliver_rate_ewma.store(ewma, Ordering::Relaxed);
     }
 }
 
