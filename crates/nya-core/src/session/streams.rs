@@ -2,6 +2,7 @@
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::Instant;
 
 use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -258,9 +259,9 @@ impl Session {
                     Unacked {
                         data: piece.clone(),
                         path_id,
-                        last_sent: std::time::Instant::now(),
+                        last_sent: Instant::now(),
                         tried: vec![path_id],
-                        retry_not_before: std::time::Instant::now(),
+                        retry_not_before: Instant::now(),
                     },
                 );
             }
@@ -273,32 +274,93 @@ impl Session {
                 data: piece,
             });
             if !self.send_on_path(path_id, frame.clone()) {
-                if let Some(alt) = self.pick_retry(path_id) {
-                    if self.send_on_path(alt, frame) {
-                        self.set_sticky(id, alt);
-                        {
-                            let mut unacked = st.unacked.lock().unwrap();
-                            if let Some(u) = unacked.get_mut(&offset) {
-                                u.path_id = alt;
-                                u.last_sent = std::time::Instant::now();
-                                u.retry_not_before = u.last_sent;
-                                Session::push_tried(&mut u.tried, alt);
-                            }
-                        }
-                        self.xfer_inflight(path_id, alt, n as u64);
-                        self.note_migrate("send_blocked");
-                        debug!(
-                            stream_id = id,
-                            from = path_id,
-                            to = alt,
-                            reason = "send_blocked",
-                            "migrate"
-                        );
-                    }
+                let bulk = st.bulk.load(Ordering::Relaxed);
+                if bulk && self.get_path(path_id).is_some_and(|p| p.is_alive()) {
+                    self.wait_bulk_send(&st, path_id, offset, n as u64, frame)
+                        .await;
+                } else {
+                    self.migrate_send_blocked(&st, path_id, offset, n as u64, frame);
                 }
             }
         }
         Ok(())
+    }
+
+    /// C4: wait for bulk queue space up to path `down_timeout`, then give-up
+    /// `pick_retry`. Pin `retry_not_before` so maintain cannot dual-send.
+    async fn wait_bulk_send(
+        &self,
+        st: &StreamState,
+        path_id: u32,
+        offset: u64,
+        n: u64,
+        frame: Frame,
+    ) {
+        let Some(p) = self.get_path(path_id) else {
+            self.migrate_send_blocked(st, path_id, offset, n, frame);
+            return;
+        };
+        let probe = self.probe_interval_for(&p);
+        let wait = health::down_timeout(&self.inner.cfg, p.stable_rtt(), probe);
+        {
+            let mut unacked = st.unacked.lock().unwrap();
+            if let Some(u) = unacked.get_mut(&offset) {
+                u.retry_not_before = Instant::now() + wait;
+            }
+        }
+        tokio::select! {
+            _ = p.queue_wait.notified() => {}
+            _ = st.send_wait.notified() => {}
+            _ = tokio::time::sleep(wait) => {}
+        }
+        {
+            let mut unacked = st.unacked.lock().unwrap();
+            if let Some(u) = unacked.get_mut(&offset) {
+                u.retry_not_before = u.last_sent;
+            }
+        }
+        if self.is_dead() || st.reset.load(Ordering::Relaxed) {
+            return;
+        }
+        if self.send_on_path(path_id, frame.clone()) {
+            return;
+        }
+        self.migrate_send_blocked(st, path_id, offset, n, frame);
+    }
+
+    fn migrate_send_blocked(
+        &self,
+        st: &StreamState,
+        path_id: u32,
+        offset: u64,
+        n: u64,
+        frame: Frame,
+    ) {
+        let Some(alt) = self.pick_retry(path_id) else {
+            return;
+        };
+        if !self.send_on_path(alt, frame) {
+            return;
+        }
+        self.set_sticky(st.id, alt);
+        {
+            let mut unacked = st.unacked.lock().unwrap();
+            if let Some(u) = unacked.get_mut(&offset) {
+                u.path_id = alt;
+                u.last_sent = Instant::now();
+                u.retry_not_before = u.last_sent;
+                Session::push_tried(&mut u.tried, alt);
+            }
+        }
+        self.xfer_inflight(path_id, alt, n);
+        self.note_migrate("send_blocked");
+        debug!(
+            stream_id = st.id,
+            from = path_id,
+            to = alt,
+            reason = "send_blocked",
+            "migrate"
+        );
     }
 
     fn close_send(&self, id: u32) -> Result<(), SessionError> {

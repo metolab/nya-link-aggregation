@@ -1216,6 +1216,132 @@ pub async fn prod_like_blocked_writer_no_drop_storm() -> Result<ScenarioReport> 
     Ok(r)
 }
 
+/// Production Hytron slow-bulk: 3×2 10ms pool, stall soy during a 1 MiB SOCKS
+/// copy. Old overlay cap is 1 MiB / 100 KB/s = 10 s; a pass must finish far
+/// under that (path-limited, not overlay-ACK-starved). 16-way short_matrix
+/// TLS can oversubscribe this host — the row is still a real gate under
+/// `cargo run -p nya-e2e --bin nya-e2e -- --jobs 1 --filter prod_like_bulk_copy`.
+pub async fn prod_like_bulk_copy() -> Result<ScenarioReport> {
+    let h = start(prod_like_spec()).await?;
+    let payload = vec![0u8; 2048];
+    let mut baseline = Duration::MAX;
+    for _ in 0..3 {
+        baseline = baseline.min(
+            socks_first_byte(&h, &payload, Duration::from_millis(400))
+                .await
+                .map_err(|_| anyhow!("baseline first-byte timed out"))?,
+        );
+    }
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut pings = Vec::new();
+    for _ in 0..3 {
+        let mut tcp = h.connect_socks_echo().await?;
+        let stop = stop.clone();
+        pings.push(tokio::spawn(async move {
+            let buf = [0x61u8; 64];
+            let mut rbuf = [0u8; 64];
+            while !stop.load(Ordering::Relaxed) {
+                if tcp.write_all(&buf).await.is_err() {
+                    break;
+                }
+                if tcp.read_exact(&mut rbuf).await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }));
+    }
+    let mut bulk = h.connect_socks_echo().await?;
+    h.link("soy").set_conn_stall(0, true);
+    h.link("soy").set_conn_stall(1, true);
+    const N: usize = 1024 * 1024;
+    const OLD_CAP: Duration = Duration::from_secs(10);
+    let copy = tokio::time::timeout(OLD_CAP, async {
+        let mut send = vec![0u8; N];
+        for (i, b) in send.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        let t0 = Instant::now();
+        let (mut rd, mut wr) = bulk.split();
+        let send_task = async { wr.write_all(&send).await };
+        let mut recv = vec![0u8; N];
+        let recv_task = async { rd.read_exact(&mut recv).await };
+        tokio::try_join!(send_task, recv_task)?;
+        anyhow::Ok((t0.elapsed(), recv == send))
+    })
+    .await;
+    stop.store(true, Ordering::Relaxed);
+    h.link("soy").set_conn_stall(0, false);
+    h.link("soy").set_conn_stall(1, false);
+    for p in pings {
+        let _ = p.await;
+    }
+    let mut stats = WorkloadStats::default();
+    let mut elapsed = None;
+    match copy {
+        Ok(Ok((d, true))) => {
+            elapsed = Some(d);
+            stats.bytes_ok = N as u64;
+            stats.samples.push(crate::workload::PingSample {
+                at: Instant::now() - d,
+                rtt: Some(d),
+            });
+        }
+        Ok(Ok((d, false))) => {
+            elapsed = Some(d);
+            stats.io_errors += 1;
+            stats.samples.push(crate::workload::PingSample {
+                at: Instant::now(),
+                rtt: None,
+            });
+        }
+        Ok(Err(_)) => {
+            stats.io_errors += 1;
+            stats.disconnect = true;
+            stats.samples.push(crate::workload::PingSample {
+                at: Instant::now(),
+                rtt: None,
+            });
+        }
+        Err(_) => {
+            stats.timeouts += 1;
+            stats.samples.push(crate::workload::PingSample {
+                at: Instant::now(),
+                rtt: None,
+            });
+        }
+    }
+    let mut r = finish(
+        "prod_like_bulk_copy",
+        &h,
+        stats,
+        Sla {
+            must_survive: true,
+            p99_ms: Some(5000),
+            failover_ms: None,
+            min_success: 1.0,
+        },
+        None,
+    );
+    note_prod_like(&mut r, &h, baseline);
+    r.notes.push(format!(
+        "churn=bulk_elapsed={:?} old_cap={:?} bytes_ok={} data_rx={} data_tx={} hops={} write_stalled={}",
+        elapsed,
+        OLD_CAP,
+        r.stats.bytes_ok,
+        r.snap.bytes_data_rx,
+        r.snap.bytes_data_tx,
+        r.snap.paths.len(),
+        r.snap.paths.iter().filter(|p| p.write_stalled).count()
+    ));
+    if !matches!(elapsed, Some(d) if d < OLD_CAP) {
+        r.notes
+            .push("bulk copy hit the old 100KB/s overlay cap".into());
+        r.sla.min_success = 2.0;
+    }
+    Ok(r)
+}
+
 /// Stall client→server on 2 of 3 connections (TCP send buffer / HOL).
 /// Sibling connections must pick up the stream.
 pub async fn one_conn_stall() -> Result<ScenarioReport> {
@@ -1789,6 +1915,7 @@ pub fn catalog() -> Vec<Scenario> {
             false,
             prod_like_blocked_writer_no_drop_storm()
         ),
+        sc!("prod_like_bulk_copy", false, prod_like_bulk_copy()),
         sc!("one_conn_stall", false, one_conn_stall()),
         sc!("one_conn_disconnect", false, one_conn_disconnect()),
         sc!("conn_churn", false, conn_churn()),

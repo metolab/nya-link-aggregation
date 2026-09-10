@@ -1278,13 +1278,11 @@ impl Session {
             return false;
         }
         let data = matches!(&frame, Frame::StreamData(_));
-        if data && p.is_write_stalled() {
-            return false;
-        }
         p.note_tx();
         // Unknown dests keep STREAM_DATA off urgent so ping/control can
-        // complete the first RTT before DATA pins FramedWrite.
-        let urgent = if data && !p.rtt_known() {
+        // complete the first RTT before DATA pins FramedWrite. Known+stalled
+        // DATA is forced onto bulk: stall is pick-skip, not "this TCP lost it".
+        let urgent = if data && (!p.rtt_known() || p.is_write_stalled()) {
             false
         } else {
             self.frame_is_interactive(&frame)
@@ -1297,7 +1295,7 @@ impl Session {
             }
             true
         } else {
-            p.note_dequeue(urgent);
+            p.undo_enqueue(urgent);
             // A full bulk queue must not mark the path unusable for ACKs/pings.
             if urgent {
                 p.set_congested(true);
@@ -4718,6 +4716,20 @@ mod tests {
         panic!("urgent queue did not fill");
     }
 
+    fn fill_bulk(client: &Session, path_id: u32) {
+        let data = Frame::StreamData(StreamData {
+            stream_id: 0,
+            offset: 0,
+            data: vec![0; 1600],
+        });
+        for _ in 0..128 {
+            if !client.send_on_path(path_id, data.clone()) {
+                return;
+            }
+        }
+        panic!("bulk queue did not fill");
+    }
+
     /// Fill urgent without `set_congested`, so `pick_pref` still returns this dest.
     fn stuff_urgent_keep_schedulable(p: &PathState) {
         let ping = Frame::Ping(nya_proto::Ping {
@@ -5795,41 +5807,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_stall_refuses_further_stream_data() {
+    async fn send_on_path_data_enqueues_while_write_stalled() {
         let client = Session::new_client(SessionConfig::default());
-        let (a, _peer) = duplex(8);
-        let done = client.start_path("stall".into(), a);
-        let stall_id = *client.inner.paths.lock().unwrap().keys().next().unwrap();
-        client
-            .get_path(stall_id)
-            .unwrap()
-            .record_rtt(Duration::from_millis(7));
-        age_path(&client.get_path(stall_id).unwrap(), Duration::from_secs(1));
-        let _live = inject_live(&client, 99, "live#0", 7);
-        let ping = Frame::Ping(nya_proto::Ping {
-            seq: 1,
-            sent_at_ms: 0,
-        });
-        for _ in 0..80 {
-            let _ = client.send_on_path(stall_id, ping.clone());
-        }
-        tokio::time::sleep(Duration::from_millis(80)).await;
-        let stall = client
-            .get_path(stall_id)
-            .expect("blocked writer must stay up");
-        assert!(stall.is_write_stalled());
+        let (p, mut wrx, mut urx) = inject_live(&client, 1, "a#0", 7);
+        p.set_write_stalled(true);
         let data = Frame::StreamData(StreamData {
             stream_id: 1,
             offset: 0,
             data: vec![1; 64],
         });
         assert!(
-            !client.send_on_path(stall_id, data),
-            "stalled dest must not take more STREAM_DATA"
+            client.send_on_path(1, data.clone()),
+            "known+stalled DATA must enqueue onto bulk"
         );
-        assert!(stall.is_alive());
+        assert!(
+            urx.try_recv().is_err(),
+            "stalled DATA must not occupy urgent"
+        );
+        match wrx.try_recv() {
+            Ok(Frame::StreamData(d)) => assert_eq!(d.stream_id, 1),
+            other => panic!("expected bulk STREAM_DATA, got {other:?}"),
+        }
+        assert!(p.is_alive());
         assert_eq!(client.snapshot().path_down, 0);
-        drop(done);
         client.shutdown();
     }
 
@@ -5879,6 +5879,213 @@ mod tests {
         }
         drop(dones);
         drop(peers);
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn write_stall_still_dequeues_bulk() {
+        let client = Session::new_client(SessionConfig::default());
+        let (a, mut peer) = duplex(64 * 1024);
+        let _done = client.start_path("stall".into(), a);
+        let id = *client.inner.paths.lock().unwrap().keys().next().unwrap();
+        client
+            .get_path(id)
+            .unwrap()
+            .record_rtt(Duration::from_millis(7));
+        age_path(&client.get_path(id).unwrap(), Duration::from_secs(1));
+        client.get_path(id).unwrap().set_write_stalled(true);
+        let data = Frame::StreamData(StreamData {
+            stream_id: 1,
+            offset: 0,
+            data: vec![7; 1600],
+        });
+        assert!(client.send_on_path(id, data));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let f = tokio::time::timeout(
+                deadline.saturating_duration_since(Instant::now()),
+                read_len_frame(&mut peer),
+            )
+            .await
+            .expect("stalled writer must still dequeue bulk");
+            match f {
+                Frame::StreamData(d) => {
+                    assert_eq!(d.stream_id, 1);
+                    break;
+                }
+                Frame::Ping(_) | Frame::StreamAck(_) => {
+                    assert!(Instant::now() < deadline, "bulk DATA never flushed");
+                }
+                other => panic!("unexpected frame {other:?}"),
+            }
+        }
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn stalled_urgent_bulk_full_does_not_drop_copy() {
+        let client = Session::new_client(SessionConfig::default());
+        let (p, _wrx, _urx) = inject_live_cap(&client, 1, "a#0", 7, 4);
+        let mut tun = client
+            .open_stream(Target {
+                host: "t".into(),
+                port: 1,
+            })
+            .await
+            .unwrap();
+        tun.write_all(b"hello").await.unwrap();
+        let st = {
+            let g = client.inner.streams.lock().unwrap();
+            g.values().next().unwrap().clone()
+        };
+        let deadline = Instant::now() + Duration::from_millis(200);
+        loop {
+            if !st.unacked.lock().unwrap().is_empty() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "write must leave unacked");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        fill_urgent(&client, 1);
+        fill_bulk(&client, 1);
+        p.set_write_stalled(true);
+        let (last, offset) = {
+            let u = st.unacked.lock().unwrap();
+            let (off, got) = u.iter().next().unwrap();
+            (got.last_sent, *off)
+        };
+        let extra = Frame::StreamData(StreamData {
+            stream_id: st.id,
+            offset: 99_000,
+            data: vec![1; 64],
+        });
+        assert!(
+            !client.send_on_path(1, extra),
+            "stalled+full bulk must return false, not drop"
+        );
+        let u = st.unacked.lock().unwrap();
+        let got = u.get(&offset).expect("copy must stay in HashMap");
+        assert_eq!(
+            got.last_sent, last,
+            "failed enqueue must not bump last_sent"
+        );
+        drop(u);
+        drop(tun);
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn bulk_send_blocked_waits_does_not_migrate() {
+        let client = Session::new_client(SessionConfig::default());
+        let (_p1, _w1, _u1) = inject_live_cap(&client, 1, "a#0", 7, 4);
+        let (p2, _w2, _u2) = inject_live(&client, 2, "b#0", 7);
+        p2.add_inflight(10 * 1024 * 1024);
+        let mut tun = client
+            .open_stream(Target {
+                host: "t".into(),
+                port: 1,
+            })
+            .await
+            .unwrap();
+        fill_bulk(&client, 1);
+        let mig0 = client.snapshot().migrates_send_blocked;
+        let buf = vec![0x5au8; 2000];
+        let write = tokio::spawn(async move { tun.write_all(&buf).await });
+        let deadline = Instant::now() + Duration::from_millis(500);
+        let st = loop {
+            let found = {
+                let g = client.inner.streams.lock().unwrap();
+                g.values()
+                    .next()
+                    .cloned()
+                    .filter(|st| !st.unacked.lock().unwrap().is_empty())
+            };
+            if let Some(st) = found {
+                break st;
+            }
+            assert!(Instant::now() < deadline, "bulk write must leave unacked");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        let from = st.unacked.lock().unwrap().values().next().unwrap().path_id;
+        assert_eq!(from, 1, "load must pin bulk onto the full dest");
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert_eq!(
+            client.snapshot().migrates_send_blocked,
+            mig0,
+            "C4 must wait, not spray, before down_timeout"
+        );
+        assert_eq!(
+            st.unacked.lock().unwrap().values().next().unwrap().path_id,
+            1
+        );
+        write.abort();
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn c4_wait_pins_retry_not_before() {
+        let client = Session::new_client(SessionConfig::default());
+        let (p1, _w1, _u1) = inject_live_cap(&client, 1, "a#0", 7, 4);
+        let (p2, _w2, _u2) = inject_live(&client, 2, "b#0", 7);
+        p2.add_inflight(10 * 1024 * 1024);
+        let mut tun = client
+            .open_stream(Target {
+                host: "t".into(),
+                port: 1,
+            })
+            .await
+            .unwrap();
+        fill_bulk(&client, 1);
+        let buf = vec![0x5au8; 2000];
+        let write = tokio::spawn(async move { tun.write_all(&buf).await });
+        let deadline = Instant::now() + Duration::from_millis(500);
+        let st = loop {
+            let found = {
+                let g = client.inner.streams.lock().unwrap();
+                g.values().next().cloned().filter(|st| {
+                    st.unacked.lock().unwrap().values().any(|u| {
+                        u.path_id == 1
+                            && u.retry_not_before > Instant::now() + Duration::from_millis(50)
+                    })
+                })
+            };
+            if let Some(st) = found {
+                break st;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "C4 must pin retry_not_before to down_timeout"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        let probe = client.probe_interval_for(&p1);
+        let wait = crate::health::down_timeout(&client.inner.cfg, p1.stable_rtt(), probe);
+        let retry_after = client.inner.cfg.tuning.loss_timeout_floor;
+        assert!(wait > retry_after);
+        let pin = st
+            .unacked
+            .lock()
+            .unwrap()
+            .values()
+            .find(|u| u.path_id == 1)
+            .unwrap()
+            .retry_not_before;
+        let remain = pin.saturating_duration_since(Instant::now());
+        assert!(
+            remain > retry_after,
+            "pin {remain:?} must exceed retry_after {retry_after:?}"
+        );
+        assert!(
+            remain <= wait + Duration::from_millis(50),
+            "pin {remain:?} must be path down_timeout {wait:?}, not all_down"
+        );
+        tokio::time::sleep(retry_after + Duration::from_millis(10)).await;
+        let hedge0 = client.snapshot().data_hedge;
+        let rtx0 = client.snapshot().data_retransmit;
+        client.debug_maintain();
+        assert_eq!(client.snapshot().data_hedge, hedge0);
+        assert_eq!(client.snapshot().data_retransmit, rtx0);
+        write.abort();
         client.shutdown();
     }
 

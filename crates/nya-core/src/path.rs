@@ -38,6 +38,8 @@ pub struct PathState {
     pub pending_acks: std::sync::Mutex<HashMap<u32, StreamAck>>,
     /// Writer wakeup when `pending_acks` gains an entry.
     pub ack_wait: Notify,
+    /// Writer dequeue wakeup. Bulk `send_data` waits here on a full queue.
+    pub queue_wait: Notify,
     pub rtt_ewma_us: AtomicU64,
     pub rtt_stable_us: AtomicU64,
     /// Two-sided class membership. 0 = unset (`class_rtt()` falls back to fast).
@@ -100,6 +102,7 @@ impl PathState {
             urgent,
             pending_acks: std::sync::Mutex::new(HashMap::new()),
             ack_wait: Notify::new(),
+            queue_wait: Notify::new(),
             rtt_ewma_us: AtomicU64::new(0),
             rtt_stable_us: AtomicU64::new(0),
             rtt_class_us: AtomicU64::new(0),
@@ -320,7 +323,9 @@ impl PathState {
         }
     }
 
-    pub fn note_dequeue(&self, urgent: bool) {
+    /// Undo `note_enqueue` after a failed `try_send`. Must not wake C4 waiters
+    /// (that permit would spin send_data on a still-full queue).
+    pub fn undo_enqueue(&self, urgent: bool) {
         let q = if urgent {
             &self.urgent_queued
         } else {
@@ -329,6 +334,11 @@ impl PathState {
         let _ = q.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
             Some(v.saturating_sub(1))
         });
+    }
+
+    pub fn note_dequeue(&self, urgent: bool) {
+        self.undo_enqueue(urgent);
+        self.queue_wait.notify_one();
     }
 
     pub fn pending_ping_count(&self) -> u64 {
@@ -668,14 +678,16 @@ async fn flush_urgent_then_close<S>(
     let _ = tokio::time::timeout(remain, writer.close()).await;
 }
 
+/// Park STREAM_DATA off urgent only until first Pong. Write-stall is pick-skip,
+/// not bulk-kill: known+stalled DATA is forced onto bulk in `send_on_path`.
 fn hold_stream_data(path: &PathState, frame: &Frame) -> bool {
-    matches!(frame, Frame::StreamData(_)) && (!path.rtt_known() || path.is_write_stalled())
+    matches!(frame, Frame::StreamData(_)) && !path.rtt_known()
 }
 
 fn park_stream_data(path: &PathState, session: &Session, frame: Frame) {
     path.note_enqueue(false);
     if path.writer.try_send(frame).is_err() {
-        path.note_dequeue(false);
+        path.undo_enqueue(false);
         session.note_send_drop();
     }
 }
@@ -948,7 +960,7 @@ pub fn spawn_path_io<T>(
                             }
                         }
                     }
-                    out = rx.recv(), if path_w.rtt_known() && !path_w.is_write_stalled() => {
+                    out = rx.recv(), if path_w.rtt_known() => {
                         let Some(frame) = out else {
                             return Err(std::io::Error::new(
                                 std::io::ErrorKind::BrokenPipe,
@@ -1095,6 +1107,7 @@ pub fn spawn_path_io<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nya_proto::StreamData;
     use tokio::sync::mpsc;
 
     fn path() -> Arc<PathState> {
@@ -1200,6 +1213,32 @@ mod tests {
             after < 45_000,
             "12 ms Instant must not look like a 200 ms RTO, got {after}"
         );
+    }
+
+    #[test]
+    fn hold_stream_data_unknown_only() {
+        let p = path();
+        let data = Frame::StreamData(StreamData {
+            stream_id: 1,
+            offset: 0,
+            data: vec![0; 64],
+        });
+        let ping = Frame::Ping(Ping {
+            seq: 1,
+            sent_at_ms: 0,
+        });
+        assert!(
+            hold_stream_data(&p, &data),
+            "unknown dest must park STREAM_DATA until first pong"
+        );
+        assert!(!hold_stream_data(&p, &ping));
+        p.record_rtt(Duration::from_millis(7));
+        p.set_write_stalled(true);
+        assert!(
+            !hold_stream_data(&p, &data),
+            "known+stalled DATA is not parked; send_on_path forces bulk"
+        );
+        assert!(!hold_stream_data(&p, &ping));
     }
 
     #[test]
