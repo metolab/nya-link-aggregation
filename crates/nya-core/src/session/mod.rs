@@ -3545,10 +3545,8 @@ mod tests {
         tun.write_all(b"hi").await.unwrap();
         tokio::time::sleep(Duration::from_millis(10)).await;
         let id = tun.id;
-        let next = {
-            let st = client.get_stream(id).unwrap();
-            st.send_next.load(Ordering::Relaxed)
-        };
+        let st = client.get_stream(id).unwrap();
+        let next = st.send_next.load(Ordering::Relaxed);
         client.handle_frame(
             1,
             Frame::StreamAck(StreamAck {
@@ -3568,14 +3566,15 @@ mod tests {
             frames.iter().any(|f| matches!(f, Frame::StreamReset(_))),
             "client Residual D linger must send wire Reset"
         );
+        assert!(
+            !st.reset.load(Ordering::SeqCst),
+            "Residual D must not set reset (that is finish_stream hop RST)"
+        );
         let mut buf = [0u8; 1];
         let n = tokio::time::timeout(Duration::from_millis(200), tun.read(&mut buf))
             .await
             .expect("closer pump must unblock");
-        assert!(
-            matches!(n, Ok(0)),
-            "closer pump must EOF (Inbound::Close), got {n:?}"
-        );
+        assert!(matches!(n, Ok(0)), "closer pump must unblock, got {n:?}");
         assert_eq!(client.inner.streams.lock().unwrap().len(), 0);
         assert!(
             client.inner.resets.lock().unwrap().contains_key(&id),
@@ -3817,18 +3816,35 @@ mod tests {
                 },
             }),
         );
-        let inc = incoming.try_recv().expect("accepted");
+        let mut inc = incoming.try_recv().expect("accepted");
+        server.handle_frame(
+            1,
+            Frame::StreamClose(StreamClose {
+                stream_id: 1,
+                final_offset: Some(0),
+            }),
+        );
         let st = server.get_stream(1).unwrap();
-        st.recv_fin.store(true, Ordering::SeqCst);
+        assert!(st.recv_fin.load(Ordering::SeqCst));
+        let mut buf = [0u8; 1];
+        let n = tokio::time::timeout(Duration::from_millis(200), inc.io.read(&mut buf))
+            .await
+            .expect("Close must EOF the pump");
+        assert!(matches!(n, Ok(0)), "pump must EOF from Close, got {n:?}");
         let timeout0 = server.snapshot().stream_resets_timeout;
         server.on_peer_reset(1, ResetReason::Timeout);
         assert_eq!(server.snapshot().stream_resets_timeout, timeout0);
-        tokio::time::sleep(Duration::from_millis(20)).await;
         assert!(
-            !st.inbound_tx.is_closed(),
-            "recv_fin + progress-fine must skip Inbound::Reset"
+            st.reset.load(Ordering::SeqCst),
+            "finish_stream still marks reset"
         );
-        let _ = inc;
+        let n2 = tokio::time::timeout(Duration::from_millis(50), inc.io.read(&mut buf))
+            .await
+            .expect("read after peer Reset must not hang");
+        assert!(
+            matches!(n2, Ok(0)),
+            "peer Reset after Close must stay EOF, not hop RST, got {n2:?}"
+        );
         server.shutdown();
     }
 
