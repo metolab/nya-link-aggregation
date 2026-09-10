@@ -540,6 +540,18 @@ impl Session {
             return;
         }
         let now = Instant::now();
+        let now_ms = crate::metrics::mono_ms();
+        let linger_ms = self.inner.cfg.tuning.close_linger.as_millis() as u64;
+        let stall_from = st.stall_from_ms.load(Ordering::Relaxed);
+        let stalled_long = st.stalled.load(Ordering::Relaxed)
+            && stall_from != 0
+            && now_ms.saturating_sub(stall_from) >= linger_ms;
+        let alive: Vec<u32> = self
+            .path_list()
+            .iter()
+            .filter(|p| p.is_alive())
+            .map(|p| p.id)
+            .collect();
         let expired: Vec<(u64, u32, Vec<u8>, Vec<u32>)> = {
             let unacked = st.unacked.lock().unwrap();
             unacked
@@ -552,10 +564,22 @@ impl Session {
                 .collect()
         };
         for (offset, from, data, mut tried) in expired {
+            if stalled_long && alive.iter().all(|id| tried.contains(id)) {
+                continue;
+            }
+            if self
+                .get_path(from)
+                .is_some_and(|p| p.is_alive() && p.is_write_stalled())
+            {
+                continue;
+            }
             Self::push_tried(&mut tried, from);
             let Some(alt) = self.pick_retry_tried(&tried) else {
                 continue;
             };
+            if self.get_path(alt).is_some_and(|p| p.is_write_stalled()) {
+                continue;
+            }
             if self.send_data_frame(st.id, offset, data, alt) {
                 if let Some(u) = st.unacked.lock().unwrap().get_mut(&offset) {
                     self.rehome_unacked(u, alt);
@@ -1302,6 +1326,67 @@ impl Session {
         self.remove_held_stream(id);
     }
 
+    /// Client Residual D: wire Reset, local Close. Observe while `recv_fin`
+    /// is still false so the linger split does not `forget_reset`.
+    pub(crate) fn residual_d_client(&self, id: u32) {
+        let Some(st) = self.get_stream(id) else {
+            return;
+        };
+        if !self.inner.is_client
+            || st.recv_fin.load(Ordering::Relaxed)
+            || !self.overlay_progress_fine(&st)
+        {
+            if self.overlay_progress_fine(&st) {
+                self.linger_reap_progress_fine(id);
+            } else {
+                self.reset_stream(id, ResetReason::Timeout);
+            }
+            return;
+        }
+        if st
+            .counted_close
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+        let why = ResetReason::Timeout;
+        match self.pick_pref(PickPref::Any) {
+            Some(p) => {
+                self.remember_reset(id, p, why);
+                if !self.send_on_path(
+                    p,
+                    Frame::StreamReset(StreamReset {
+                        stream_id: id,
+                        reason: why,
+                    }),
+                ) {
+                    if let Some(alt) = self.pick_retry_untried(&[p]) {
+                        self.remember_reset(id, alt, why);
+                        if self.send_on_path(
+                            alt,
+                            Frame::StreamReset(StreamReset {
+                                stream_id: id,
+                                reason: why,
+                            }),
+                        ) {
+                            self.inner
+                                .metrics
+                                .reset_retry
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+            }
+            None => self.remember_reset(id, 0, why),
+        }
+        self.observe_stream_end(&st, Some(ResetReason::Timeout));
+        if !st.recv_fin.swap(true, Ordering::SeqCst) {
+            let _ = st.inbound_tx.try_send(crate::stream::Inbound::Close);
+        }
+        self.remove_held_stream(id);
+    }
+
     pub(crate) fn finish_stream(
         &self,
         id: u32,
@@ -1314,7 +1399,10 @@ impl Session {
         let first_reset = !st.reset.swap(true, Ordering::SeqCst);
         if first_reset {
             let why = reset_reason.unwrap_or(ResetReason::SessionDead);
-            let _ = st.inbound_tx.try_send(crate::stream::Inbound::Reset(why));
+            // Peer Reset after Close is EOF, not hop RST.
+            if !(st.recv_fin.load(Ordering::Relaxed) && self.overlay_progress_fine(&st)) {
+                let _ = st.inbound_tx.try_send(crate::stream::Inbound::Reset(why));
+            }
             st.send_wait.notify_waiters();
             let live = send_frame && !self.inner.dead.load(Ordering::Relaxed);
             if live {
@@ -1399,7 +1487,9 @@ impl Session {
                     .fetch_add(1, Ordering::Relaxed);
                 debug!(stream_id = st.id, reason = "linger", "stream end");
                 self.forget_close(st.id);
-                self.forget_reset(st.id);
+                if st.recv_fin.load(Ordering::Relaxed) {
+                    self.forget_reset(st.id);
+                }
                 return;
             }
             Some(reason) => {
@@ -3439,7 +3529,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn linger_progress_fine_does_not_send_reset() {
+    async fn linger_progress_fine_without_recv_fin_sends_reset() {
         let mut cfg = SessionConfig::default();
         cfg.tuning.close_linger = Duration::from_millis(80);
         let client = Session::new_client(cfg);
@@ -3467,7 +3557,7 @@ mod tests {
                 window: 128 * 1024,
             }),
         );
-        drop(tun);
+        tun.shutdown().await.unwrap();
         tokio::time::sleep(Duration::from_millis(120)).await;
         client.debug_maintain();
         let frames: Vec<_> = drain_frames(&mut w1, &mut u1)
@@ -3475,14 +3565,24 @@ mod tests {
             .chain(drain_frames(&mut w2, &mut u2))
             .collect();
         assert!(
-            !frames.iter().any(|f| matches!(f, Frame::StreamReset(_))),
-            "progress-fine linger must not send Reset"
+            frames.iter().any(|f| matches!(f, Frame::StreamReset(_))),
+            "client Residual D linger must send wire Reset"
+        );
+        let mut buf = [0u8; 1];
+        let n = tokio::time::timeout(Duration::from_millis(200), tun.read(&mut buf))
+            .await
+            .expect("closer pump must unblock");
+        assert!(
+            matches!(n, Ok(0)),
+            "closer pump must EOF (Inbound::Close), got {n:?}"
         );
         assert_eq!(client.inner.streams.lock().unwrap().len(), 0);
-        assert!(client.inner.resets.lock().unwrap().is_empty());
+        assert!(
+            client.inner.resets.lock().unwrap().contains_key(&id),
+            "Inner.resets must stay after maintain (observe before recv_fin.swap)"
+        );
         assert!(client.snapshot().stream_reaps_linger >= 1);
         assert_eq!(client.snapshot().stream_resets_timeout, 0);
-        assert_eq!(client.snapshot().reset_retry, 0);
         client.shutdown();
     }
 
@@ -3609,9 +3709,322 @@ mod tests {
         server.debug_maintain();
         assert!(fed, "Close must land on dest 2");
         assert_eq!(server.inner.streams.lock().unwrap().len(), 0);
-        assert_eq!(client.snapshot().reset_retry, 0);
         client.shutdown();
         server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn server_origin_eof_linger_does_not_send_reset() {
+        let mut cfg = SessionConfig::default();
+        cfg.tuning.close_linger = Duration::from_millis(80);
+        let (server, mut incoming) = Session::new_server(cfg);
+        let (_p, mut w, mut u) = inject_live(&server, 1, "a#0", 7);
+        server.handle_frame(
+            1,
+            Frame::StreamOpen(StreamOpen {
+                stream_id: 1,
+                target: Target {
+                    host: "t".into(),
+                    port: 1,
+                },
+            }),
+        );
+        let inc = incoming.try_recv().expect("accepted");
+        let next = server
+            .get_stream(1)
+            .unwrap()
+            .send_next
+            .load(Ordering::Relaxed);
+        server.handle_frame(
+            1,
+            Frame::StreamAck(StreamAck {
+                stream_id: 1,
+                acked_offset: next,
+                window: 128 * 1024,
+            }),
+        );
+        drop(inc);
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        server.debug_maintain();
+        let frames = drain_frames(&mut w, &mut u);
+        assert!(
+            !frames.iter().any(|f| matches!(f, Frame::StreamReset(_))),
+            "server origin-EOF linger must stay silent"
+        );
+        assert_eq!(server.inner.streams.lock().unwrap().len(), 0);
+        assert!(server.inner.resets.lock().unwrap().is_empty());
+        assert_eq!(server.snapshot().stream_resets_timeout, 0);
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn linger_progress_fine_with_recv_fin_does_not_send_reset() {
+        let mut cfg = SessionConfig::default();
+        cfg.tuning.close_linger = Duration::from_millis(80);
+        let client = Session::new_client(cfg);
+        let (_p1, mut w1, mut u1) = inject_live(&client, 1, "a#0", 7);
+        let (_p2, mut w2, mut u2) = inject_live(&client, 2, "b#0", 7);
+        let tun = client
+            .open_stream(Target {
+                host: "t".into(),
+                port: 1,
+            })
+            .await
+            .unwrap();
+        let id = tun.id;
+        client.handle_frame(
+            1,
+            Frame::StreamAck(StreamAck {
+                stream_id: id,
+                acked_offset: 0,
+                window: 128 * 1024,
+            }),
+        );
+        client.handle_frame(
+            1,
+            Frame::StreamClose(StreamClose {
+                stream_id: id,
+                final_offset: Some(0),
+            }),
+        );
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        client.debug_maintain();
+        let frames: Vec<_> = drain_frames(&mut w1, &mut u1)
+            .into_iter()
+            .chain(drain_frames(&mut w2, &mut u2))
+            .collect();
+        assert!(
+            !frames.iter().any(|f| matches!(f, Frame::StreamReset(_))),
+            "progress-fine + recv_fin linger must not send Reset"
+        );
+        assert_eq!(client.inner.streams.lock().unwrap().len(), 0);
+        assert!(client.inner.resets.lock().unwrap().is_empty());
+        drop(tun);
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn peer_reset_after_recv_fin_is_eof_not_hop_rst() {
+        let (server, mut incoming) = Session::new_server(SessionConfig::default());
+        let _p = inject_live(&server, 1, "a#0", 7);
+        server.handle_frame(
+            1,
+            Frame::StreamOpen(StreamOpen {
+                stream_id: 1,
+                target: Target {
+                    host: "t".into(),
+                    port: 1,
+                },
+            }),
+        );
+        let inc = incoming.try_recv().expect("accepted");
+        let st = server.get_stream(1).unwrap();
+        st.recv_fin.store(true, Ordering::SeqCst);
+        let timeout0 = server.snapshot().stream_resets_timeout;
+        server.on_peer_reset(1, ResetReason::Timeout);
+        assert_eq!(server.snapshot().stream_resets_timeout, timeout0);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !st.inbound_tx.is_closed(),
+            "recv_fin + progress-fine must skip Inbound::Reset"
+        );
+        let _ = inc;
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn stalled_leftover_retry_stops_after_all_dests_and_linger() {
+        let mut cfg = SessionConfig::default();
+        cfg.tuning.close_linger = Duration::from_millis(40);
+        let client = Session::new_client(cfg);
+        let _p1 = inject_live(&client, 1, "a#0", 7);
+        let _p2 = inject_live(&client, 2, "b#0", 7);
+        let mut tun = client
+            .open_stream(Target {
+                host: "t".into(),
+                port: 1,
+            })
+            .await
+            .unwrap();
+        tun.write_all(b"hello").await.unwrap();
+        let st = {
+            let g = client.inner.streams.lock().unwrap();
+            g.values().next().unwrap().clone()
+        };
+        let id = st.id;
+        let deadline = Instant::now() + Duration::from_millis(200);
+        loop {
+            if !st.unacked.lock().unwrap().is_empty() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "write must leave unacked");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        while crate::metrics::mono_ms() < 100 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        {
+            let mut u = st.unacked.lock().unwrap();
+            for x in u.values_mut() {
+                x.tried = vec![1, 2];
+                x.last_sent = Instant::now() - Duration::from_millis(100);
+                x.retry_not_before = Instant::now() - Duration::from_millis(100);
+            }
+        }
+        st.stalled.store(true, Ordering::Relaxed);
+        st.stall_from_ms.store(
+            crate::metrics::mono_ms().saturating_sub(80).max(1),
+            Ordering::Relaxed,
+        );
+        let hedge0 = client.snapshot().data_hedge;
+        let rtx0 = client.snapshot().data_retransmit;
+        client.debug_maintain();
+        client.debug_maintain();
+        assert_eq!(client.snapshot().data_hedge, hedge0);
+        assert_eq!(client.snapshot().data_retransmit, rtx0);
+        assert!(
+            client.inner.streams.lock().unwrap().contains_key(&id),
+            "A3 must not GC"
+        );
+        drop(tun);
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn retry_expired_unacked_skips_alive_write_stalled_from() {
+        let client = Session::new_client(SessionConfig::default());
+        let (p1, _w1, _u1) = inject_live(&client, 1, "a#0", 7);
+        let _p2 = inject_live(&client, 2, "b#0", 7);
+        let mut tun = client
+            .open_stream(Target {
+                host: "t".into(),
+                port: 1,
+            })
+            .await
+            .unwrap();
+        tun.write_all(b"hello").await.unwrap();
+        let st = {
+            let g = client.inner.streams.lock().unwrap();
+            g.values().next().unwrap().clone()
+        };
+        let deadline = Instant::now() + Duration::from_millis(200);
+        loop {
+            if !st.unacked.lock().unwrap().is_empty() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "write must leave unacked");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        {
+            let mut u = st.unacked.lock().unwrap();
+            for x in u.values_mut() {
+                x.path_id = 1;
+                x.tried = vec![1];
+                x.last_sent = Instant::now() - Duration::from_millis(100);
+                x.retry_not_before = Instant::now() - Duration::from_millis(100);
+            }
+        }
+        p1.set_write_stalled(true);
+        let hedge0 = client.snapshot().data_hedge;
+        let rtx0 = client.snapshot().data_retransmit;
+        client.debug_maintain();
+        assert_eq!(client.snapshot().data_hedge, hedge0);
+        assert_eq!(client.snapshot().data_retransmit, rtx0);
+        let from = st.unacked.lock().unwrap().values().next().unwrap().path_id;
+        assert_eq!(from, 1, "copy must stay on stalled-alive from");
+        drop(tun);
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn retry_does_not_pick_write_stalled_alt() {
+        let client = Session::new_client(SessionConfig::default());
+        let (_p1, _w1, _u1) = inject_live(&client, 1, "a#0", 7);
+        let (p2, _w2, _u2) = inject_live(&client, 2, "b#0", 7);
+        let mut tun = client
+            .open_stream(Target {
+                host: "t".into(),
+                port: 1,
+            })
+            .await
+            .unwrap();
+        tun.write_all(b"hello").await.unwrap();
+        let st = {
+            let g = client.inner.streams.lock().unwrap();
+            g.values().next().unwrap().clone()
+        };
+        let deadline = Instant::now() + Duration::from_millis(200);
+        loop {
+            if !st.unacked.lock().unwrap().is_empty() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "write must leave unacked");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        {
+            let mut u = st.unacked.lock().unwrap();
+            for x in u.values_mut() {
+                x.path_id = 1;
+                x.tried = vec![1];
+                x.last_sent = Instant::now() - Duration::from_millis(100);
+                x.retry_not_before = Instant::now() - Duration::from_millis(100);
+            }
+        }
+        p2.set_write_stalled(true);
+        let hedge0 = client.snapshot().data_hedge;
+        client.debug_maintain();
+        assert_eq!(client.snapshot().data_hedge, hedge0);
+        let tried = st
+            .unacked
+            .lock()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap()
+            .tried
+            .clone();
+        assert!(
+            !tried.contains(&2),
+            "must not spray onto write-stalled alt: {tried:?}"
+        );
+        drop(tun);
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn hol_leftover_interactive_does_not_pin_after_linger_stall() {
+        let mut cfg = SessionConfig::default();
+        cfg.tuning.close_linger = Duration::from_millis(40);
+        let client = Session::new_client(cfg);
+        let _p1 = inject_live(&client, 1, "a#0", 7);
+        let _p2 = inject_live(&client, 2, "a#1", 7);
+        let mut tun = client
+            .open_stream(Target {
+                host: "t".into(),
+                port: 1,
+            })
+            .await
+            .unwrap();
+        tun.write_all(b"hi").await.unwrap();
+        let st = {
+            let g = client.inner.streams.lock().unwrap();
+            g.values().next().unwrap().clone()
+        };
+        while crate::metrics::mono_ms() < 100 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        st.sticky.store(1, Ordering::Relaxed);
+        st.stalled.store(true, Ordering::Relaxed);
+        st.stall_from_ms.store(
+            crate::metrics::mono_ms().saturating_sub(80).max(1),
+            Ordering::Relaxed,
+        );
+        assert!(
+            client.hol_place_bulk(1).is_none(),
+            "linger-stalled leftover must not pin as interactive"
+        );
+        drop(tun);
+        client.shutdown();
     }
 
     #[tokio::test]

@@ -358,7 +358,23 @@ impl Session {
         }
         for id in timeout_ids {
             match self.get_stream(id) {
-                Some(st) if self.overlay_progress_fine(&st) => {
+                Some(st)
+                    if self.overlay_progress_fine(&st) && st.recv_fin.load(Ordering::Relaxed) =>
+                {
+                    self.linger_reap_progress_fine(id);
+                }
+                Some(st)
+                    if self.inner.is_client
+                        && self.overlay_progress_fine(&st)
+                        && !st.recv_fin.load(Ordering::Relaxed) =>
+                {
+                    self.residual_d_client(id);
+                }
+                Some(st)
+                    if !self.inner.is_client
+                        && self.overlay_progress_fine(&st)
+                        && !st.recv_fin.load(Ordering::Relaxed) =>
+                {
                     self.linger_reap_progress_fine(id);
                 }
                 Some(_) => self.reset_stream(id, ResetReason::Timeout),
@@ -372,10 +388,19 @@ impl Session {
     }
 
     fn conn_has_interactive(&self, path_id: u32) -> bool {
+        let now = mono_ms();
+        let linger_ms = self.inner.cfg.tuning.close_linger.as_millis() as u64;
         self.inner.streams.lock().unwrap().values().any(|st| {
-            st.is_steerable()
-                && st.sticky.load(Ordering::Relaxed) == path_id
-                && !st.bulk.load(Ordering::Relaxed)
+            if !st.is_steerable()
+                || st.sticky.load(Ordering::Relaxed) != path_id
+                || st.bulk.load(Ordering::Relaxed)
+            {
+                return false;
+            }
+            // Stall-only belt: unstalled hangover still pins until bounce.
+            let stalled = st.stalled.load(Ordering::Relaxed);
+            let from = st.stall_from_ms.load(Ordering::Relaxed);
+            !(stalled && from != 0 && now.saturating_sub(from) >= linger_ms)
         })
     }
 

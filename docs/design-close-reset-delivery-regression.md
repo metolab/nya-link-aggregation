@@ -11,6 +11,8 @@
 | **Compatibility** | `PROTOCOL_VERSION` **stays 2**. No CloseAck. No new TOML keys. `[session]` stays `deny_unknown_fields` (four keys, `cfg.rs` L130–137). One production `Tuning::STANDARD`. Tests clone-and-mutate. Version stays `0.1.2` in the mechanism PR; release tag is later. |
 | **Intended repo path** | `docs/design-close-reset-delivery-regression.md` |
 
+**Follow-up:** Residual D (`progress-fine && !recv_fin` linger) is implemented **client-only** in `docs/design-hytron-bulk-goodput.md`. Server origin-EOF linger stays silent. Hangover neither-FIN is session bounce, not idle-GC.
+
 ---
 
 ## Overview
