@@ -59,8 +59,10 @@ pub struct StreamState {
     pub initial_window: u32,
     /// BDP advertise cap. Floor = `initial_window`; ceil = floor * chan.
     pub recv_cap: AtomicU32,
-    /// `drain_recv` bytes/s EWMA (α = 1/8). 0 until a second successful drain.
+    /// `drain_recv` bytes/s EWMA (α = 1/8). 0 until a sample spanning ≥ one RTT.
     pub deliver_rate_ewma: AtomicU64,
+    /// Bytes since the last rate sample. Coalesced so FramedRead gaps are not a rate.
+    pending_deliver: AtomicU64,
     last_deliver: Mutex<Option<Instant>>,
     last_stick_change: Mutex<Instant>,
     /// 0 = never. Written when `send_acked` advances.
@@ -106,6 +108,7 @@ impl StreamState {
             initial_window,
             recv_cap: AtomicU32::new(initial_window),
             deliver_rate_ewma: AtomicU64::new(0),
+            pending_deliver: AtomicU64::new(0),
             last_deliver: Mutex::new(None),
             last_stick_change: Mutex::new(Instant::now()),
             last_ack_ms: AtomicU64::new(0),
@@ -159,24 +162,28 @@ impl StreamState {
             .min(u32::MAX as u64) as u32
     }
 
-    /// dt==0 would be +inf B/s; skip rather than grow from a collapsed Instant.
-    pub(crate) fn note_deliver(&self, len: u64) {
+    /// Coalesce until `dt >= min_dt` (one RTT, or maintain_interval). First
+    /// bytes are kept; a collapsed-but-nonzero Instant is not a rate.
+    pub(crate) fn note_deliver(&self, len: u64, min_dt: Duration) {
         if len == 0 {
             return;
         }
         let now = Instant::now();
         let mut last = self.last_deliver.lock().unwrap();
+        let pending = self.pending_deliver.fetch_add(len, Ordering::Relaxed) + len;
         let Some(prev) = *last else {
             *last = Some(now);
             return;
         };
         let dt = now.saturating_duration_since(prev);
-        if dt.is_zero() {
+        // Decode-speed FramedRead gaps are tens of µs; require a full RTT.
+        if dt.is_zero() || dt < min_dt {
             return;
         }
         *last = Some(now);
+        self.pending_deliver.store(0, Ordering::Relaxed);
         drop(last);
-        let sample = (len as f64 / dt.as_secs_f64()) as u64;
+        let sample = (pending as f64 / dt.as_secs_f64()) as u64;
         if sample == 0 {
             return;
         }
@@ -188,6 +195,11 @@ impl StreamState {
             old.saturating_mul(7).saturating_add(sample) / 8
         };
         self.deliver_rate_ewma.store(ewma, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn debug_set_deliver_clock(&self, start: Instant) {
+        *self.last_deliver.lock().unwrap() = Some(start);
     }
 }
 

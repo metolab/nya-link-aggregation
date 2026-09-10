@@ -6356,6 +6356,80 @@ mod tests {
         client.shutdown();
     }
 
+    #[tokio::test]
+    async fn recv_cap_does_not_grow_from_back_to_back_data() {
+        let client = Session::new_client(SessionConfig::default());
+        let (p, _w, _u) = inject_live(&client, 1, "a#0", 7);
+        let tun = client
+            .open_stream(Target {
+                host: "t".into(),
+                port: 1,
+            })
+            .await
+            .unwrap();
+        let st = client.get_stream(tun.id).unwrap();
+        st.sticky.store(p.id, Ordering::Relaxed);
+        let floor = st.initial_window;
+        let ceil = floor.saturating_mul(client.inner.cfg.tuning.chan as u32);
+        let sid = tun.id;
+        client.on_data(
+            p.id,
+            StreamData {
+                stream_id: sid,
+                offset: 0,
+                data: vec![0xab; 16 * 1024],
+            },
+        );
+        client.on_data(
+            p.id,
+            StreamData {
+                stream_id: sid,
+                offset: 16 * 1024,
+                data: vec![0xcd; 16 * 1024],
+            },
+        );
+        assert_eq!(
+            st.deliver_rate_ewma.load(Ordering::Relaxed),
+            0,
+            "FramedRead callback gap is not a rate"
+        );
+        assert_eq!(
+            st.recv_cap.load(Ordering::Relaxed),
+            floor,
+            "two in-order frames must not ACK ceil"
+        );
+        assert_ne!(st.recv_cap.load(Ordering::Relaxed), ceil);
+
+        const TOTAL: u64 = 350_000;
+        let already = 32 * 1024u64;
+        let rtt = Duration::from_millis(7);
+        let start = Instant::now().checked_sub(rtt).unwrap();
+        st.debug_set_deliver_clock(start);
+        client.on_data(
+            p.id,
+            StreamData {
+                stream_id: sid,
+                offset: already,
+                data: vec![0xef; (TOTAL - already) as usize],
+            },
+        );
+        let cap = st.recv_cap.load(Ordering::Relaxed);
+        let dt = start.elapsed();
+        let expect = {
+            let rate = TOTAL as f64 / dt.as_secs_f64();
+            let twice = 2.0 * rate * rtt.as_secs_f64();
+            (twice as u32).clamp(floor, ceil)
+        };
+        assert!(cap > floor, "cap {cap} must grow after one RTT of 50 MB/s");
+        assert!(cap < ceil, "cap {cap} must not be decode-speed ceil");
+        assert!(
+            cap.abs_diff(expect) < 2_000,
+            "cap {cap} expect {expect} (2·{TOTAL}/{dt:?}·7ms), ~700 KiB class"
+        );
+        drop(tun);
+        client.shutdown();
+    }
+
     struct WarnCap(std::sync::Arc<Mutex<Vec<(String, String)>>>);
     impl tracing::Subscriber for WarnCap {
         fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {

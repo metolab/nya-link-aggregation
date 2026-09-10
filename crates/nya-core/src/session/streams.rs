@@ -550,7 +550,7 @@ impl Session {
                 .store(crate::metrics::mono_ms().max(1), Ordering::Relaxed);
         }
         if delivered > 0 {
-            st.note_deliver(delivered);
+            st.note_deliver(delivered, self.deliver_min_dt(st));
             self.tune_recv_cap(st);
         }
         self.send_ack(st, ack_path);
@@ -598,6 +598,11 @@ impl Session {
         } else {
             twice as u32
         }
+    }
+
+    fn deliver_min_dt(&self, st: &StreamState) -> Duration {
+        self.bdp_rtt(st)
+            .unwrap_or(self.inner.cfg.tuning.maintain_interval)
     }
 
     /// Sticky fast EWMA if that dest is alive and known; else pool min.
