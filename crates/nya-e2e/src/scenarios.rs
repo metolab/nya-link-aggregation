@@ -1217,9 +1217,10 @@ pub async fn prod_like_blocked_writer_no_drop_storm() -> Result<ScenarioReport> 
 }
 
 /// Production Hytron slow-bulk: 3×2 10ms pool, stall soy during a 1 MiB SOCKS
-/// copy. Old overlay cap is 1 MiB / 100 KB/s = 10 s; a pass must finish far
-/// under that (path-limited, not overlay-ACK-starved). 16-way short_matrix
-/// TLS can oversubscribe this host — the row is still a real gate under
+/// copy. Old overlay cap is 1 MiB / 100 KB/s = 10 s. The real gate is 5 s
+/// (SLA p99; ≪ 10 s, path-limited not overlay-ACK-starved). 16-way
+/// short_matrix TLS can oversubscribe this host — the row is still a real
+/// gate under
 /// `cargo run -p nya-e2e --bin nya-e2e -- --jobs 1 --filter prod_like_bulk_copy`.
 pub async fn prod_like_bulk_copy() -> Result<ScenarioReport> {
     let h = start(prod_like_spec()).await?;
@@ -1252,24 +1253,34 @@ pub async fn prod_like_bulk_copy() -> Result<ScenarioReport> {
         }));
     }
     let mut bulk = h.connect_socks_echo().await?;
+    let saw_soy_stall = Arc::new(AtomicBool::new(false));
+    {
+        let session = h.session.clone();
+        let stop = stop.clone();
+        let saw = saw_soy_stall.clone();
+        tokio::spawn(async move {
+            while !stop.load(Ordering::Relaxed) {
+                if session
+                    .snapshot()
+                    .paths
+                    .iter()
+                    .any(|p| p.name.starts_with("soy") && p.write_stalled)
+                {
+                    saw.store(true, Ordering::Relaxed);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+    }
     h.link("soy").set_conn_stall(0, true);
     h.link("soy").set_conn_stall(1, true);
     const N: usize = 1024 * 1024;
-    const OLD_CAP: Duration = Duration::from_secs(10);
-    let copy = tokio::time::timeout(OLD_CAP, async {
-        let mut send = vec![0u8; N];
-        for (i, b) in send.iter_mut().enumerate() {
-            *b = (i % 251) as u8;
-        }
-        let t0 = Instant::now();
-        let (mut rd, mut wr) = bulk.split();
-        let send_task = async { wr.write_all(&send).await };
-        let mut recv = vec![0u8; N];
-        let recv_task = async { rd.read_exact(&mut recv).await };
-        tokio::try_join!(send_task, recv_task)?;
-        anyhow::Ok((t0.elapsed(), recv == send))
-    })
-    .await;
+    // Historical 1 MiB / 100 KB/s overlay cap. Hang watchdog only.
+    const OVERLAY_CAP: Duration = Duration::from_secs(10);
+    // Real gate: ≪ overlay cap. Same as SLA p99_ms=5000.
+    const GATE: Duration = Duration::from_secs(5);
+    let copy = tokio::time::timeout(OVERLAY_CAP, bulk_echo(&mut bulk, N)).await;
     stop.store(true, Ordering::Relaxed);
     h.link("soy").set_conn_stall(0, false);
     h.link("soy").set_conn_stall(1, false);
@@ -1325,18 +1336,20 @@ pub async fn prod_like_bulk_copy() -> Result<ScenarioReport> {
     );
     note_prod_like(&mut r, &h, baseline);
     r.notes.push(format!(
-        "churn=bulk_elapsed={:?} old_cap={:?} bytes_ok={} data_rx={} data_tx={} hops={} write_stalled={}",
+        "churn=bulk_elapsed={:?} gate={:?} overlay_cap={:?} soy_write_stalled={} bytes_ok={} data_rx={} data_tx={} hops={}",
         elapsed,
-        OLD_CAP,
+        GATE,
+        OVERLAY_CAP,
+        saw_soy_stall.load(Ordering::Relaxed),
         r.stats.bytes_ok,
         r.snap.bytes_data_rx,
         r.snap.bytes_data_tx,
         r.snap.paths.len(),
-        r.snap.paths.iter().filter(|p| p.write_stalled).count()
     ));
-    if !matches!(elapsed, Some(d) if d < OLD_CAP) {
-        r.notes
-            .push("bulk copy hit the old 100KB/s overlay cap".into());
+    if !matches!(elapsed, Some(d) if d < GATE) {
+        r.notes.push(format!(
+            "bulk copy {elapsed:?} not ≪ overlay cap {OVERLAY_CAP:?} (gate {GATE:?})"
+        ));
         r.sla.min_success = 2.0;
     }
     Ok(r)

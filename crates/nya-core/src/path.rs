@@ -338,7 +338,10 @@ impl PathState {
 
     pub fn note_dequeue(&self, urgent: bool) {
         self.undo_enqueue(urgent);
-        self.queue_wait.notify_one();
+        // C4 waits on bulk space. Urgent dequeue must not abort that wait.
+        if !urgent {
+            self.queue_wait.notify_one();
+        }
     }
 
     pub fn pending_ping_count(&self) -> u64 {

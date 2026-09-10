@@ -6008,6 +6008,8 @@ mod tests {
         };
         let from = st.unacked.lock().unwrap().values().next().unwrap().path_id;
         assert_eq!(from, 1, "load must pin bulk onto the full dest");
+        st.send_wait.notify_waiters();
+        client.get_path(1).unwrap().queue_wait.notify_one();
         tokio::time::sleep(Duration::from_millis(80)).await;
         assert_eq!(
             client.snapshot().migrates_send_blocked,
@@ -6079,12 +6081,26 @@ mod tests {
             remain <= wait + Duration::from_millis(50),
             "pin {remain:?} must be path down_timeout {wait:?}, not all_down"
         );
+        st.send_wait.notify_waiters();
+        p1.queue_wait.notify_one();
         tokio::time::sleep(retry_after + Duration::from_millis(10)).await;
         let hedge0 = client.snapshot().data_hedge;
         let rtx0 = client.snapshot().data_retransmit;
         client.debug_maintain();
         assert_eq!(client.snapshot().data_hedge, hedge0);
         assert_eq!(client.snapshot().data_retransmit, rtx0);
+        let pin_after = st
+            .unacked
+            .lock()
+            .unwrap()
+            .values()
+            .find(|u| u.path_id == 1)
+            .unwrap()
+            .retry_not_before;
+        assert!(
+            pin_after > Instant::now(),
+            "pin must survive send_wait / non-space queue_wait"
+        );
         write.abort();
         client.shutdown();
     }

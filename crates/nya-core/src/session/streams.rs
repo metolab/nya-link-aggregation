@@ -2,7 +2,7 @@
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -287,7 +287,8 @@ impl Session {
     }
 
     /// C4: wait for bulk queue space up to path `down_timeout`, then give-up
-    /// `pick_retry`. Pin `retry_not_before` so maintain cannot dual-send.
+    /// `pick_retry`. Pin `retry_not_before` for the whole wait so maintain
+    /// cannot dual-send. `send_wait` is a reset/window check, not give-up.
     async fn wait_bulk_send(
         &self,
         st: &StreamState,
@@ -302,30 +303,51 @@ impl Session {
         };
         let probe = self.probe_interval_for(&p);
         let wait = health::down_timeout(&self.inner.cfg, p.stable_rtt(), probe);
+        let deadline = Instant::now() + wait;
         {
             let mut unacked = st.unacked.lock().unwrap();
             if let Some(u) = unacked.get_mut(&offset) {
-                u.retry_not_before = Instant::now() + wait;
+                u.retry_not_before = deadline;
             }
         }
-        tokio::select! {
-            _ = p.queue_wait.notified() => {}
-            _ = st.send_wait.notified() => {}
-            _ = tokio::time::sleep(wait) => {}
-        }
-        {
-            let mut unacked = st.unacked.lock().unwrap();
-            if let Some(u) = unacked.get_mut(&offset) {
-                u.retry_not_before = u.last_sent;
+        let mark_enqueued = || {
+            let now = Instant::now();
+            if let Some(u) = st.unacked.lock().unwrap().get_mut(&offset) {
+                u.last_sent = now;
+                u.retry_not_before = now;
+            }
+        };
+        loop {
+            if self.is_dead() || st.reset.load(Ordering::Relaxed) {
+                return;
+            }
+            let timed_out = Instant::now() >= deadline;
+            if !p.is_alive() || timed_out {
+                if p.is_alive() && self.send_on_path(path_id, frame.clone()) {
+                    mark_enqueued();
+                    return;
+                }
+                self.migrate_send_blocked(st, path_id, offset, n, frame);
+                return;
+            }
+            let remain: Duration = deadline.saturating_duration_since(Instant::now());
+            tokio::select! {
+                _ = p.queue_wait.notified() => {}
+                _ = st.send_wait.notified() => {
+                    continue;
+                }
+                _ = tokio::time::sleep(remain) => {
+                    continue;
+                }
+            }
+            if p.queued_bulk() >= self.inner.cfg.tuning.chan as u64 {
+                continue;
+            }
+            if self.send_on_path(path_id, frame.clone()) {
+                mark_enqueued();
+                return;
             }
         }
-        if self.is_dead() || st.reset.load(Ordering::Relaxed) {
-            return;
-        }
-        if self.send_on_path(path_id, frame.clone()) {
-            return;
-        }
-        self.migrate_send_blocked(st, path_id, offset, n, frame);
     }
 
     fn migrate_send_blocked(
