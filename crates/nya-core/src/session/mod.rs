@@ -385,15 +385,24 @@ impl Session {
         info!(path = %path.name, path_id, "path down");
         self.inner.metrics.path_down.fetch_add(1, Ordering::Relaxed);
         self.observe_failover(&path);
-        let taken = {
-            let mut g = path.pending_acks.lock().unwrap();
-            std::mem::take(&mut *g)
-        };
+        let mut taken = path.take_all_acks();
         self.rehome_unacked_from(path_id);
         self.retry_open_from(path_id);
         self.retry_close_from(path_id);
         self.retry_reset_from(path_id);
         self.inner.paths.lock().unwrap().remove(&path_id);
+        for (id, ack) in path.take_all_acks() {
+            match taken.entry(id) {
+                std::collections::hash_map::Entry::Occupied(e)
+                    if e.get().acked_offset >= ack.acked_offset => {}
+                std::collections::hash_map::Entry::Occupied(mut e) => {
+                    e.insert(ack);
+                }
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(ack);
+                }
+            }
+        }
         self.merge_pending_acks(path_id, taken);
         if !self.has_alive_path() {
             *self.inner.all_down_since.lock().unwrap() = Some(Instant::now());
@@ -410,39 +419,30 @@ impl Session {
         let Some(dest2) = self.get_path(alt) else {
             return;
         };
-        {
-            let mut g = dest2.pending_acks.lock().unwrap();
-            for (id, ack) in taken {
-                match g.entry(id) {
-                    std::collections::hash_map::Entry::Occupied(e)
-                        if e.get().acked_offset >= ack.acked_offset => {}
-                    std::collections::hash_map::Entry::Occupied(mut e) => {
-                        e.insert(ack);
-                    }
-                    std::collections::hash_map::Entry::Vacant(e) => {
-                        e.insert(ack);
-                    }
-                }
-            }
+        for (_, ack) in taken {
+            dest2.merge_ack(ack);
         }
         dest2.ack_wait.notify_one();
     }
 
     pub(crate) fn note_ack_sent(&self, path: &PathState, stream_id: u32) {
-        if path.pending_acks.lock().unwrap().contains_key(&stream_id) {
-            path.ack_wait.notify_one();
-            return;
-        }
         let Some(st) = self.get_stream(stream_id) else {
             return;
         };
-        st.ack_dirty.store(false, Ordering::Relaxed);
-        let from = st.ack_flush_from_ms.swap(0, Ordering::Relaxed);
-        if from != 0 {
-            let us = crate::metrics::mono_ms()
-                .saturating_sub(from)
-                .saturating_mul(1000);
-            self.inner.metrics.ack_flush_us.observe(us);
+        {
+            let g = path.pending_acks.lock().unwrap();
+            if g.contains_key(&stream_id) {
+                drop(g);
+                path.ack_wait.notify_one();
+                return;
+            }
+            st.ack_dirty.store(false, Ordering::Relaxed);
+            let from = st.ack_flush_from_us.swap(0, Ordering::Relaxed);
+            drop(g);
+            if from != 0 {
+                let us = crate::metrics::mono_us().saturating_sub(from);
+                self.inner.metrics.ack_flush_us.observe(us);
+            }
         }
     }
 
@@ -4358,6 +4358,33 @@ mod tests {
         let g = p2.pending_acks.lock().unwrap();
         let ack = g.get(&st.id).expect("merged onto alt");
         assert_eq!(ack.acked_offset, 200, "max offset must win");
+        drop(tun);
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn ack_send_on_down_dest_stores_on_alt() {
+        let client = Session::new_client(SessionConfig::default());
+        let (p1, _w1, _u1) = inject_live(&client, 1, "a#0", 7);
+        let (p2, _w2, _u2) = inject_live(&client, 2, "b#0", 7);
+        let tun = client
+            .open_stream(Target {
+                host: "t".into(),
+                port: 1,
+            })
+            .await
+            .unwrap();
+        let st = client.get_stream(tun.id).unwrap();
+        p1.state.store(crate::path::STATE_DOWN, Ordering::SeqCst);
+        client.send_ack(&st, p1.id);
+        assert!(
+            p1.pending_acks.lock().unwrap().get(&st.id).is_none(),
+            "DOWN dest must not keep a raced insert"
+        );
+        assert!(
+            p2.pending_acks.lock().unwrap().contains_key(&st.id),
+            "ACK must land on an alive alt"
+        );
         drop(tun);
         client.shutdown();
     }

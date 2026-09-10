@@ -472,35 +472,42 @@ impl Session {
             acked_offset: st.recv_next.load(Ordering::Relaxed),
             window: st.advertised_window(),
         };
-        let dest = if self.get_path(path_id).is_some_and(|p| p.is_alive()) {
-            Some(path_id)
-        } else {
-            let sticky = st.sticky.load(Ordering::Relaxed);
-            if sticky != 0 && self.get_path(sticky).is_some_and(|p| p.is_alive()) {
-                Some(sticky)
-            } else {
-                self.pick_pref(PickPref::Interactive)
+        if self.store_ack(st, path_id, &ack) {
+            return;
+        }
+        let sticky = st.sticky.load(Ordering::Relaxed);
+        if sticky != 0 && sticky != path_id && self.store_ack(st, sticky, &ack) {
+            return;
+        }
+        if let Some(picked) = self.pick_pref(PickPref::Interactive) {
+            if picked != path_id && picked != sticky && self.store_ack(st, picked, &ack) {
+                return;
             }
+        }
+        Self::mark_ack_dirty(st);
+    }
+
+    fn store_ack(&self, st: &StreamState, path_id: u32, ack: &StreamAck) -> bool {
+        let Some(p) = self.get_path(path_id) else {
+            return false;
         };
-        let Some(dest) = dest else {
-            Self::mark_ack_dirty(st);
-            return;
-        };
-        let Some(p) = self.get_path(dest) else {
-            Self::mark_ack_dirty(st);
-            return;
-        };
-        p.pending_acks.lock().unwrap().insert(st.id, ack);
+        {
+            let mut g = p.pending_acks.lock().unwrap();
+            if !p.is_alive() {
+                return false;
+            }
+            g.insert(st.id, ack.clone());
+        }
         Self::mark_ack_dirty(st);
         p.ack_wait.notify_one();
+        true
     }
 
     fn mark_ack_dirty(st: &StreamState) {
         if !st.ack_dirty.swap(true, Ordering::Relaxed) {
-            st.ack_flush_from_ms
-                .store(crate::metrics::mono_ms().max(1), Ordering::Relaxed);
+            st.ack_flush_from_us
+                .store(crate::metrics::mono_us().max(1), Ordering::Relaxed);
         }
-        st.ack_gen.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(super) fn on_ack(&self, ack: StreamAck) {

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -285,6 +285,31 @@ impl PathState {
         let mut g = self.pending_acks.lock().unwrap();
         let ids: Vec<u32> = g.keys().copied().take(k).collect();
         ids.into_iter().filter_map(|id| g.remove(&id)).collect()
+    }
+
+    pub(crate) fn take_all_acks(&self) -> HashMap<u32, StreamAck> {
+        std::mem::take(&mut *self.pending_acks.lock().unwrap())
+    }
+
+    /// Re-insert without going backwards if a newer generation already landed.
+    pub(crate) fn merge_ack(&self, ack: StreamAck) {
+        let mut g = self.pending_acks.lock().unwrap();
+        match g.entry(ack.stream_id) {
+            std::collections::hash_map::Entry::Occupied(e)
+                if e.get().acked_offset >= ack.acked_offset => {}
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                e.insert(ack);
+            }
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(ack);
+            }
+        }
+    }
+
+    pub(crate) fn restore_acks(&self, acks: impl IntoIterator<Item = StreamAck>) {
+        for ack in acks {
+            self.merge_ack(ack);
+        }
     }
 
     pub fn note_enqueue(&self, urgent: bool) {
@@ -744,6 +769,17 @@ pub fn spawn_path_io<T>(
             Io(std::io::Error),
         }
 
+        struct RestoreAcks<'a> {
+            path: &'a PathState,
+            rest: VecDeque<StreamAck>,
+        }
+
+        impl Drop for RestoreAcks<'_> {
+            fn drop(&mut self) {
+                self.path.restore_acks(self.rest.drain(..));
+            }
+        }
+
         let session_w = session.clone();
         let path_w = path.clone();
         let mut write_task = tokio::spawn(async move {
@@ -814,8 +850,11 @@ pub fn spawn_path_io<T>(
                             path_w.ack_wait.notified().await;
                         }
                     } => {
-                        let batch = path_w.take_acks(ACK_FLUSH_K);
-                        for ack in batch {
+                        let mut guard = RestoreAcks {
+                            path: &path_w,
+                            rest: VecDeque::from(path_w.take_acks(ACK_FLUSH_K)),
+                        };
+                        while let Some(ack) = guard.rest.pop_front() {
                             let sid = ack.stream_id;
                             match write_one(
                                 &mut writer,
@@ -824,7 +863,7 @@ pub fn spawn_path_io<T>(
                                 ping_max,
                                 &session_w,
                                 &path_w,
-                                Frame::StreamAck(ack),
+                                Frame::StreamAck(ack.clone()),
                             )
                             .await
                             {
@@ -835,6 +874,7 @@ pub fn spawn_path_io<T>(
                                     session_w.note_ack_sent(&path_w, sid);
                                 }
                                 WriteOne::Interrupted => {
+                                    guard.rest.push_front(ack);
                                     flush_urgent_then_close(
                                         &mut writer,
                                         &mut urgent,
@@ -846,6 +886,7 @@ pub fn spawn_path_io<T>(
                                     return Ok(());
                                 }
                                 WriteOne::Io(e) => {
+                                    guard.rest.push_front(ack);
                                     warn!(path = %path_w.name, error = %e, "path ack failed");
                                     return Err(e);
                                 }
@@ -1015,13 +1056,21 @@ pub fn spawn_path_io<T>(
         match exit {
             Exit::Idle | Exit::Down => {
                 let _ = close_tx.send(());
-                let _ = tokio::time::timeout(ping_max, &mut write_task).await;
+                if tokio::time::timeout(ping_max, &mut write_task)
+                    .await
+                    .is_err()
+                {
+                    write_task.abort();
+                    let _ = write_task.await;
+                }
                 read_task.abort();
-                write_task.abort();
             }
             Exit::Child => {
                 read_task.abort();
-                write_task.abort();
+                if !write_task.is_finished() {
+                    write_task.abort();
+                    let _ = write_task.await;
+                }
             }
         }
         session.path_failed(path.id);
@@ -1038,6 +1087,25 @@ mod tests {
     fn path() -> Arc<PathState> {
         let (tx, _rx) = mpsc::channel(1);
         PathState::new(1, "t".into(), tx)
+    }
+
+    #[test]
+    fn restore_acks_keeps_max_offset() {
+        let p = path();
+        p.merge_ack(StreamAck {
+            stream_id: 1,
+            acked_offset: 200,
+            window: 2,
+        });
+        p.restore_acks([StreamAck {
+            stream_id: 1,
+            acked_offset: 100,
+            window: 1,
+        }]);
+        let g = p.pending_acks.lock().unwrap();
+        let ack = g.get(&1).unwrap();
+        assert_eq!(ack.acked_offset, 200);
+        assert_eq!(ack.window, 2);
     }
 
     #[test]

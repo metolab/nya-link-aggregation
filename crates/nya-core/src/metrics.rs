@@ -31,6 +31,11 @@ pub fn mono_ms() -> u64 {
     epoch().elapsed().as_millis() as u64
 }
 
+/// Microseconds since process start. Never 0 after the first microsecond.
+pub fn mono_us() -> u64 {
+    epoch().elapsed().as_micros() as u64
+}
+
 pub fn path_state_label(state: u8) -> &'static str {
     match state {
         STATE_UP => "up",
