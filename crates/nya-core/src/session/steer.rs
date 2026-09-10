@@ -13,8 +13,8 @@ use nya_proto::ResetReason;
 use crate::health;
 use crate::path::PathState;
 use crate::scheduler::{
-    failback_target, fastest_class_set, hol_place_bulk_fallback, should_rebalance_conn,
-    FailbackReason,
+    failback_target, fastest_class_set, hol_bulk_dest_ok, hol_place_bulk_fallback,
+    should_rebalance_conn, FailbackReason,
 };
 use crate::stream::StreamState;
 
@@ -413,8 +413,7 @@ impl Session {
         if let Some(sib) = paths.iter().find(|p| {
             p.id != cur.id
                 && p.link() == cur.link()
-                && p.is_schedulable()
-                && crate::scheduler::is_loss_fresh(&self.inner.cfg, p)
+                && hol_bulk_dest_ok(&self.inner.cfg, p)
                 && !self.conn_has_interactive(p.id)
         }) {
             return Some(sib.id);

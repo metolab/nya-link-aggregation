@@ -516,6 +516,30 @@ impl Session {
         Some(sticky)
     }
 
+    /// One bulk stream stays on one 5-tuple, including a write-stalled dest
+    /// that is still flushing. Urgent-full without a working flush does not pin.
+    fn bulk_affinity(&self, sticky: u32) -> Option<u32> {
+        if sticky == 0 {
+            return None;
+        }
+        let p = self.get_path(sticky)?;
+        if !p.is_alive() {
+            return None;
+        }
+        if p.is_congested() && !p.is_write_stalled() {
+            return None;
+        }
+        if p.is_write_stalled() || p.is_schedulable() {
+            if crate::scheduler::is_loss_fresh(&self.inner.cfg, &p) {
+                Some(sticky)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    }
+
     fn pick_retry(&self, avoid: u32) -> Option<u32> {
         pick_retry_path(&self.path_list(), &self.inner.cfg, &[avoid])
     }
@@ -4454,6 +4478,112 @@ mod tests {
             "linger-stalled leftover must not pin as interactive"
         );
         drop(tun);
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn hol_place_bulk_accepts_write_stalled_sibling() {
+        // Two dests only: a schedulable third would hide stalled soy in
+        // fastest_class_set. D2 must pick the stalled sibling directly.
+        let client = Session::new_client(SessionConfig::default());
+        let (_p0, _w0, _u0) = inject_live(&client, 1, "a#0", 7);
+        let (p1, _w1, _u1) = inject_live(&client, 2, "a#1", 7);
+        p1.set_write_stalled(true);
+        assert!(!p1.is_congested());
+        let mut tun = client
+            .open_stream(Target {
+                host: "t".into(),
+                port: 1,
+            })
+            .await
+            .unwrap();
+        tun.write_all(b"hi").await.unwrap();
+        let st = {
+            let g = client.inner.streams.lock().unwrap();
+            g.values().next().unwrap().clone()
+        };
+        st.sticky.store(1, Ordering::Relaxed);
+        assert!(
+            !st.bulk.load(Ordering::Relaxed),
+            "interactive sticky on dest 1"
+        );
+        assert_eq!(
+            client.hol_place_bulk(1),
+            Some(2),
+            "write-stalled same-link dest is a bulk HOL target"
+        );
+        drop(tun);
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn bulk_affinity_stays_on_write_stalled_sticky() {
+        let client = Session::new_client(SessionConfig::default());
+        let (p1, _w1, _u1) = inject_live(&client, 1, "a#0", 7);
+        let (_p2, _w2, _u2) = inject_live(&client, 2, "b#0", 7);
+        let mut tun = client
+            .open_stream(Target {
+                host: "t".into(),
+                port: 1,
+            })
+            .await
+            .unwrap();
+        tun.write_all(b"hi").await.unwrap();
+        let st = {
+            let g = client.inner.streams.lock().unwrap();
+            g.values().next().unwrap().clone()
+        };
+        let deadline = Instant::now() + Duration::from_millis(200);
+        loop {
+            if !st.unacked.lock().unwrap().is_empty() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "write must leave unacked");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        st.bulk.store(true, Ordering::Relaxed);
+        st.sticky.store(1, Ordering::Relaxed);
+        p1.set_write_stalled(true);
+        let before = st.send_next.load(Ordering::Relaxed);
+        tun.write_all(b"more-bulk").await.unwrap();
+        let deadline = Instant::now() + Duration::from_millis(200);
+        loop {
+            if st.send_next.load(Ordering::Relaxed) > before {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "bulk write must advance send_next"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let last = st
+            .unacked
+            .lock()
+            .unwrap()
+            .values()
+            .max_by_key(|u| u.last_sent)
+            .map(|u| u.path_id);
+        assert_eq!(
+            last,
+            Some(1),
+            "bulk affinity must stay on write-stalled sticky"
+        );
+        assert_eq!(st.sticky.load(Ordering::Relaxed), 1);
+        drop(tun);
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn interactive_affinity_still_skips_write_stalled() {
+        let client = Session::new_client(SessionConfig::default());
+        let (p1, _w1, _u1) = inject_live(&client, 1, "a#0", 7);
+        let (_p2, _w2, _u2) = inject_live(&client, 2, "b#0", 7);
+        p1.set_write_stalled(true);
+        assert!(
+            client.interactive_affinity(1).is_none(),
+            "interactive affinity must still skip write-stalled dests"
+        );
         client.shutdown();
     }
 

@@ -285,18 +285,30 @@ pub fn format_candidates(
     out
 }
 
-/// HOL bulk fallback after same-link sibling: fastest class, no interactive,
-/// `class_rtt <= cur`. Never moves bulk onto a higher class_rtt.
+/// D2 bulk HOL dest: alive, not congested, schedulable *or* write-stalled
+/// (flushing), loss-fresh. Write-stalled dests are invisible to
+/// [`fastest_class_set`] while any dest is still schedulable.
+pub(crate) fn hol_bulk_dest_ok(cfg: &SessionConfig, p: &PathState) -> bool {
+    p.is_alive()
+        && !p.is_congested()
+        && (p.is_schedulable() || p.is_write_stalled())
+        && is_loss_fresh(cfg, p)
+}
+
+/// HOL bulk fallback after same-link sibling: D2 dests with `class_rtt <=
+/// cur`. Own cand list — must not call [`fastest_class_set`] (that hides
+/// a stalled soy while nsix is idle). Never moves bulk onto a higher class_rtt.
 pub(crate) fn hol_place_bulk_fallback(
     paths: &[Arc<PathState>],
     cur: &PathState,
     cfg: &SessionConfig,
     conn_has_interactive: impl Fn(u32) -> bool,
 ) -> Option<u32> {
-    let cands: Vec<&Arc<PathState>> = fastest_class_set(paths, cfg)
-        .into_iter()
+    let cands: Vec<&Arc<PathState>> = paths
+        .iter()
         .filter(|p| {
             p.id != cur.id
+                && hol_bulk_dest_ok(cfg, p)
                 && !conn_has_interactive(p.id)
                 && effective_class_rtt(cfg, p) <= effective_class_rtt(cfg, cur)
         })
@@ -1224,6 +1236,19 @@ mod tests {
         let dest = hol_place_bulk_fallback(&[cur.clone(), s1], &cur, &cfg, |id| id == 1);
         assert_ne!(dest, Some(2), "never s1 from 182, got {dest:?}");
         assert!(dest.is_none());
+    }
+
+    #[test]
+    fn hol_fallback_picks_write_stalled_when_cur_is_only_schedulable() {
+        // Two dests, different links: fastest_class_set would keep only
+        // schedulable `cur` and hide the stalled dest. Fallback must not
+        // go through that set.
+        let cfg = SessionConfig::default();
+        let cur = mk_named(1, "soy#0".into(), 7);
+        let stalled = mk_named(2, "nsix#0".into(), 7);
+        stalled.set_write_stalled(true);
+        let dest = hol_place_bulk_fallback(&[cur.clone(), stalled], &cur, &cfg, |id| id == 1);
+        assert_eq!(dest, Some(2), "write-stalled dest is a bulk HOL target");
     }
 
     #[test]

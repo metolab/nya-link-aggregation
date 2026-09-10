@@ -216,7 +216,8 @@ impl Session {
                     self.interactive_affinity(st.sticky.load(Ordering::Relaxed))
                         .or_else(|| self.pick_pref(pref))
                 } else {
-                    self.pick_pref(pref)
+                    self.bulk_affinity(st.sticky.load(Ordering::Relaxed))
+                        .or_else(|| self.pick_pref(pref))
                 };
                 if let Some(p) = picked {
                     break p;
