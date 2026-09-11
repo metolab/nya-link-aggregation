@@ -690,14 +690,15 @@ impl Session {
                         // when the sample waited behind bulk inflight.
                         let sample = u.last_sent.elapsed();
                         let t = &self.inner.cfg.tuning;
-                        let cap = health::loss_timeout(
-                            &self.inner.cfg,
-                            self.min_alive_fast_rtt().unwrap_or(p.class_rtt()),
-                        );
+                        let cap = self.rtt_sample_cap(&p);
+                        // A lucky-low ACK (fast return path) must not pull a
+                        // 60 ms class down into the 7 ms set.
+                        let not_lucky_low = !p.class_known() || sample * 2 >= p.class_rtt();
                         if u.data.len() <= t.interactive_max
                             && sample > t.ack_rtt_min
                             && sample < t.ack_rtt_max
                             && sample <= cap
+                            && not_lucky_low
                             && loaded < t.inflight_bias
                         {
                             p.record_rtt(sample);

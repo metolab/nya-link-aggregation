@@ -372,6 +372,29 @@ pub async fn failback_after_fast_blackhole() -> Result<ScenarioReport> {
         "p50_warm={warm_p50}us p50_backup={mid_p50}us p50_after={after_p50}us failbacks={}",
         r.snap.failbacks
     ));
+    let paths: Vec<String> = r
+        .snap
+        .paths
+        .iter()
+        .map(|p| {
+            format!(
+                "{} rtt={} class={} st={} sticky={} stall={} cong={} known={} bak={} rx={}ms q={}/{}",
+                p.name,
+                p.rtt_us / 1000,
+                p.class_rtt_us / 1000,
+                p.state,
+                p.sticky,
+                p.write_stalled,
+                p.congested,
+                p.rtt_known,
+                p.backup,
+                p.last_rx_ago_us / 1000,
+                p.queued_urgent,
+                p.queued_bulk
+            )
+        })
+        .collect();
+    r.notes.push(format!("p50=paths {}", paths.join(" | ")));
     // After restore, p50 should return near the 10ms class, not stay on 60ms.
     if after_p50 > 35_000 {
         r.notes

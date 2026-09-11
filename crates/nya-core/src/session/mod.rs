@@ -460,16 +460,14 @@ impl Session {
             Frame::Pong(p) => {
                 if let Some(path) = self.get_path(path_id) {
                     let record = path.inflight_bytes() < self.inner.cfg.tuning.inflight_bias;
-                    let cap = if path.rtt_known() {
-                        Some(health::loss_timeout(
-                            &self.inner.cfg,
-                            self.min_alive_fast_rtt()
-                                .unwrap_or_else(|| crate::scheduler::path_loss_rtt(&path)),
-                        ))
-                    } else {
-                        Some(self.inner.cfg.tuning.unknown_degrade_min)
-                    };
-                    path.on_pong_record(p.seq, p.sent_at_ms, record, cap);
+                    let known = path.rtt_known();
+                    path.on_pong_record(
+                        p.seq,
+                        p.sent_at_ms,
+                        record,
+                        Some(self.rtt_sample_cap(&path)),
+                        !known,
+                    );
                 }
             }
             Frame::StreamOpen(open) => {
@@ -567,6 +565,24 @@ impl Session {
             .filter(|p| p.is_alive() && p.rtt_known())
             .map(|p| p.rtt())
             .min()
+    }
+
+    /// Cap for recording a Pong/ACK sample as path RTT.
+    ///
+    /// Use **class** (or stable) on this dest, not `min_alive_fast` and not
+    /// `min(fast, class)`. A 7 ms peer must not drop a 60 ms backup's real
+    /// samples — that poisons class into the fast set and pins interactive
+    /// affinity on the slow impair. Queueing delay still exceeds *this*
+    /// dest's class loss clock. Unknown dests keep the 300 ms first-sample
+    /// window.
+    pub(super) fn rtt_sample_cap(&self, path: &PathState) -> Duration {
+        if path.class_known() {
+            health::loss_timeout(&self.inner.cfg, path.class_rtt())
+        } else if path.rtt_known() {
+            health::loss_timeout(&self.inner.cfg, path.stable_rtt())
+        } else {
+            self.inner.cfg.tuning.unknown_degrade_min
+        }
     }
 
     /// Late vs dests we could still send to. Not 2× this path's poisoned
@@ -6353,6 +6369,59 @@ mod tests {
         );
 
         drop(tun);
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn backup_pong_records_even_when_pool_has_fast_peer() {
+        let client = Session::new_client(SessionConfig::default());
+        let (fast, _fw, _fu) = inject_live(&client, 1, "f#0", 7);
+        let (slow, _sw, _su) = inject_live(&client, 2, "b#0", 80);
+        let fast_cap = client.rtt_sample_cap(&fast);
+        let slow_cap = client.rtt_sample_cap(&slow);
+        assert_eq!(
+            fast_cap,
+            Duration::from_millis(20),
+            "7 ms dest stays on the loss floor"
+        );
+        assert!(
+            slow_cap >= Duration::from_millis(100),
+            "80 ms dest cap must be 2× own RTT, not the 20 ms fast-peer floor, got {slow_cap:?}"
+        );
+
+        let ping = slow.next_ping();
+        slow.backdate_pending_ping(Duration::from_millis(60));
+        client.handle_frame(
+            2,
+            Frame::Pong(nya_proto::Pong {
+                seq: ping.seq,
+                sent_at_ms: ping.sent_at_ms,
+            }),
+        );
+        // (80ms×8 + ~60ms×2)/10 ≈ 76ms. A 20 ms pool cap would drop the
+        // sample and leave EWMA at 80_000.
+        let got = slow.rtt_us();
+        assert!(
+            (70_000..79_000).contains(&got),
+            "backup Pong must update EWMA; got {got} us"
+        );
+
+        let before = slow.rtt_us();
+        let late = slow.next_ping();
+        slow.expire_stale_pings(Duration::ZERO);
+        slow.backdate_pending_ping(Duration::from_millis(200));
+        client.handle_frame(
+            2,
+            Frame::Pong(nya_proto::Pong {
+                seq: late.seq,
+                sent_at_ms: late.sent_at_ms,
+            }),
+        );
+        assert_eq!(
+            slow.rtt_us(),
+            before,
+            "known-path expired Pong must be clear-only"
+        );
         client.shutdown();
     }
 

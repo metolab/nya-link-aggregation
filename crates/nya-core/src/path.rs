@@ -567,6 +567,14 @@ impl PathState {
         *self.class_low_accum.lock().unwrap()
     }
 
+    #[cfg(test)]
+    pub(crate) fn backdate_pending_ping(&self, age: Duration) {
+        let mut pending = self.pending_ping.lock().unwrap();
+        for t in pending.values_mut() {
+            *t = Instant::now().checked_sub(age).unwrap_or(*t);
+        }
+    }
+
     pub fn mark_degraded(&self) {
         let _ = self.state.compare_exchange(
             STATE_UP,
@@ -596,7 +604,7 @@ impl PathState {
 
     /// Prefer local Instant (µs) over the millisecond wall-clock echo.
     pub fn on_pong(&self, seq: u64, sent_at_ms: u64) {
-        self.on_pong_record(seq, sent_at_ms, true, None);
+        self.on_pong_record(seq, sent_at_ms, true, None, true);
     }
 
     pub(crate) fn is_tls_unexpected_eof(e: &std::io::Error) -> bool {
@@ -605,14 +613,31 @@ impl PathState {
 
     /// Always clear the pending/late ping. Skip `record_rtt` when the
     /// sample rode behind bulk inflight. No wall-clock fallback.
-    pub fn on_pong_record(&self, seq: u64, _sent_at_ms: u64, record: bool, cap: Option<Duration>) {
+    ///
+    /// `allow_late`: expired (moved-to-late) Pongs on a **known** path are
+    /// clear-only — TCP min-RTO must not poison EWMA. Unknown dests still
+    /// take a first late sample so a 60–200 ms path can freeze class.
+    pub fn on_pong_record(
+        &self,
+        seq: u64,
+        _sent_at_ms: u64,
+        record: bool,
+        cap: Option<Duration>,
+        allow_late: bool,
+    ) {
         let started = {
             let mut pending = self.pending_ping.lock().unwrap();
             pending.remove(&seq)
         };
         let started = match started {
             Some(t0) => Some(t0),
-            None => self.late_ping.lock().unwrap().remove(&seq),
+            None => {
+                let t0 = self.late_ping.lock().unwrap().remove(&seq);
+                if t0.is_some() && !allow_late {
+                    return;
+                }
+                t0
+            }
         };
         if !record {
             return;
@@ -1155,7 +1180,7 @@ mod tests {
         let p = path();
         p.record_rtt(Duration::from_millis(7));
         let before = p.rtt_ewma_us.load(Ordering::Relaxed);
-        p.on_pong_record(99, 0, true, None);
+        p.on_pong_record(99, 0, true, None, true);
         assert_eq!(
             p.rtt_ewma_us.load(Ordering::Relaxed),
             before,
@@ -1177,6 +1202,7 @@ mod tests {
             ping.sent_at_ms,
             true,
             Some(Duration::from_millis(300)),
+            true,
         );
         assert!(p.rtt_known(), "late Instant must still freeze unknown RTT");
     }
@@ -1191,6 +1217,7 @@ mod tests {
             ping.sent_at_ms,
             true,
             Some(Duration::from_millis(1)),
+            true,
         );
         assert!(!p.rtt_known(), "sample above unknown cap must be ignored");
     }
@@ -1206,6 +1233,7 @@ mod tests {
             ping.sent_at_ms,
             true,
             Some(Duration::from_millis(50)),
+            true,
         );
         let after = p.rtt_ewma_us.load(Ordering::Relaxed);
         assert!(
@@ -1614,7 +1642,7 @@ mod tests {
         let p = path();
         let ping = p.next_ping();
         std::thread::sleep(Duration::from_millis(5));
-        p.on_pong_record(ping.seq, ping.sent_at_ms, false, None);
+        p.on_pong_record(ping.seq, ping.sent_at_ms, false, None, true);
         assert!(!p.rtt_known());
         assert_eq!(p.pending_ping_count(), 0);
     }
@@ -1631,6 +1659,7 @@ mod tests {
             ping.sent_at_ms,
             true,
             Some(Duration::from_millis(20)),
+            true,
         );
         assert_eq!(
             p.rtt_ewma_us.load(Ordering::Relaxed),
@@ -1655,6 +1684,7 @@ mod tests {
             first.sent_at_ms,
             true,
             Some(Duration::from_millis(300)),
+            true,
         );
         assert!(
             !p.rtt_known(),

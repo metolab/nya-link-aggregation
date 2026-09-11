@@ -5,7 +5,7 @@
 | **Title** | Mechanism design to remove the Hytron unusable-download failure mode and approach GZ–HK link capacity |
 | **Author** | nya-link-aggregation maintainers |
 | **Date** | 2026-09-10 |
-| **Status** | Draft |
+| **Status** | Implemented (main `486422e`; product gate is post-bounce Signoz) |
 | **Audience** | Senior engineers who already know session / scheduler / health, `nya-client` inbound, `nya-server` outbound, and the Signoz scorecard |
 | **Predecessor** | `docs/design-close-reset-delivery-regression.md` (**Implemented**, Residual D leftover now production-visible). Write-stall: `docs/design-dns-he-write-timeout.md` / `docs/design-origin-he-io-backpressure.md`. Live-session table: `docs/design-live-session-reap-pick-rtt.md`. |
 | **Compatibility** | `PROTOCOL_VERSION` **stays 2**. No CloseAck. No new TOML keys. `[session]` stays `deny_unknown_fields` (four keys, `cfg.rs` L130–137). One production `Tuning::STANDARD`. Tests clone-and-mutate. Do **not** retune `chan`, `initial_window`, `inflight_bias`, `loss_timeout_floor`, `close_linger`, `down_min_silence`, `interactive_max`, `class_drop_*`, or `path_score` weights. Window auto-tune is **not** a TOML flag. |

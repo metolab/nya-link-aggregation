@@ -98,11 +98,15 @@ HOL 隔离靠「每链路多连接 + bulk 避开交互连接」，不是把流�
 
 ## 流控制
 
-- 初始窗口 `128 KiB`，对端用 `STREAM_ACK.window` 通告
+- 初始窗口 `128 KiB` 是 **floor**。接收端按 deliver rate × sticky RTT 把 `recv_cap` 调到 `clamp(2 BDP, 128 KiB, 128 KiB × chan)`；`STREAM_ACK.window = recv_cap - buffered_in - recv_buffered`。不是 TOML 开关，也不改 `Tuning::STANDARD.initial_window`。
+- `STREAM_ACK` 是每路径 overwrite register + `Notify`，**不**占 urgent `chan`。writer 每轮最多取 K=8 条直接 `write_one`。urgent 满不能丢掉 ACK，也不能因此 `set_congested`。
 - `STREAM_DATA` 带 offset，接收端 `BTreeMap` 重排
-- 未确认数据记在发送路径的 inflight 上；ACK 时减去，并对小帧采样 RTT（bulk ACK 不当时延）
+- 未确认数据记在发送路径的 inflight 上；ACK 时减去，并对小帧采样 RTT（bulk ACK 不当时延）。Pong/ACK 样本 cap 是 **这条 path** 的 `loss_timeout`，不是池里 `min_alive_fast`（否则 7 ms 同伴会把 60 ms 备份的真实 RTT 丢掉，交互 affinity 钉在慢路上）。
+- write-stall（`write_deadline` 20 ms floor）只让 **新** Interactive/Open pick-skip；writer 继续排 bulk。`hold_stream_data` 只对 `!rtt_known()`。已知+stalled 的 DATA 走 bulk；retry 不喷到 write-stalled dest。stall 不拆路。
+- 一条 bulk 流尽量钉在一条 5-tuple（`bulk_affinity`，含正在 flush 的 write-stalled dest）。交互 affinity 仍跳过 write-stalled。
+- HOL：stall ≥ `close_linger` 的 leftover 不再算 interactive。`hol_place_bulk_fallback` **不**走 `fastest_class_set`（那会在 nsix 空闲时把 stalled soy 藏起来）。
 - 服务端出站拨号失败会 `IncomingStream::reset(DialFailed)`，对端收到 `STREAM_RESET`
-- 活会话上流表：`counted_close` / 半关闭 linger / hygiene `STREAM_RESET` 会从 `Inner.streams` 摘掉。第一 closer 的 Close 重试停在对端 `recv_fin`、HashMap-gone、或 `close_linger`（`retry_close_from` 同一套），**不用** multiplexed `path.last_rx` 当 Close ACK（Pong ≠ Close 送达）。第二 closer 仍在 `observe_stream_end` 立刻 `forget_close`。Close/Reset 换路**不**走 `pick_retry_path` 的 cycle rung（DATA 仍走）；`push_tried` 只在 Close/Reset **发送成功**时记。`expire_recv_closes` 不在空洞上强制 FIN（`maintain` 上的 belt 只 `try_finish_recv_close`）。progress-fine linger 只摘 HashMap、**不**发 `STREAM_RESET`（`forget_reset` 仅 `counted_close` CAS 赢家）；无进度 linger 仍 Reset 换路。linger 仍不是产品 `stream_resets_timeout`。部署前 hangover 需要 bounce 会话。
+- 活会话上流表：`counted_close` / 半关闭 linger / hygiene `STREAM_RESET` 会从 `Inner.streams` 摘掉。第一 closer 的 Close 重试停在对端 `recv_fin`、HashMap-gone、或 `close_linger`（`retry_close_from` 同一套），**不用** multiplexed `path.last_rx` 当 Close ACK（Pong ≠ Close 送达）。第二 closer 仍在 `observe_stream_end` 立刻 `forget_close`。Close/Reset 换路**不**走 `pick_retry_path` 的 cycle rung（DATA 仍走）；`push_tried` 只在 Close/Reset **发送成功**时记。`expire_recv_closes` 不在空洞上强制 FIN（`maintain` 上的 belt 只 `try_finish_recv_close`）。**Client** progress-fine linger 且 `!recv_fin` 发 wire `STREAM_RESET`，closer pump 仍是 `Inbound::Close`（Residual D）。**Server** origin-EOF 同类 linger 保持静默（Yuusei hop-RST 修复）。`recv_fin` 已到则两侧都静默摘表。无进度 linger 仍 Reset 换路。`maybe_failback` 不在 `maintain` 里；交互靠每 offset `pick_pref`。neither-FIN hangover 靠 session bounce，不 idle-GC。linger 仍不是产品 `stream_resets_timeout`。
 
 ## 可观测性
 
@@ -110,7 +114,7 @@ HOL 隔离靠「每链路多连接 + bulk 避开交互连接」，不是把流�
 
 线路状态按 `link_key` 汇总（`a#0`/`a#1` → `a`）：up/deg 连接数、RTT 范围、sticky、inflight、队列、rx 新鲜/最旧。`paths=` 可带 ` bak`。迁移原因拆成 speculative / path_down / ensure_sticky / send-blocked；另有 retransmit/hedge、probe_miss、未知 RTT pick。snapshot 带压缩 `streams=`（不进 Prometheus 标签）。
 
-业务计分卡：流完成比、send-unacked ∪ recv-hole stall（进入钟是 `loss_timeout`）、每路径一次 `failover_ms`（`last_rx_ago`）、overlay goodput。换路重传计入 `data_retransmit` / `data_hedge`（跨 `link_key` 为 hedge）；Close 换路计 `close_retry`。半关闭 linger 计 `stream_reaps_linger`（含 progress-fine 静默摘表），**不是**产品 `stream_resets_timeout`。Soak 看 `(closed - linger) / opened`。e2e 产品门是 **新流 first-byte** 与 Close-swallowed（`prod_like_*`），不是 ping 1500 ms。见 [OBSERVABILITY.md](OBSERVABILITY.md)。Close/Reset 送达语义见 [design-close-reset-delivery-regression.md](design-close-reset-delivery-regression.md)。
+业务计分卡：流完成比、send-unacked ∪ recv-hole stall（进入钟是 `loss_timeout`）、每路径一次 `failover_ms`（`last_rx_ago`）、overlay goodput。换路重传计入 `data_retransmit` / `data_hedge`（跨 `link_key` 为 hedge）；Close 换路计 `close_retry`。半关闭 linger 计 `stream_reaps_linger`（含 client Residual D Reset），**不是**产品 `stream_resets_timeout`。Soak 看 `(closed - linger) / opened`。e2e 产品门是 **新流 first-byte**、Close-swallowed、以及 `prod_like_bulk_copy`（1 MiB ≪ 10 s overlay cap）。Hytron 下载产品门是 **bounce 之后** hop ≫ 150 KB/s 且 origin ≈ client，不是 ping 1500 ms。见 [OBSERVABILITY.md](OBSERVABILITY.md)。Close/Reset 送达语义见 [design-close-reset-delivery-regression.md](design-close-reset-delivery-regression.md)；bulk goodput 机制见 [design-hytron-bulk-goodput.md](design-hytron-bulk-goodput.md)。
 
 ## 配置分层
 

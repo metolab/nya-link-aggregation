@@ -285,6 +285,21 @@ goodput = data / wire                    // 重传的 STREAM_DATA 算 data，诚
 
 `bytes_ctrl_*` 替代草案里「`send_frame` **或** `send_on_path`」的歧义：实现者没有或。
 
+#### Hytron bulk 产品门（post-bounce）
+
+下载是否可用看 **hop 拷贝速率**，不是 ping SLA、也不是未测的 2× path TCP。机制见 [design-hytron-bulk-goodput.md](design-hytron-bulk-goodput.md)。`n_counter` 仍是 54；ACK 延迟是 histogram（`nya_ack_flush_us`，µs），pending 是 gauge（`nya_path_ack_pending`），都不加 `_total`。
+
+| 信号 | 读法 |
+| --- | --- |
+| 大 hop（`rx_bytes >= 200000`）KB/s | **≫ 150 KB/s** 且 client ≈ origin（overlay 不再 pacing）。pre-bounce Hytron `held=419` 不是回滚信号 |
+| 5-min `nya_bytes_data_rx` | ≫ 466 KB/s peak（origin/pipe 允许时） |
+| `nya_ack_flush_us` p50 | path-RTT 量级（7 ms 池 ≤ ~20 ms） |
+| `nya_path_ack_pending` | 每 dest ~0–几条 |
+| `nya_link_queued_urgent` / `_bulk` | 不要长期粘在 `chan=64` |
+| Yuusei leftover / hop RST | leftover ~0，hop RST ~1/h；client Residual D 不得把 server origin-EOF 打成 hop-RST |
+
+部署：先 Yuusei canary，再 Hytron **client+server 一起 bounce**（neither-FIN hangover 不会被 A1 收掉）。
+
 ---
 
 ### 模块 × 事件清单
