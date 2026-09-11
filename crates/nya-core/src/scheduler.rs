@@ -2,8 +2,9 @@
 //!
 //! New streams stay on the fastest RTT class; exact score ties pick min
 //! `path_id`. Interactive DATA may reuse last-send while that dest is
-//! still the class dest. HOL isolation is same-link rebalance
-//! (`should_rebalance_conn`) and sibling-first `backup_path`, not ISP pinning.
+//! still in the live-clock Interactive subset of that class. HOL isolation
+//! is same-link rebalance (`should_rebalance_conn`) and sibling-first
+//! `backup_path`, not ISP pinning.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -84,7 +85,11 @@ pub fn pick_path_pref(
     cfg: &SessionConfig,
     pref: PickPref,
 ) -> Option<u32> {
-    pick_from(&fastest_class_set(paths, cfg), cfg, pref)
+    let cands = match pref {
+        PickPref::Interactive => interactive_class_set(paths, cfg),
+        PickPref::Any => fastest_class_set(paths, cfg),
+    };
+    pick_from(&cands, cfg, pref)
 }
 
 pub(crate) fn fastest_class_set<'a>(
@@ -153,6 +158,87 @@ pub(crate) fn fastest_class_set<'a>(
         }
     }
     candidates
+}
+
+/// Live RTT a dest may contribute as the Interactive *reference min*.
+/// Spikes keep class (same as [`effective_class_rtt`] for fast >> class).
+/// Lucky-low stable still in class-drop hold does not become the pool min.
+fn interactive_best_rtt(cfg: &SessionConfig, p: &PathState) -> Duration {
+    let fast = p.rtt();
+    let class = p.class_rtt();
+    let stable = p.stable_rtt();
+    if p.class_known() && cfg.tuning.class_jump(fast, class) {
+        return class;
+    }
+    let low = fast.min(stable).min(class);
+    if p.class_known()
+        && cfg
+            .tuning
+            .class_should_drop(class.as_micros() as u64, low.as_micros() as u64)
+    {
+        return class;
+    }
+    low
+}
+
+/// Pessimistic clock for the dest under test. Lucky-low class freeze
+/// cannot hide a live-slow extra.
+fn interactive_cand_rtt(p: &PathState) -> Duration {
+    p.rtt().max(p.class_rtt())
+}
+
+fn interactive_leave(cfg: &SessionConfig, cand: Duration, best: Duration) -> bool {
+    if best >= cand {
+        return false;
+    }
+    health::should_failback(cfg, cand, best)
+        || cfg
+            .tuning
+            .class_should_drop(cand.as_micros() as u64, best.as_micros() as u64)
+}
+
+/// Live-clock subset of [`fastest_class_set`] for Interactive Open/DATA/affinity.
+/// Bulk / `PickPref::Any` / HOL / `failback_target` keep the base set.
+pub(crate) fn interactive_class_set<'a>(
+    paths: &'a [Arc<PathState>],
+    cfg: &SessionConfig,
+) -> Vec<&'a Arc<PathState>> {
+    let base = fastest_class_set(paths, cfg);
+    if base.is_empty() {
+        return base;
+    }
+    let unspiked: Vec<&Arc<PathState>> = base
+        .iter()
+        .copied()
+        .filter(|p| !p.class_known() || !cfg.tuning.class_jump(p.rtt(), p.class_rtt()))
+        .collect();
+    let src = if unspiked.is_empty() {
+        &base
+    } else {
+        &unspiked
+    };
+    let Some(raw_best) = src.iter().map(|p| interactive_best_rtt(cfg, p)).min() else {
+        return base;
+    };
+    // Do not follow jitter low-tail below (1 - class_drop_frac) of min class.
+    let class_floor = src
+        .iter()
+        .filter(|p| p.class_known())
+        .map(|p| p.class_rtt())
+        .min()
+        .map(|c| crate::tuning::scale(c, 1.0 - cfg.tuning.class_drop_frac, Duration::ZERO))
+        .unwrap_or(raw_best);
+    let best = raw_best.max(class_floor);
+    let tight: Vec<&Arc<PathState>> = base
+        .iter()
+        .copied()
+        .filter(|p| !interactive_leave(cfg, interactive_cand_rtt(p), best))
+        .collect();
+    if tight.is_empty() {
+        base
+    } else {
+        tight
+    }
 }
 
 fn path_score(p: &PathState, cfg: &SessionConfig, pref: PickPref) -> (u64, bool) {
@@ -281,6 +367,22 @@ pub fn format_candidates(
         backups.sort();
         out.push_str(" backup=");
         out.push_str(&backups.join(","));
+    }
+    if pref == PickPref::Interactive {
+        let tight_ids: std::collections::HashSet<u32> = interactive_class_set(paths, cfg)
+            .iter()
+            .map(|p| p.id)
+            .collect();
+        let mut excluded: Vec<&str> = cands
+            .iter()
+            .filter(|p| !tight_ids.contains(&p.id))
+            .map(|p| p.name.as_str())
+            .collect();
+        if !excluded.is_empty() {
+            excluded.sort();
+            out.push_str(" interactive_out=");
+            out.push_str(&excluded.join(","));
+        }
     }
     out
 }
@@ -703,6 +805,22 @@ mod tests {
         p.rtt_class_us.store(class_ms * 1000, Ordering::Relaxed);
         *p.up_since.lock().unwrap() = Instant::now() - Duration::from_secs(10);
         p
+    }
+
+    fn mk_clocks(
+        id: u32,
+        name: &str,
+        fast_ms: u64,
+        class_ms: u64,
+        stable_ms: u64,
+    ) -> Arc<PathState> {
+        let p = mk_class(id, name, fast_ms, class_ms);
+        p.rtt_stable_us.store(stable_ms * 1000, Ordering::Relaxed);
+        p
+    }
+
+    fn set_has(set: &[&Arc<PathState>], id: u32) -> bool {
+        set.iter().any(|p| p.id == id)
     }
 
     #[test]
@@ -1476,5 +1594,176 @@ mod tests {
         let a = mk_named(1, "a#0".into(), 0);
         let b = mk_named(2, "b#0".into(), 0);
         assert!(pick_path(&[a, b], &cfg).is_some());
+    }
+
+    #[test]
+    fn interactive_set_ejects_s_when_peer_class_is_200() {
+        let cfg = SessionConfig::default();
+        let a = mk_clocks(1, "a#0", 213, 200, 168);
+        let s = mk_clocks(2, "s#0", 283, 244, 152);
+        let paths = vec![a.clone(), s.clone()];
+        assert!(
+            !crate::health::should_failback(
+                &cfg,
+                Duration::from_millis(244),
+                Duration::from_millis(200)
+            ),
+            "244 vs 200 must stay in fastest_class_set"
+        );
+        let base = fastest_class_set(&paths, &cfg);
+        assert!(set_has(&base, 2), "s in fastest_class_set");
+        let tight = interactive_class_set(&paths, &cfg);
+        assert!(!set_has(&tight, 2), "s out of interactive_class_set");
+        assert_eq!(
+            pick_path_pref(&paths, &cfg, PickPref::Interactive).unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn interactive_set_ejects_s_on_equal_clock_200() {
+        let cfg = SessionConfig::default();
+        let a = mk_clocks(1, "a#0", 213, 200, 200);
+        let s = mk_clocks(2, "s#0", 283, 244, 152);
+        let paths = vec![a.clone(), s.clone()];
+        assert!(!crate::health::should_failback(
+            &cfg,
+            Duration::from_millis(283),
+            Duration::from_millis(200)
+        ));
+        assert!(cfg.tuning.class_should_drop(283_000, 200_000));
+        let base = fastest_class_set(&paths, &cfg);
+        assert!(set_has(&base, 2));
+        let tight = interactive_class_set(&paths, &cfg);
+        assert!(!set_has(&tight, 2));
+        let dump = format_candidates(&paths, &cfg, PickPref::Interactive, Some(1));
+        assert!(dump.contains("interactive_out=s#0"), "{dump}");
+        assert!(
+            !dump.contains("s#0{id=2") || !dump[dump.find("s#0{id=2").unwrap()..].contains("*}"),
+            "must not star s: {dump}"
+        );
+    }
+
+    #[test]
+    fn interactive_set_keeps_inflated_peers_together() {
+        let cfg = SessionConfig::default();
+        let a = mk_clocks(1, "a#0", 213, 200, 200);
+        let b = mk_clocks(2, "b#0", 220, 220, 220);
+        let c = mk_clocks(3, "c#0", 225, 225, 225);
+        let s = mk_clocks(4, "s#0", 283, 244, 152);
+        let paths = vec![a, b, c, s];
+        let tight = interactive_class_set(&paths, &cfg);
+        assert!(set_has(&tight, 1) && set_has(&tight, 2) && set_has(&tight, 3));
+        assert!(!set_has(&tight, 4));
+        let picked = pick_path_pref(&paths, &cfg, PickPref::Interactive).unwrap();
+        assert!(picked <= 3, "Interactive pick a peer, got {picked}");
+    }
+
+    #[test]
+    fn interactive_set_ejects_honest_258_vs_168() {
+        let cfg = SessionConfig::default();
+        let a = mk_class(1, "a#0", 168, 168);
+        let s = mk_class(2, "s#0", 258, 258);
+        let paths = vec![a, s];
+        assert!(!set_has(&fastest_class_set(&paths, &cfg), 2));
+        assert!(!set_has(&interactive_class_set(&paths, &cfg), 2));
+    }
+
+    #[test]
+    fn near_16ms_peer_stays_in_interactive_when_12ms_jitters_to_8() {
+        let cfg = SessionConfig::default();
+        let a = mk_class(1, "a#0", 8, 12);
+        let b = mk_class(2, "b#0", 16, 16);
+        let paths = vec![a, b];
+        assert!(
+            set_has(&interactive_class_set(&paths, &cfg), 2),
+            "16 ms peer must stay when 12 ms jitters to 8"
+        );
+    }
+
+    #[test]
+    fn interactive_set_sits_on_s_when_peers_degraded() {
+        let cfg = SessionConfig::default();
+        let a = mk_class(1, "a#0", 168, 168);
+        let b = mk_class(2, "b#0", 182, 182);
+        let c = mk_class(3, "c#0", 196, 196);
+        a.state
+            .store(crate::path::STATE_DEGRADED, Ordering::Relaxed);
+        b.state
+            .store(crate::path::STATE_DEGRADED, Ordering::Relaxed);
+        c.state
+            .store(crate::path::STATE_DEGRADED, Ordering::Relaxed);
+        let s = mk_class(4, "s#0", 258, 258);
+        let paths = vec![a, b, c, s];
+        assert_eq!(
+            pick_path_pref(&paths, &cfg, PickPref::Interactive).unwrap(),
+            4
+        );
+    }
+
+    #[test]
+    fn interactive_set_sits_on_s_when_peers_down() {
+        let cfg = SessionConfig::default();
+        let a = mk_class(1, "a#0", 168, 168);
+        let b = mk_class(2, "b#0", 182, 182);
+        let c = mk_class(3, "c#0", 196, 196);
+        a.state.store(crate::path::STATE_DOWN, Ordering::Relaxed);
+        b.state.store(crate::path::STATE_DOWN, Ordering::Relaxed);
+        c.state.store(crate::path::STATE_DOWN, Ordering::Relaxed);
+        let s = mk_class(4, "s#0", 258, 258);
+        let paths = vec![a, b, c, s];
+        assert_eq!(
+            pick_path_pref(&paths, &cfg, PickPref::Interactive).unwrap(),
+            4
+        );
+    }
+
+    #[test]
+    fn interactive_set_keeps_far_peers_together() {
+        let cfg = SessionConfig::default();
+        let a = mk_class(1, "a#0", 168, 168);
+        let b = mk_class(2, "b#0", 182, 182);
+        let c = mk_class(3, "c#0", 196, 196);
+        let paths = vec![a, b, c];
+        let tight = interactive_class_set(&paths, &cfg);
+        assert_eq!(tight.len(), 3);
+    }
+
+    #[test]
+    fn interactive_set_mid_p3_drops_c_when_a_live() {
+        let cfg = SessionConfig::default();
+        let a = mk_class(1, "a#0", 68, 68);
+        let b = mk_class(2, "b#0", 82, 82);
+        let c = mk_class(3, "c#0", 96, 96);
+        let paths = vec![a.clone(), b.clone(), c.clone()];
+        assert!(!crate::health::should_failback(
+            &cfg,
+            Duration::from_millis(96),
+            Duration::from_millis(68)
+        ));
+        let base = fastest_class_set(&paths, &cfg);
+        assert_eq!(base.len(), 3);
+        let tight = interactive_class_set(&paths, &cfg);
+        assert!(set_has(&tight, 1) && set_has(&tight, 2));
+        assert!(!set_has(&tight, 3));
+        let picked = pick_path_pref(&paths, &cfg, PickPref::Interactive).unwrap();
+        assert!(picked == 1 || picked == 2, "got {picked}");
+        a.state
+            .store(crate::path::STATE_DEGRADED, Ordering::Relaxed);
+        let tight = interactive_class_set(&paths, &cfg);
+        assert!(set_has(&tight, 3), "c returns when a is DEGRADED");
+    }
+
+    #[test]
+    fn interactive_prefers_unspiked_sibling() {
+        let cfg = SessionConfig::default();
+        let a = mk_class(1, "a#0", 306, 180);
+        let b = mk_class(2, "b#0", 180, 180);
+        let slow = mk_class(3, "s#0", 255, 255);
+        let paths = vec![a, b, slow];
+        assert_eq!(
+            pick_path_pref(&paths, &cfg, PickPref::Interactive).unwrap(),
+            2
+        );
     }
 }

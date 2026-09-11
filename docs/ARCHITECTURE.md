@@ -92,7 +92,7 @@ offset 进度（`session::{streams,steer}`，5ms tick）：
 - **换路重传**：unacked / StreamOpen / StreamClose 超过 `loss_timeout(min 活 dest 的 fast RTT)` 则避开已试过的 `path_id`、优先不同 `link_key` 再发一次。不是并发双发。不是 2× 那条病 5-tuple。
 - **选路跳过静默但 UP 的 TCP**：`last_rx_ago >= loss_timeout(min(fast, class))` 时不当最好路径（不必等 `mark_degraded`）。
 - **路径 down**：那条 TCP 上的 unacked / Open / Close **立刻**换到仍活的路上；路径拆/重拨是池卫生，不挡 TTFB。
-- **HOL**：same-link bulk vs interactive；last-send 只是诊断和 HOL 放置，不是发送契约。`maybe_failback` 已从 maintain 去掉。
+- **HOL**：same-link bulk vs interactive；last-send 只是诊断和 HOL 放置，不是发送契约。`maybe_failback` 已从 maintain 去掉。Interactive 成员是 `fastest_class_set` 的 live-clock 子集（`should_failback || class_should_drop`），避免 far-band ping 钉在 258 ms extra 上；bulk / Any / HOL 仍用完整 class 集。
 
 HOL 隔离靠「每链路多连接 + bulk 避开交互连接」，不是把流钉死在一条 TCP 上。交互帧（`<= interactive_max` 1500 字节）和控制帧走 urgent；bulk 队列满 **不** `set_congested`。不要靠加大 `chan` 修 TTFB。未知 RTT 的替换 5-tuple 在已有已知、schedulable 姐妹时进不了 fastest class。
 

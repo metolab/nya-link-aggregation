@@ -507,7 +507,7 @@ impl Session {
             return None;
         }
         let paths = self.path_list();
-        let class = crate::scheduler::fastest_class_set(&paths, &self.inner.cfg);
+        let class = crate::scheduler::interactive_class_set(&paths, &self.inner.cfg);
         if !class.iter().any(|q| q.id == sticky) {
             return None;
         }
@@ -4600,6 +4600,41 @@ mod tests {
             client.interactive_affinity(1).is_none(),
             "interactive affinity must still skip write-stalled dests"
         );
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn interactive_affinity_skips_far_slow_on_equal_clock_200() {
+        let client = Session::new_client(SessionConfig::default());
+        let (a, ..) = inject_live(&client, 1, "a#0", 168);
+        let (s, ..) = inject_live(&client, 2, "s#0", 258);
+        a.rtt_ewma_us.store(213_000, Ordering::Relaxed);
+        a.rtt_class_us.store(200_000, Ordering::Relaxed);
+        a.rtt_stable_us.store(200_000, Ordering::Relaxed);
+        s.rtt_ewma_us.store(283_000, Ordering::Relaxed);
+        s.rtt_class_us.store(244_000, Ordering::Relaxed);
+        s.rtt_stable_us.store(152_000, Ordering::Relaxed);
+        assert!(
+            client.interactive_affinity(2).is_none(),
+            "s must not keep Interactive sticky vs equal-clock 200"
+        );
+        assert_eq!(client.pick_pref(PickPref::Interactive).unwrap(), 1);
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn interactive_affinity_skips_far_slow_when_peer_stable_is_168() {
+        let client = Session::new_client(SessionConfig::default());
+        let (a, ..) = inject_live(&client, 1, "a#0", 168);
+        let (s, ..) = inject_live(&client, 2, "s#0", 258);
+        a.rtt_ewma_us.store(213_000, Ordering::Relaxed);
+        a.rtt_class_us.store(200_000, Ordering::Relaxed);
+        a.rtt_stable_us.store(168_000, Ordering::Relaxed);
+        s.rtt_ewma_us.store(283_000, Ordering::Relaxed);
+        s.rtt_class_us.store(244_000, Ordering::Relaxed);
+        s.rtt_stable_us.store(152_000, Ordering::Relaxed);
+        assert!(client.interactive_affinity(2).is_none());
+        assert_eq!(client.pick_pref(PickPref::Interactive).unwrap(), 1);
         client.shutdown();
     }
 
