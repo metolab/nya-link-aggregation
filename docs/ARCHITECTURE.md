@@ -1,6 +1,6 @@
 # 架构
 
-nya 是一条 overlay 会话：客户端把多条 TCP+TLS 路径接到同一个 session，上面再多路复用若干条应用流。路径是池，不是流的家。每个 offset **只先发一次**（当前最好的活 TCP）；未 ACK 则按发出那条路的 `loss_timeout`（2×RTT）**换路再发**，禁止原地再打同一条 5-tuple。接收端按 offset 重组，先到的一份交付。不把同一包同时打到多条路上。
+nya 是一条 overlay 会话：客户端把多条 TCP+TLS 路径接到同一个 session，上面再多路复用若干条应用流。路径是池，不是流的家。每个 offset **只先发一次**（当前最好的活 TCP）；未 ACK 则**换路再发**，禁止原地再打同一条 5-tuple。交互片（≤ `interactive_max`）按发出那条路的 `loss_timeout`（2×RTT）换路；bulk 片只在**那条路静默**（`last_rx_ago ≥ retry_after_bulk`，2×ACK RTT 夹在 loss..down 之间）且片龄也过了这个阈值、或接收端明确丢过（`dropped`）、或到了 `down_timeout × 2^(tries−1)` 的 belt 时才再发——一条健康 TCP 上排队的 bulk 不是丢包。接收端按 offset 重组，先到的一份交付，`STREAM_ACK` 带 SACK 区间让发送端释放乱序已到的片。不把同一包同时打到多条路上。
 
 ## Crate
 
@@ -16,7 +16,7 @@ nya-e2e（测试，同时拉 client + server）
 - **nya-core**：会话、路径 IO、健康时钟、调度、握手、SPKI pin。`Tuning` 不进 TOML。
 - **nya-client**：按 `[[links]]` 各开 `connections` 条 TCP+TLS；第一条 `CreateSession`，其余 `JoinSession`。入站是 SOCKS5 CONNECT 或固定目标 forward。
 - **nya-server**：TLS 接受 → 握手 → `SessionTable`。`CreateSession` 建会话并 spawn outbound；`JoinSession` 把路径挂到已有会话。
-- **nya-e2e**：每条路径前插用户态损伤代理；catalog 是短 SLA，`--mixed` 是分 RTT 带的 soak。
+- **nya-e2e**：每条路径前插用户态损伤代理（`packet_wan`：RTT / jitter / loss，可选 `rate_bps` + `queue_bytes` 瓶颈，Reno 拥塞控制、RACK/TLP）；catalog 是短 SLA，`--mixed` 是分 RTT 带的 soak。
 
 ## 数据路径
 
@@ -57,10 +57,15 @@ PSK 证明「谁能加入这条会话」；pin 证明「TLS 对端是这张证�
 
 ## 路径与健康
 
+每条路径的 TCP socket 在 Linux 上设 `TCP_NOTSENT_LOWAT`（内核只留一小段未发字节，其余排在 overlay 自己的队列里，HOL / 换路能看见）并尽力 `TCP_CONGESTION=bbr`（失败只记一次日志）；`dup()` 出来的 fd 存在 `PathState.tcp_fd`，snapshot 读 `TCP_INFO`（cwnd / unacked / notsent / rtt / retrans）当路径 gauge。
+
 每条路径维护：
 
 - **fast RTT**：近期 EWMA，用于打分和瞬时判断
 - **stable RTT**：更慢抬升，给 loss / down 时钟用，避免尖刺拆 TCP
+- **min RTT**：10 s 窗口最小值（`WindowedMin`），预算控制器用，不被排队时延抬高
+- **ACK RTT / 送达率**：DATA 片带 `delivered` 计数和时间戳，ACK 回来时按 BBR 方式算送达率样本（`bw_filter`）；`ack_rtt` 是 bulk 片的实际 ACK 往返
+- **发送预算**（`budget_bytes`）：这条路上允许的 unacked DATA 上限。「长得出吞吐才长」：每个 min-RTT 轮结束比较本轮送达率与上次确认的满带宽，连续两轮 ≥ +15 % 才算一步（×1.5）；3 轮没步就算满管，之后每 4 轮探一次 ×1.25，探到带宽没涨 ≥ 7.5 % 就回去；送达率下沉 ≥ 15 % 连续 3 轮、或 8 轮都没被预算限住，则收缩到 `min(当前, 2 × 本轮带宽 × ACK RTT)`。上限 `3 × bw_max × min_rtt`（`bw_max` 喂的是相邻两轮的较小值，10 s 窗口），下限 `inflight_bias`（64 KiB），硬上限 `chan × 16 KiB`。预算只挡 bulk；bulk 无处可发时等 `budget_wait`，有别的路有余量则溢出到那条（fan-out）。
 - **class RTT**：调度用的 class 成员资格；相对 fast 过时偏高时让位。raise 仍是 hold 后一次 7/8；raise store 与 init freeze 都置 unwind permit。完成 init 的生产路径 permit 为真，直到某次 drop store 的 new_us ≤ fast 才清；happy-path freeze（class==fast）不会 catch-up 清 permit，故 `permit && fast < class` 在会话剩余时间绕过 0.25/8 ms 门。fast < class 时每 hold 一次 7/8。EWMA 从尖刺回落到 (class, 2×class] 死区时 permit 保持。仅 poke class 的测试、以及已经 catch-up 清 permit 的路径仍走 0.25/8 ms 门。timeout-stable 仍不是这套时钟。DEGRADED 仍探活（在途 Ping 最多一条）。尖刺时不跟着每 ping 跳 class
 
 超时由 `Tuning` 从 stable RTT 推出来，再夹紧：
@@ -98,10 +103,10 @@ HOL 隔离靠「每链路多连接 + bulk 避开交互连接」，不是把流�
 
 ## 流控制
 
-- 初始窗口 `128 KiB` 是 **floor**。接收端按 deliver rate × sticky RTT 把 `recv_cap` 调到 `clamp(2 BDP, 128 KiB, 128 KiB × chan)`；`STREAM_ACK.window = recv_cap - buffered_in - recv_buffered`。不是 TOML 开关，也不改 `Tuning::STANDARD.initial_window`。
-- `STREAM_ACK` 是每路径 overwrite register + `Notify`，**不**占 urgent `chan`。writer 每轮最多取 K=8 条直接 `write_one`。urgent 满不能丢掉 ACK，也不能因此 `set_congested`。
-- `STREAM_DATA` 带 offset，接收端 `BTreeMap` 重排
-- 未确认数据记在发送路径的 inflight 上；ACK 时减去，并对小帧采样 RTT（bulk ACK 不当时延）。Pong/ACK 样本 cap 是 **这条 path** 的 `loss_timeout`，不是池里 `min_alive_fast`（否则 7 ms 同伴会把 60 ms 备份的真实 RTT 丢掉，交互 affinity 钉在慢路上）。
+- 初始窗口 `128 KiB` 是 **floor**。接收端按 deliver rate × **到达路径** RTT（`last_recv_path`，其次 sticky，再次池 min；下载流的 sticky 只是请求那条路）把 `recv_cap` 调到 `clamp(2 BDP, 128 KiB, 128 KiB × chan)`；`STREAM_ACK.window = recv_cap - buffered_in - recv_buffered`。发送端被我们的窗口边沿卡住（DATA 反复停在上次通告的边沿，`edge_ring`）而应用跟得上时，把 cap 翻倍探 `4 × min_rtt`，送达率没掉 ≥ 10 % 就留下（`recv_cap_probes / kept / reverted`）。不是 TOML 开关，也不改 `Tuning::STANDARD.initial_window`。
+- `STREAM_ACK` 是每路径 overwrite register + `Notify`，**不**占 urgent `chan`。writer 每轮最多取 K=8 条直接 `write_one`。urgent 满不能丢掉 ACK，也不能因此 `set_congested`。ACK 可带最多 `MAX_SACK_RANGES` 个乱序已到区间（旧对端解码到累计 ACK 即止）；应用读走字节也会触发 drain + ACK，窗口不会停在 0。
+- `STREAM_DATA` 带 offset，接收端 `BTreeMap` 重排。`recv_fin` 之后或 `close_off` 之外再到的重复 DATA 仍回 ACK（`data_dup_rx_bytes` / `ack_after_fin`），发送端才能收尾。
+- 未确认数据记在发送路径的 inflight 上；ACK / SACK 时减去，并对小帧采样 RTT（bulk ACK 不当时延）。每条路的 unacked DATA 还受 `budget_bytes`（见「路径与健康」）约束：sticky 满了先溢到同 class 有余量的路，都没有就等 `budget_wait`（`send_budget_blocks`）；被对端窗口挡住而路上有余量计 `send_window_limited_with_room`。Pong/ACK 样本 cap 是 **这条 path** 的 `loss_timeout`，不是池里 `min_alive_fast`（否则 7 ms 同伴会把 60 ms 备份的真实 RTT 丢掉，交互 affinity 钉在慢路上）。
 - write-stall（`write_deadline` 20 ms floor）只让 **新** Interactive/Open pick-skip；writer 继续排 bulk。`hold_stream_data` 只对 `!rtt_known()`。已知+stalled 的 DATA 走 bulk；retry 不喷到 write-stalled dest。stall 不拆路。
 - 一条 bulk 流尽量钉在一条 5-tuple（`bulk_affinity`，含正在 flush 的 write-stalled dest）。交互 affinity 仍跳过 write-stalled。
 - HOL：stall ≥ `close_linger` 的 leftover 不再算 interactive。`hol_place_bulk_fallback` **不**走 `fastest_class_set`（那会在 nsix 空闲时把 stalled soy 藏起来）。
@@ -114,7 +119,7 @@ HOL 隔离靠「每链路多连接 + bulk 避开交互连接」，不是把流�
 
 线路状态按 `link_key` 汇总（`a#0`/`a#1` → `a`）：up/deg 连接数、RTT 范围、sticky、inflight、队列、rx 新鲜/最旧。`paths=` 可带 ` bak`。迁移原因拆成 speculative / path_down / ensure_sticky / send-blocked；另有 retransmit/hedge、probe_miss、未知 RTT pick。snapshot 带压缩 `streams=`（不进 Prometheus 标签）。
 
-业务计分卡：流完成比、send-unacked ∪ recv-hole stall（进入钟是 `loss_timeout`）、每路径一次 `failover_ms`（`last_rx_ago`）、overlay goodput。换路重传计入 `data_retransmit` / `data_hedge`（跨 `link_key` 为 hedge）；Close 换路计 `close_retry`。半关闭 linger 计 `stream_reaps_linger`（含 client Residual D Reset），**不是**产品 `stream_resets_timeout`。Soak 看 `(closed - linger) / opened`。e2e 产品门是 **新流 first-byte**、Close-swallowed、以及 `prod_like_bulk_copy`（1 MiB ≪ 10 s overlay cap）。Hytron 下载产品门是 **bounce 之后** hop ≫ 150 KB/s 且 origin ≈ client，不是 ping 1500 ms。见 [OBSERVABILITY.md](OBSERVABILITY.md)。Close/Reset 送达语义见 [design-close-reset-delivery-regression.md](design-close-reset-delivery-regression.md)；bulk goodput 机制见 [design-hytron-bulk-goodput.md](design-hytron-bulk-goodput.md)。
+业务计分卡：流完成比、send-unacked ∪ recv-hole stall（进入钟是 `loss_timeout`）、每路径一次 `failover_ms`（`last_rx_ago`）、overlay goodput。换路重传计入 `data_retransmit` / `data_hedge`（跨 `link_key` 为 hedge）；Close 换路计 `close_retry`。限制器归因：`send_budget_blocks` / `send_window_limited_with_room` / `window_blocks`、`data_sacked`、`data_dup_rx_bytes`、`ack_loop_ms`、`recv_cap_max_bytes`；每路径 `budget` / `bw` / `ack_rtt` / `delivered` 与 `TCP_INFO` gauge 进 snapshot `paths=` 和 Prometheus。每个 `nya.hop` span 在 copy 结束时带这条流的 `nya.limiter`（`window` / `budget` / `path` / `none`）及 `window_blocks` / `budget_blocks` / `recv_cap_max` / `hedges` / `dup_rx_bytes` / `paths_used`。半关闭 linger 计 `stream_reaps_linger`（含 client Residual D Reset），**不是**产品 `stream_resets_timeout`。Soak 看 `(closed - linger) / opened`。e2e 产品门是 **新流 first-byte**、Close-swallowed、以及 `prod_like_bulk_copy`（1 MiB ≪ 10 s overlay cap）。Hytron 下载产品门是 **bounce 之后** hop ≫ 150 KB/s 且 origin ≈ client，不是 ping 1500 ms。见 [OBSERVABILITY.md](OBSERVABILITY.md)。Close/Reset 送达语义见 [design-close-reset-delivery-regression.md](design-close-reset-delivery-regression.md)；bulk goodput 机制见 [design-hytron-bulk-goodput.md](design-hytron-bulk-goodput.md)；每路径发送预算、ACK-clock、bulk 静默 hedge、SACK 见 [design-path-budget-ack-clock.md](design-path-budget-ack-clock.md)。
 
 ## 配置分层
 
@@ -128,10 +133,10 @@ HOL 隔离靠「每链路多连接 + bulk 避开交互连接」，不是把流�
 | --- | --- | --- |
 | 单元 | `nya-proto` / `nya-core` 模块内 | 帧编解码、Tuning、握手 duplex、单测调度 |
 | 会话 | `nya-core::session` tests | 单路径 echo、多路径 failover |
-| 短 matrix | `cargo test -p nya-e2e` | 时延、异构、blackhole、failback、多连接 HOL、prod-like 新流 first-byte… |
+| 短 matrix | `cargo test -p nya-e2e` | 时延、异构、blackhole、failback、多连接 HOL、prod-like 新流 first-byte、`bulk_*` 瓶颈（50 Mbps / 10 ms / 128 KiB 队列：单流、双流共享、三路 fan-out、bulk 下 ping、健康路零 hedge）… |
 | 长 blackhole | `nya-e2e --long` | 30s / 60s / 5m |
 | 混合 soak | `nya-e2e --mixed` | near 11–16ms / mid 60–100 / high 120–150 / far 160–200 |
 
-e2e 损伤代理在 TLS 外侧做 stall，不丢 TLS 字节。CI 跑 fmt、clippy、`--exclude nya-e2e` 的单元测试，以及 `nya-e2e` 的 lib/bin 测试；完整 matrix 留给本地或夜间任务。
+e2e 损伤代理在 TLS 外侧做 stall，不丢 TLS 字节。`bulk_*` 瓶颈场景对 CPU 时序敏感，标 `exclusive`，catalog 里串行跑。CI 跑 fmt、clippy、`--exclude nya-e2e` 的单元测试，以及 `nya-e2e` 的 lib/bin 测试；完整 matrix 留给本地或夜间任务。核多的机器上 `cargo test` 的 16 job 会互相抢 timer，用 `nya-e2e --jobs 4` 跑 release 二进制。
 
 发版流程（tag `v*` → 两个平台二进制 → GitHub Release）见 [RELEASE.md](RELEASE.md)。

@@ -867,6 +867,13 @@ TYPE 行必写。counter 名加 `_total`；gauge 不加；histogram 用 raw→cu
 | `bytes_ctrl_rx` | `nya_bytes_ctrl_rx_total` | bytes |
 | `frame_send_drop` | `nya_frame_send_drop_total` | frames |
 | `session_all_down_resets` | `nya_session_all_down_resets_total` | events |
+| `send_budget_blocks` | `nya_send_budget_blocks_total` | events（bulk 等 `budget_wait`） |
+| `send_window_limited_with_room` | `nya_send_window_limited_with_room_total` | events（对端窗口挡住而路上有余量：窗口是限制器） |
+| `data_sacked` | `nya_data_sacked_total` | frames（被 SACK 区间释放） |
+| `data_dup_rx_bytes` | `nya_data_dup_rx_bytes_total` | bytes（重复到达，含 FIN 后） |
+| `ack_after_fin` | `nya_ack_after_fin_total` | frames（`recv_fin` / `close_off` 外的重复 DATA 回的 ACK） |
+| `data_dropped_resend` | `nya_data_dropped_resend_total` | frames（writer 队列丢掉后按 `dropped` 立刻换路） |
+| `recv_cap_probes` / `recv_cap_probe_kept` / `recv_cap_probe_reverted` | `nya_recv_cap_probes_total` 等 | events（接收窗口探测） |
 | process handshake/inbound/outbound/reconnect/sessions_created/dead | `nya_handshake_create_ok_total` 等，与字段名 `nya_{field}_total` | |
 
 **Gauges**
@@ -877,11 +884,16 @@ TYPE 行必写。counter 名加 `_total`；gauge 不加；histogram 用 raw→cu
 | `streams_live` | `nya_streams_live` | 无 | streams |
 | `sessions_live` | `nya_sessions_live` | 无 | sessions |
 | `PathSnap.rtt_us` 等 | `nya_path_*` | `path`, `link` | 见实现 |
+| `PathSnap.budget_bytes` / `bw_bytes_s` / `ack_rtt_us` | `nya_path_budget_bytes` / `nya_path_bw_bytes_s` / `nya_path_ack_rtt_us` | `path`, `link` | overlay 每路径发送预算、ACK-clock 送达率、bulk ACK 往返 |
+| `PathSnap.delivered` | `nya_path_delivered_bytes_total`（counter） | `path`, `link` | 这条路被 ACK 的 DATA 字节 |
+| `PathSnap.tcp` | `nya_path_tcp_known` / `_cwnd_bytes` / `_unacked_bytes` / `_notsent_bytes` / `_rtt_us` / `_min_rtt_us` / `_delivery_rate_bytes_s` / `nya_path_tcp_retrans_total`（counter） | `path`, `link` | Linux `TCP_INFO`；非 Linux 或无 fd 时 `known=0`、其余为 0 |
 | `LinkSnap.*` | `nya_link_*` | `link` | 连接数 / RTT / sticky / 队列 / rx |
 
 路径 `path`/`link` 与线路 `link`：单会话是 `a#0` / `a`；多会话服务端两边都带 4-hex，例如 `a1b2:a#0`、`a1b2:a`，禁止跨租户合并。`streams=` 只进 snapshot 日志，不进 Prometheus。
 
-**Histograms**（`nya_failover_ms` / `nya_stall_ms` / `nya_stream_lifetime_ms`）
+限制器归因（「大文件为什么慢」）：`nya_path_tcp_cwnd_bytes ≈ nya_path_tcp_unacked_bytes` 且 `notsent` 小 ⇒ 内核 TCP 是限制器；`nya_path_budget_bytes ≈ inflight` 且 `nya_send_budget_blocks_total` 在涨 ⇒ overlay 预算；`nya_send_window_limited_with_room_total / nya_window_blocks_total ≥ 0.2` ⇒ 对端接收窗口；三者都不是则看 `nya_ack_loop_ms`（ACK 往返直方图，含对端排队）。
+
+**Histograms**（`nya_failover_ms` / `nya_stall_ms` / `nya_stream_lifetime_ms` / `nya_ack_loop_ms` / `nya_recv_cap_max_bytes`）
 
 ```
 # HELP nya_failover_ms overlay path-silence to restick/down, milliseconds
@@ -1221,7 +1233,7 @@ stderr 上 SDK `ExportError` 默认 `off`。`nya_obs` 对 BatchLog/BatchSpan 失
 | `nya.path.up` | path 注册瞬间（毫秒） | internal |
 | `nya.inbound.socks5` / `nya.inbound.forward` | 到 `open_stream` 返回；属性 `nya.open_us`。**不**包 `copy_bidirectional` | server |
 | `nya.outbound.dial` | `TcpStream::connect`；属性 `nya.dial_us`。**不**包 copy | client |
-| `nya.hop` | copy 结束（或 open/dial fail）的 **marker**；属性 `nya.copy_us` / `nya.first_rx_us` / `nya.origin_first_rx_us` / `nya.max_gap_us` 等。**不**包 copy | client / server |
+| `nya.hop` | copy 结束（或 open/dial fail）的 **marker**；属性 `nya.copy_us` / `nya.first_rx_us` / `nya.origin_first_rx_us` / `nya.max_gap_us` 等；copy 结束还带这条流的限制器归因 `nya.limiter`（`window` / `budget` / `path` / `none`，按等待次数取 argmax）、`nya.window_blocks` / `nya.budget_blocks` / `nya.window_limited_with_room` / `nya.recv_cap_max` / `nya.hedges` / `nya.dup_rx_bytes` / `nya.paths_used`。**不**包 copy | client / server |
 
 失败：`otel.status_code=ERROR`。无协议 `traceparent`。
 

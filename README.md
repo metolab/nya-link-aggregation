@@ -220,10 +220,13 @@ target = "127.0.0.1:22"
 # 单元测试（不含 e2e matrix）
 cargo test --workspace --exclude nya-e2e
 
-# 短 SLA matrix（并行，约数分钟）
+# 短 SLA matrix（并行，约数分钟；bulk_* 瓶颈场景对时序敏感，
+# 用 release 二进制、--jobs 4；核很多的机器上 cargo test 的 16 job 会互相抢 timer）
 cargo test -p nya-e2e
 # 或
-cargo run -p nya-e2e --bin nya-e2e -- --jobs 8
+cargo run --release -p nya-e2e --bin nya-e2e -- --jobs 4
+# 单个场景 + 每 100ms 的路径 / 流 / 链路 tracer
+NYA_E2E_TRACE_BULK=1 cargo run --release -p nya-e2e --bin nya-e2e -- --filter bulk_bottleneck_single
 
 # 含 30s / 60s / 5m blackhole
 cargo run -p nya-e2e --bin nya-e2e -- --long

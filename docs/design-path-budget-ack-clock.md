@@ -5,10 +5,10 @@
 | **Title** | Remove the 128 KiB/loop floor lock, the 20 ms bulk hedge storm, and per-5-tuple kernel bufferbloat; make the limiter observable |
 | **Author** | nya-link-aggregation maintainers |
 | **Date** | 2026-09-14 |
-| **Status** | Draft (post-v0.1.5 production observation) |
+| **Status** | **Implemented** on `main` (post-v0.1.5); see "Implementation status" below for deviations from the draft |
 | **Audience** | Senior engineers in `nya-core` session / scheduler / path IO, `nya-client` dial, `nya-server` accept, `nya-e2e` WAN emulation |
 | **Predecessor** | `docs/design-hytron-bulk-goodput.md` (**Implemented** in v0.1.4: leftover Reset, ACK register, write-stall pick-skip, HOL, window auto-tune). `docs/design-interactive-class-set.md` (v0.1.5). This document does **not** reopen those; it fixes what v0.1.5 production shows they left. |
-| **Compatibility** | `PROTOCOL_VERSION` **stays 2**. No wire change (`StreamAck { stream_id, acked_offset, window }` unchanged). No new TOML keys; `[session]` stays `deny_unknown_fields`. One production `Tuning::STANDARD`. Do **not** retune `initial_window`, `chan`, `inflight_bias`, `loss_timeout_*`, `down_*`, `close_linger`, `interactive_max`, `class_drop_*`, `path_score` weights. New mechanism constants are **derived** from existing ones or are textbook control constants (gain 2, α = 1/8, BBR 10-RTT window) and are documented at the definition site. |
+| **Compatibility** | `PROTOCOL_VERSION` **stays 2**. One backward-compatible wire addition made during implementation: `StreamAck` may carry trailing SACK ranges (old decoders stop at `window`; old encoders produce none). No new TOML keys; `[session]` stays `deny_unknown_fields`. One production `Tuning::STANDARD`. Do **not** retune `initial_window`, `chan`, `inflight_bias`, `loss_timeout_*`, `down_*`, `close_linger`, `interactive_max`, `class_drop_*`, `path_score` weights. New mechanism constants are **derived** from existing ones or are textbook control constants (gain 2, α = 1/8, BBR 10-RTT window) and are documented at the definition site. |
 | **Intended repo path** | `docs/design-path-budget-ack-clock.md` |
 
 ---
@@ -37,7 +37,34 @@ Plus a blind spot: nothing today tells us **which layer is the limiter** (stream
 | **P5** | ACK duplicates after `recv_fin` / past `close_off` / below `recv_next` | 4 |
 | **P6** | Observability: per-path `TCP_INFO` gauges (Linux), per-path `bw`/`budget`/`ack_rtt`, limiter counters, duplicate-bytes counter, `recv_cap_max` histogram, per-stream attribution on `nya.hop` spans; e2e WAN gets a **rate + queue** bottleneck so all of the above is testable | blind spot |
 
-Nothing here changes the wire, TOML, `PROTOCOL_VERSION`, `failbacks`, all-down, class/failback clocks, Close/Reset delivery, or the leftover contract.
+Nothing here changes the TOML, `PROTOCOL_VERSION`, `failbacks`, all-down, class/failback clocks, Close/Reset delivery, or the leftover contract. The only wire change is the backward-compatible SACK tail on `StreamAck` (see below).
+
+### Implementation status (2026-09-14, `main`)
+
+All of P1–P6 landed, in the PR-plan order, as direct commits on `main`. Deviations from the draft, each forced by the e2e bottleneck (PR 5) rather than by taste:
+
+| Area | Draft | Shipped | Why |
+| --- | --- | --- | --- |
+| P2 budget | closed form `clamp(2·bw·min_rtt, floor, ceil)` | **Growth controller** (`PathState::end_budget_round`): per min-RTT round, a step ×1.5 needs two consecutive rounds ≥ +15 % over the last confirmed bandwidth; 3 flat rounds ⇒ full, then a ×1.25 probe every 4 limited rounds (kept if bandwidth rose ≥ 7.5 %); 3 sag rounds or 8 unlimited rounds ⇒ shrink to `2·bw·ack_rtt`. Ceiling `3·bw_max·min_rtt` with `bw_max` fed the min of two consecutive rounds over 10 s | The closed form is a fixed point at the floor under a shared bottleneck: `bw` measured under a budget is at most `budget/loop`, so the budget can never exceed what it already carries. BBR resolves this with a pacing gain overshoot; a cwnd-only budget needs an explicit "grow while it buys throughput" test. Gain 2 starved the forward direction under a reverse bulk flow (measured 75–85 % vs 97 % at 3) |
+| P3b | specified, gated on production evidence | **Shipped** (`tune_recv_cap_sampled`, `edge_ring`, `recv_cap_probes/kept/reverted`) | `bulk_bottleneck_single` reproduced the floor lock locally: with P2 in place the window, not the path, was the limiter (`window_limited_with_room / window_blocks` > 0.5) |
+| P4 trigger | rehome when path `!is_loss_fresh` | rehome when path silent for `retry_after_bulk` (= `clamp(2·ack_rtt, loss, down)`) **and** the piece itself is at least that old; `dropped` and the `down_timeout·2^(tries−1)` belt unchanged | `is_loss_fresh` alone fired during the emulated TCP's Reno recovery (a healthy path that is briefly quiet), producing the very hedges `hedge_only_on_silence` forbids |
+| ACK | cumulative only | **SACK ranges** on `StreamAck` (`MAX_SACK_RANGES`, trailing, optional; `data_sacked` counter) | With per-piece hedging, one hole on one path makes every later piece behind it look unacked on the cumulative ACK, and the belt then re-sends all of them — a duplicate storm proportional to the budget. SACK lets the sender release what arrived out of order |
+| Receiver drain | ACK only on DATA arrival | `note_app_read` drains `recv_buf` and re-ACKs | A window shrunk by P3b's revert could reach 0 and stay there when no new DATA arrived to trigger the next ACK |
+| `drain_recv` | — | holds `recv_buf` across `try_send` | Concurrent deliveries on fan-out paths could interleave and hand the app out-of-order bytes (`bulk_fanout_three_paths` `intact=false`) |
+| e2e emulator | rate + queue | plus Reno cwnd (slow start / halving), time-based RACK reordering window, Linux-like RTO + TLP, one ordered wire task per pipe, `cwnd_fwd/rev` and `queue_drops` in `LinkStats` | A rate/queue without congestion control made every overflow a hard loss with no recovery and produced spurious reordering from timer granularity; the bottleneck scenarios were measuring the emulator |
+
+Measured on the e2e bottleneck (50 Mbps / 10 ms / 128 KiB queue, release binary, `--jobs 4`), before core changes (commit `a47e194`, e2e only) → after:
+
+| Scenario | Before | After (two consecutive full catalogs) |
+| --- | --- | --- |
+| `bulk_bottleneck_single` 12 MiB | 87 % of link | 5.9–6.1 MB/s ≈ **95–97 %**, 0 hedges, 0 dup; occasional Reno-loss run at 74–77 % (gate 70 %, see scenario comment) |
+| `bulk_shared_two_streams` 2×6 MiB | 52 % aggregate, **FAIL** (queue overflow) | 6.1–6.2 MB/s aggregate ≈ **98 %**, 0 dup |
+| `bulk_fanout_three_paths` 12 MiB over 3×20 Mbps (64 KiB queues; gate = 80 % of two links) | timeout at 60 s, 298 MB sent for 12 MiB, 34 664 hedges | **2.1–2.2 s** = 6.0 MB/s ≈ 2.4 links' worth, 0 hedges, 0 dup |
+| `ping_under_bulk_bounded` | p99 ≈ 250 ms | p99 **84–111 ms** |
+| `hedge_only_on_silence` | **FAIL** (hedges on the healthy phase, copy errors) | PASS, dup_rx 0.5 %, hedges only after the blackhole |
+| Full short catalog (51) | — | 51/51, twice; `stream_lifecycle` PASS |
+
+Production follow-up (unchanged from the Rollout Plan): the limiter counters and `nya.hop` attributes now answer "window / budget / path / kernel TCP" per stream; the next pull should read `nya.limiter` distribution on ≥ 8 MB Hytron hops, `nya_path_tcp_cwnd_bytes` vs `nya_path_budget_bytes`, and `nya_data_dup_rx_bytes_total / nya_bytes_data_rx_total` (was 14–18 %).
 
 ---
 
