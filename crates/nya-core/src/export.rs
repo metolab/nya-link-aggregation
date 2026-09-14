@@ -438,7 +438,7 @@ mod tests {
         assert!(names.contains("nya_path_rtt_us"));
         assert!(names.contains("nya_failover_ms_bucket"));
         let n_counter = names.iter().filter(|n| n.ends_with("_total")).count();
-        assert_eq!(n_counter, 55, "{names:?}");
+        assert_eq!(n_counter, 60, "{names:?}");
         assert!(names.contains("nya_path_ack_pending"));
         assert!(names.contains("nya_ack_flush_us_bucket"));
         assert!(names.contains("nya_path_outlier_recycle_total"));

@@ -489,23 +489,48 @@ impl Session {
         let Some(st) = self.get_stream(data.stream_id) else {
             return;
         };
-        if st.reset.load(Ordering::Relaxed) || st.recv_fin.load(Ordering::Relaxed) {
+        if st.reset.load(Ordering::Relaxed) {
             return;
         }
-        st.last_recv_path.store(path_id, Ordering::Relaxed);
+        let len = data.data.len() as u64;
+        // P5: the receive side is complete (or this piece lies past the
+        // sender's final offset). The sender only re-sends because it has
+        // not seen our ACK reach `close_off`; every silent drop here costs
+        // it another hedge round. Re-ACK — `recv_next == close_off` — so the
+        // sender's `unacked` empties and the hedge belt stops.
         let close_off = st.recv_close_off.load(Ordering::Relaxed);
-        if close_off != u64::MAX && data.offset >= close_off {
-            return;
-        }
-        let mut buf = st.recv_buf.lock().unwrap();
-        if data.offset < st.recv_next.load(Ordering::Relaxed) {
-            drop(buf);
+        if st.recv_fin.load(Ordering::Relaxed)
+            || (close_off != u64::MAX && data.offset >= close_off)
+        {
+            self.inner
+                .metrics
+                .data_dup_rx_bytes
+                .fetch_add(len, Ordering::Relaxed);
+            self.inner
+                .metrics
+                .ack_after_fin
+                .fetch_add(1, Ordering::Relaxed);
             self.send_ack(&st, path_id);
             return;
         }
-        let new_len = data.data.len() as u64;
+        st.last_recv_path.store(path_id, Ordering::Relaxed);
+        let mut buf = st.recv_buf.lock().unwrap();
+        if data.offset < st.recv_next.load(Ordering::Relaxed) {
+            drop(buf);
+            self.inner
+                .metrics
+                .data_dup_rx_bytes
+                .fetch_add(len, Ordering::Relaxed);
+            self.send_ack(&st, path_id);
+            return;
+        }
+        let new_len = len;
         if let Some(old) = buf.insert(data.offset, data.data) {
             let old_len = old.len() as u64;
+            self.inner
+                .metrics
+                .data_dup_rx_bytes
+                .fetch_add(old_len, Ordering::Relaxed);
             let _ = st
                 .recv_buffered
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {

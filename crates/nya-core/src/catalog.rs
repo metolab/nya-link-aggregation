@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 
 use crate::metrics::{
     percentile, HistSnap, ProcessSnapshot, ACK_FLUSH_US_BOUNDS, FAILOVER_MS_BOUNDS,
-    LIFETIME_MS_BOUNDS, STALL_MS_BOUNDS,
+    LIFETIME_MS_BOUNDS, RECV_CAP_BYTES_BOUNDS, STALL_MS_BOUNDS,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -96,6 +96,8 @@ pub fn metric_descriptors() -> Vec<MetricDesc> {
     ps.session.stall_ms = HistSnap::zeroed(STALL_MS_BOUNDS);
     ps.session.stream_lifetime_ms = HistSnap::zeroed(LIFETIME_MS_BOUNDS);
     ps.session.ack_flush_us = HistSnap::zeroed(ACK_FLUSH_US_BOUNDS);
+    ps.session.ack_loop_ms = HistSnap::zeroed(STALL_MS_BOUNDS);
+    ps.session.recv_cap_max_bytes = HistSnap::zeroed(RECV_CAP_BYTES_BOUNDS);
     ps.session.links.push(crate::metrics::LinkSnap {
         name: "_".into(),
         ..Default::default()
@@ -208,6 +210,31 @@ pub fn visit_metrics(ps: &ProcessSnapshot, sink: &mut impl MetricSink) {
         "nya_window_blocks_total",
         "times send waited on stream window",
         s.window_blocks,
+    );
+    sink.counter(
+        "nya_send_budget_blocks_total",
+        "bulk piece waited for per-path budget room",
+        s.send_budget_blocks,
+    );
+    sink.counter(
+        "nya_send_window_limited_with_room_total",
+        "window wait while a path had budget room",
+        s.send_window_limited_with_room,
+    );
+    sink.counter(
+        "nya_data_dup_rx_bytes_total",
+        "duplicate STREAM_DATA payload bytes received",
+        s.data_dup_rx_bytes,
+    );
+    sink.counter(
+        "nya_ack_after_fin_total",
+        "ACKs for duplicates after recv_fin / past close_off",
+        s.ack_after_fin,
+    );
+    sink.counter(
+        "nya_data_dropped_resend_total",
+        "pieces re-sent after the frame never reached a writer queue",
+        s.data_dropped_resend,
     );
     sink.counter(
         "nya_picks_unknown_rtt_total",
@@ -427,6 +454,18 @@ pub fn visit_metrics(ps: &ProcessSnapshot, sink: &mut impl MetricSink) {
         "STREAM_ACK register store to wire, microseconds",
         ACK_FLUSH_US_BOUNDS,
         &s.ack_flush_us,
+    );
+    sink.histogram(
+        "nya_ack_loop_ms",
+        "bulk piece send to ACK, milliseconds",
+        STALL_MS_BOUNDS,
+        &s.ack_loop_ms,
+    );
+    sink.histogram(
+        "nya_recv_cap_max_bytes",
+        "per-stream max recv_cap at stream end",
+        RECV_CAP_BYTES_BOUNDS,
+        &s.recv_cap_max_bytes,
     );
 
     for ln in &s.links {
@@ -658,6 +697,8 @@ pub fn prometheus_metric_names(_ps: &ProcessSnapshot) -> BTreeSet<String> {
     ps.session.stall_ms = HistSnap::zeroed(STALL_MS_BOUNDS);
     ps.session.stream_lifetime_ms = HistSnap::zeroed(LIFETIME_MS_BOUNDS);
     ps.session.ack_flush_us = HistSnap::zeroed(ACK_FLUSH_US_BOUNDS);
+    ps.session.ack_loop_ms = HistSnap::zeroed(STALL_MS_BOUNDS);
+    ps.session.recv_cap_max_bytes = HistSnap::zeroed(RECV_CAP_BYTES_BOUNDS);
     ps.session.links.push(crate::metrics::LinkSnap {
         name: "_".into(),
         ..Default::default()

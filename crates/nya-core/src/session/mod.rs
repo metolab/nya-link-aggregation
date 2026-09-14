@@ -3642,6 +3642,91 @@ mod tests {
         server.shutdown();
     }
 
+    /// P5: DATA re-sent after we already FIN'd (or lying past close_off)
+    /// must be answered with an ACK at close_off, not dropped silently —
+    /// otherwise the sender keeps hedging the tail forever.
+    #[tokio::test]
+    async fn dup_data_after_fin_is_acked() {
+        let (server, mut incoming) = Session::new_server(SessionConfig::default());
+        let (p, _rx, _urx) = inject_live(&server, 1, "a#0", 7);
+        server.handle_frame(
+            1,
+            Frame::StreamOpen(StreamOpen {
+                stream_id: 1,
+                target: Target {
+                    host: "t".into(),
+                    port: 1,
+                },
+            }),
+        );
+        let _inc = incoming.try_recv().expect("accepted");
+        server.handle_frame(
+            1,
+            Frame::StreamData(StreamData {
+                stream_id: 1,
+                offset: 0,
+                data: vec![7; 100],
+            }),
+        );
+        server.handle_frame(
+            1,
+            Frame::StreamClose(StreamClose {
+                stream_id: 1,
+                final_offset: Some(100),
+            }),
+        );
+        server.debug_maintain();
+        let st = server.get_stream(1).expect("stream");
+        assert!(st.recv_fin.load(Ordering::Relaxed));
+        // Drain whatever ACK the delivery already staged.
+        let _ = p.take_all_acks();
+        let dup0 = server
+            .inner
+            .metrics
+            .data_dup_rx_bytes
+            .load(Ordering::Relaxed);
+        server.handle_frame(
+            1,
+            Frame::StreamData(StreamData {
+                stream_id: 1,
+                offset: 60,
+                data: vec![7; 40],
+            }),
+        );
+        let acks = p.take_all_acks();
+        let ack = acks.get(&1).expect("dup after FIN must re-ACK");
+        assert_eq!(ack.acked_offset, 100, "ACK must carry close_off");
+        assert_eq!(
+            server
+                .inner
+                .metrics
+                .data_dup_rx_bytes
+                .load(Ordering::Relaxed)
+                - dup0,
+            40
+        );
+        assert_eq!(
+            server.inner.metrics.ack_after_fin.load(Ordering::Relaxed),
+            1
+        );
+        // Past close_off (sender bug / stale piece): same treatment.
+        server.handle_frame(
+            1,
+            Frame::StreamData(StreamData {
+                stream_id: 1,
+                offset: 100,
+                data: vec![7; 10],
+            }),
+        );
+        assert!(p.take_all_acks().contains_key(&1));
+        assert_eq!(
+            server.inner.metrics.ack_after_fin.load(Ordering::Relaxed),
+            2
+        );
+        assert_eq!(st.recv_next.load(Ordering::Relaxed), 100);
+        server.shutdown();
+    }
+
     #[tokio::test]
     async fn linger_progress_fine_without_recv_fin_sends_reset() {
         let mut cfg = SessionConfig::default();

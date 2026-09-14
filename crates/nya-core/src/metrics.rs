@@ -20,6 +20,16 @@ pub const LIFETIME_MS_BOUNDS: &[u64] = &[100, 500, 1000, 5000, 30_000, 60_000, 3
 pub const ACK_FLUSH_US_BOUNDS: &[u64] = &[
     500, 1_000, 2_000, 5_000, 10_000, 20_000, 50_000, 100_000, 200_000,
 ];
+/// Per-stream max `recv_cap` at stream end: floor (128 KiB) … ceil (8 MiB).
+pub const RECV_CAP_BYTES_BOUNDS: &[u64] = &[
+    128 * 1024,
+    256 * 1024,
+    512 * 1024,
+    1024 * 1024,
+    2 * 1024 * 1024,
+    4 * 1024 * 1024,
+    8 * 1024 * 1024,
+];
 
 fn epoch() -> Instant {
     static EPOCH: OnceLock<Instant> = OnceLock::new();
@@ -179,6 +189,16 @@ pub struct Counters {
     pub pick_rtt_us: AtomicU64,
     pub probe_miss: AtomicU64,
     pub window_blocks: AtomicU64,
+    /// Bulk piece waited for per-path budget room (P2).
+    pub send_budget_blocks: AtomicU64,
+    /// Window wait while some path still had budget room (P3b evidence).
+    pub send_window_limited_with_room: AtomicU64,
+    /// Payload bytes received that were already delivered or buffered (waste).
+    pub data_dup_rx_bytes: AtomicU64,
+    /// ACKs sent for duplicates after recv_fin / past close_off (P5).
+    pub ack_after_fin: AtomicU64,
+    /// Pieces re-sent because the frame never reached a writer queue (P4).
+    pub data_dropped_resend: AtomicU64,
     pub picks_unknown_rtt: AtomicU64,
     pub picks_unknown_over_known: AtomicU64,
     pub failbacks: AtomicU64,
@@ -207,6 +227,10 @@ pub struct Counters {
     pub stall_ms: Histogram,
     pub stream_lifetime_ms: Histogram,
     pub ack_flush_us: Histogram,
+    /// Bulk piece last_sent → ACK, milliseconds (loaded ACK loop).
+    pub ack_loop_ms: Histogram,
+    /// Per-stream max recv_cap observed, at stream end.
+    pub recv_cap_max_bytes: Histogram,
 }
 
 impl Default for Counters {
@@ -229,6 +253,11 @@ impl Default for Counters {
             pick_rtt_us: AtomicU64::new(0),
             probe_miss: AtomicU64::new(0),
             window_blocks: AtomicU64::new(0),
+            send_budget_blocks: AtomicU64::new(0),
+            send_window_limited_with_room: AtomicU64::new(0),
+            data_dup_rx_bytes: AtomicU64::new(0),
+            ack_after_fin: AtomicU64::new(0),
+            data_dropped_resend: AtomicU64::new(0),
             picks_unknown_rtt: AtomicU64::new(0),
             picks_unknown_over_known: AtomicU64::new(0),
             failbacks: AtomicU64::new(0),
@@ -256,6 +285,8 @@ impl Default for Counters {
             stall_ms: Histogram::new(STALL_MS_BOUNDS),
             stream_lifetime_ms: Histogram::new(LIFETIME_MS_BOUNDS),
             ack_flush_us: Histogram::new(ACK_FLUSH_US_BOUNDS),
+            ack_loop_ms: Histogram::new(STALL_MS_BOUNDS),
+            recv_cap_max_bytes: Histogram::new(RECV_CAP_BYTES_BOUNDS),
         }
     }
 }
@@ -411,6 +442,11 @@ pub struct Snapshot {
     pub pick_rtt_us: u64,
     pub probe_miss: u64,
     pub window_blocks: u64,
+    pub send_budget_blocks: u64,
+    pub send_window_limited_with_room: u64,
+    pub data_dup_rx_bytes: u64,
+    pub ack_after_fin: u64,
+    pub data_dropped_resend: u64,
     pub picks_unknown_rtt: u64,
     pub picks_unknown_over_known: u64,
     pub failbacks: u64,
@@ -441,6 +477,8 @@ pub struct Snapshot {
     pub stall_ms: HistSnap,
     pub stream_lifetime_ms: HistSnap,
     pub ack_flush_us: HistSnap,
+    pub ack_loop_ms: HistSnap,
+    pub recv_cap_max_bytes: HistSnap,
     pub paths: Vec<PathSnap>,
     pub links: Vec<LinkSnap>,
     pub streams: Vec<StreamSnap>,
@@ -468,6 +506,11 @@ impl Snapshot {
         }
         self.probe_miss += other.probe_miss;
         self.window_blocks += other.window_blocks;
+        self.send_budget_blocks += other.send_budget_blocks;
+        self.send_window_limited_with_room += other.send_window_limited_with_room;
+        self.data_dup_rx_bytes += other.data_dup_rx_bytes;
+        self.ack_after_fin += other.ack_after_fin;
+        self.data_dropped_resend += other.data_dropped_resend;
         self.picks_unknown_rtt += other.picks_unknown_rtt;
         self.picks_unknown_over_known += other.picks_unknown_over_known;
         self.failbacks += other.failbacks;
@@ -497,6 +540,8 @@ impl Snapshot {
         self.stall_ms.merge_add(&other.stall_ms);
         self.stream_lifetime_ms.merge_add(&other.stream_lifetime_ms);
         self.ack_flush_us.merge_add(&other.ack_flush_us);
+        self.ack_loop_ms.merge_add(&other.ack_loop_ms);
+        self.recv_cap_max_bytes.merge_add(&other.recv_cap_max_bytes);
     }
 }
 
@@ -520,6 +565,13 @@ impl Counters {
             pick_rtt_us: self.pick_rtt_us.load(Ordering::Relaxed),
             probe_miss: self.probe_miss.load(Ordering::Relaxed),
             window_blocks: self.window_blocks.load(Ordering::Relaxed),
+            send_budget_blocks: self.send_budget_blocks.load(Ordering::Relaxed),
+            send_window_limited_with_room: self
+                .send_window_limited_with_room
+                .load(Ordering::Relaxed),
+            data_dup_rx_bytes: self.data_dup_rx_bytes.load(Ordering::Relaxed),
+            ack_after_fin: self.ack_after_fin.load(Ordering::Relaxed),
+            data_dropped_resend: self.data_dropped_resend.load(Ordering::Relaxed),
             picks_unknown_rtt: self.picks_unknown_rtt.load(Ordering::Relaxed),
             picks_unknown_over_known: self.picks_unknown_over_known.load(Ordering::Relaxed),
             failbacks: self.failbacks.load(Ordering::Relaxed),
@@ -549,6 +601,8 @@ impl Counters {
             stall_ms: self.stall_ms.snap(),
             stream_lifetime_ms: self.stream_lifetime_ms.snap(),
             ack_flush_us: self.ack_flush_us.snap(),
+            ack_loop_ms: self.ack_loop_ms.snap(),
+            recv_cap_max_bytes: self.recv_cap_max_bytes.snap(),
             paths: paths
                 .iter()
                 .map(|p| PathSnap {
