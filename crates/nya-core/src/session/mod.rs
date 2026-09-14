@@ -100,6 +100,10 @@ pub(crate) struct Inner {
     next_stream_id: AtomicU32,
     incoming: Mutex<Option<mpsc::Sender<IncomingStream>>>,
     ready: Notify,
+    /// P2: some path's inflight dropped or a path was added — bulk senders
+    /// parked on budget re-check room. Session-level: a waiter on a full
+    /// sticky must also see a sibling gain room (fan-out).
+    budget_wait: Notify,
     dead: AtomicBool,
     dead_notify: Notify,
     all_down_since: Mutex<Option<Instant>>,
@@ -152,6 +156,7 @@ impl Session {
             next_stream_id: AtomicU32::new(1),
             incoming: Mutex::new(incoming),
             ready: Notify::new(),
+            budget_wait: Notify::new(),
             dead: AtomicBool::new(false),
             dead_notify: Notify::new(),
             all_down_since: Mutex::new(None),
@@ -369,6 +374,13 @@ impl Session {
         let (utx, urx) = mpsc::channel(chan);
         let path = PathState::with_writers(id, name.clone(), tx, utx);
         *path.tcp_fd.lock().unwrap() = fd;
+        path.budget_floor
+            .store(self.inner.cfg.tuning.inflight_bias, Ordering::Relaxed);
+        path.budget_ceil.store(
+            (self.inner.cfg.tuning.chan as u64)
+                .saturating_mul(nya_proto::MAX_STREAM_PAYLOAD as u64),
+            Ordering::Relaxed,
+        );
         path.stable_up_hold_us.store(
             self.inner.cfg.tuning.stable_up_hold.as_micros() as u64,
             Ordering::Relaxed,
@@ -376,6 +388,7 @@ impl Session {
         self.inner.paths.lock().unwrap().insert(id, path.clone());
         *self.inner.all_down_since.lock().unwrap() = None;
         self.inner.ready.notify_waiters();
+        self.inner.budget_wait.notify_waiters();
         info!(path = %name, path_id = id, "path added");
         self.inner
             .metrics
@@ -410,6 +423,7 @@ impl Session {
         self.observe_failover(&path);
         let mut taken = path.take_all_acks();
         self.rehome_unacked_from(path_id);
+        self.inner.budget_wait.notify_waiters();
         self.retry_open_from(path_id);
         self.retry_close_from(path_id);
         self.retry_reset_from(path_id);
@@ -648,7 +662,58 @@ impl Session {
         }
     }
 
+    /// P4 bulk hedge clock: twice this path's loaded ACK RTT, never below
+    /// the pool loss clock and never above the path's down timeout.
+    fn retry_after_bulk(&self, p: &PathState) -> Duration {
+        let lo = self.retry_after(p.id);
+        let hi = health::down_timeout(&self.inner.cfg, p.stable_rtt(), self.probe_interval_for(p))
+            .max(lo);
+        match p.ack_rtt() {
+            Some(a) => (a * 2).clamp(lo, hi),
+            None => lo,
+        }
+    }
+
+    /// P4 belt for a bulk piece on a *fresh* path: `down_timeout × 2^(tries−1)`,
+    /// capped at `down_timeout_ceil`. The only way a piece on a healthy path
+    /// is ever re-sent (receiver dropped it silently: unknown stream after
+    /// `expire_early_data`, close_off race).
+    fn hedge_belt(&self, p: &PathState, tries: usize) -> Duration {
+        let base =
+            health::down_timeout(&self.inner.cfg, p.stable_rtt(), self.probe_interval_for(p));
+        let shift = tries.clamp(1, 5) as u32 - 1;
+        base.saturating_mul(1u32 << shift)
+            .min(self.inner.cfg.tuning.down_timeout_ceil)
+    }
+
+    /// P4: piece is in `unacked` but nothing for it is on a writer queue.
+    pub(crate) fn note_data_dropped(&self, stream_id: u32, offset: u64) {
+        let Some(st) = self.get_stream(stream_id) else {
+            return;
+        };
+        let mut g = st.unacked.lock().unwrap();
+        if let Some(u) = g.get_mut(&offset) {
+            u.dropped = true;
+            u.retry_not_before = Instant::now();
+        }
+    }
+
+    /// P2: remember the path ACK clock at (re)send so `on_ack` can turn this
+    /// piece's ACK into a delivery-rate sample.
+    pub(super) fn stamp_delivered(&self, st: &StreamState, offset: u64, p: &PathState) {
+        if let Some(u) = st.unacked.lock().unwrap().get_mut(&offset) {
+            u.delivered_at_send = p.delivered.load(Ordering::Relaxed);
+            u.delivered_time_at_send_us = p.delivered_at_us.load(Ordering::Relaxed);
+        }
+    }
+
     /// Expired unacked copies: one send on a *different* path. Never in-place.
+    ///
+    /// Interactive pieces keep the age clock (`retry_after`). Bulk pieces
+    /// are re-sent only when the **path** is silent (`!is_loss_fresh`),
+    /// when they never reached the wire (`dropped`), or on the slow belt:
+    /// a fresh path's per-frame ACKs prove it is delivering, and a bulk
+    /// ACK loop longer than the 20 ms clock is transfer delay, not loss.
     fn retry_expired_unacked(&self, st: &StreamState) {
         if !st.is_steerable() {
             return;
@@ -666,24 +731,66 @@ impl Session {
             .filter(|p| p.is_alive())
             .map(|p| p.id)
             .collect();
-        let expired: Vec<(u64, u32, Vec<u8>, Vec<u32>)> = {
+        let interactive_max = self.inner.cfg.tuning.interactive_max;
+        struct Due {
+            offset: u64,
+            from: u32,
+            data: Vec<u8>,
+            tried: Vec<u32>,
+            dropped: bool,
+            bulk: bool,
+        }
+        let expired: Vec<Due> = {
             let unacked = st.unacked.lock().unwrap();
             unacked
                 .iter()
                 .filter(|(_, u)| {
-                    u.last_sent.elapsed() >= self.retry_after(u.path_id)
-                        && now >= u.retry_not_before
+                    if now < u.retry_not_before {
+                        return false;
+                    }
+                    if u.dropped {
+                        return true;
+                    }
+                    let age = u.last_sent.elapsed();
+                    let bulk = u.data.len() > interactive_max;
+                    match self.get_path(u.path_id) {
+                        None => true,
+                        Some(p) if !p.is_alive() => true,
+                        Some(_) if !bulk => age >= self.retry_after(u.path_id),
+                        Some(p) => {
+                            (!crate::scheduler::is_loss_fresh(&self.inner.cfg, &p)
+                                && age >= self.retry_after_bulk(&p))
+                                || age >= self.hedge_belt(&p, u.tried.len())
+                        }
+                    }
                 })
-                .map(|(off, u)| (*off, u.path_id, u.data.clone(), u.tried.clone()))
+                .map(|(off, u)| Due {
+                    offset: *off,
+                    from: u.path_id,
+                    data: u.data.clone(),
+                    tried: u.tried.clone(),
+                    dropped: u.dropped,
+                    bulk: u.data.len() > interactive_max,
+                })
                 .collect()
         };
-        for (offset, from, data, mut tried) in expired {
+        for Due {
+            offset,
+            from,
+            data,
+            mut tried,
+            dropped,
+            bulk,
+        } in expired
+        {
             if stalled_long && alive.iter().all(|id| tried.contains(id)) {
                 continue;
             }
-            if self
-                .get_path(from)
-                .is_some_and(|p| p.is_alive() && p.is_write_stalled())
+            let from_path = self.get_path(from);
+            if !dropped
+                && from_path
+                    .as_ref()
+                    .is_some_and(|p| p.is_alive() && p.is_write_stalled())
             {
                 continue;
             }
@@ -695,12 +802,29 @@ impl Session {
                 continue;
             }
             if self.send_data_frame(st.id, offset, data, alt) {
+                let base = match (&from_path, bulk) {
+                    (Some(p), true) => self.retry_after_bulk(p),
+                    _ => Duration::ZERO,
+                };
                 if let Some(u) = st.unacked.lock().unwrap().get_mut(&offset) {
                     self.rehome_unacked(u, alt);
+                    // Bulk backoff: base × 2^(rung−1), rung = paths tried.
+                    let shift = u.tried.len().clamp(1, 5) as u32 - 1;
+                    let backoff = base
+                        .saturating_mul(1u32 << shift)
+                        .min(self.inner.cfg.tuning.down_timeout_ceil);
+                    u.retry_not_before = u.last_sent + backoff;
+                }
+                if dropped {
+                    self.inner
+                        .metrics
+                        .data_dropped_resend
+                        .fetch_add(1, Ordering::Relaxed);
                 }
                 self.note_retry(from, alt);
             } else if let Some(u) = st.unacked.lock().unwrap().get_mut(&offset) {
                 Self::push_tried(&mut u.tried, alt);
+                u.dropped = true;
                 u.retry_not_before = Instant::now() + self.retry_after(from);
             }
         }
@@ -1239,10 +1363,15 @@ impl Session {
             let mut g = st.unacked.lock().unwrap();
             std::mem::take(&mut *g).into_values().collect()
         };
+        let mut freed = false;
         for u in leftover {
             if let Some(p) = self.get_path(u.path_id) {
                 p.sub_inflight(u.data.len() as u64);
+                freed = true;
             }
+        }
+        if freed {
+            self.inner.budget_wait.notify_waiters();
         }
     }
 
@@ -1261,6 +1390,7 @@ impl Session {
         }
         if let Some(p) = self.get_path(from) {
             p.sub_inflight(n);
+            self.inner.budget_wait.notify_waiters();
         }
         if let Some(p) = self.get_path(to) {
             p.add_inflight(n);
@@ -1272,7 +1402,12 @@ impl Session {
         u.path_id = to;
         u.last_sent = Instant::now();
         u.retry_not_before = u.last_sent;
+        u.dropped = false;
         Self::push_tried(&mut u.tried, to);
+        if let Some(p) = self.get_path(to) {
+            u.delivered_at_send = p.delivered.load(Ordering::Relaxed);
+            u.delivered_time_at_send_us = p.delivered_at_us.load(Ordering::Relaxed);
+        }
     }
 
     fn send_data_frame(&self, stream_id: u32, offset: u64, data: Vec<u8>, path_id: u32) -> bool {
@@ -2291,6 +2426,146 @@ mod tests {
         client.shutdown();
     }
 
+    /// Open a stream on `client` and push one bulk-sized piece; returns the
+    /// stream state once the piece sits in `unacked`.
+    async fn one_bulk_piece(client: &Session) -> (crate::stream::TunnelStream, Arc<StreamState>) {
+        let mut tun = client
+            .open_stream(Target {
+                host: "t".into(),
+                port: 1,
+            })
+            .await
+            .unwrap();
+        tun.write_all(&vec![0x42u8; 4000]).await.unwrap();
+        let st = {
+            let g = client.inner.streams.lock().unwrap();
+            g.values().next().unwrap().clone()
+        };
+        let deadline = Instant::now() + Duration::from_millis(200);
+        loop {
+            if !st.unacked.lock().unwrap().is_empty() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "write must leave unacked");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        (tun, st)
+    }
+
+    fn hedges(client: &Session) -> u64 {
+        let s = client.snapshot();
+        s.data_hedge + s.data_retransmit
+    }
+
+    /// P4: a bulk piece on a receive-fresh path is transfer delay, not loss.
+    #[tokio::test]
+    async fn bulk_piece_on_fresh_path_is_not_hedged() {
+        let client = Session::new_client(SessionConfig::default());
+        let _a = inject_live(&client, 1, "akcdn#0", 7);
+        let _b = inject_live(&client, 2, "soy#0", 7);
+        let (tun, st) = one_bulk_piece(&client).await;
+        {
+            let mut u = st.unacked.lock().unwrap();
+            for x in u.values_mut() {
+                x.last_sent = Instant::now() - Duration::from_millis(100);
+            }
+        }
+        let h0 = hedges(&client);
+        client.debug_maintain();
+        assert_eq!(
+            hedges(&client),
+            h0,
+            "fresh path: 100 ms old bulk must stay put"
+        );
+        assert_eq!(st.unacked.lock().unwrap().len(), 1);
+        drop(tun);
+        client.shutdown();
+    }
+
+    /// P4: the same piece moves once the *path* is silent past the loss clock.
+    #[tokio::test]
+    async fn bulk_piece_on_silent_path_is_hedged_with_backoff() {
+        let client = Session::new_client(SessionConfig::default());
+        let (pa, _wa, _ua) = inject_live(&client, 1, "akcdn#0", 7);
+        let (pb, _wb, _ub) = inject_live(&client, 2, "soy#0", 7);
+        let (tun, st) = one_bulk_piece(&client).await;
+        let from = st.unacked.lock().unwrap().values().next().unwrap().path_id;
+        let silent = if from == 1 { &pa } else { &pb };
+        // Past the loss clock (20 ms floor) but short of down_for, so this
+        // is the hedge path, not path_failed's rehome.
+        *silent.last_rx.lock().unwrap() = Instant::now() - Duration::from_millis(100);
+        {
+            let mut u = st.unacked.lock().unwrap();
+            for x in u.values_mut() {
+                x.last_sent = Instant::now() - Duration::from_millis(100);
+            }
+        }
+        let h0 = hedges(&client);
+        client.debug_maintain();
+        assert_eq!(hedges(&client), h0 + 1, "silent path must hedge once");
+        let g = st.unacked.lock().unwrap();
+        let u = g.values().next().unwrap();
+        assert_ne!(u.path_id, from);
+        assert_eq!(u.tried.len(), 2);
+        // Backoff: second rung is 2 × retry_after_bulk(from) ≥ 40 ms.
+        assert!(
+            u.retry_not_before >= u.last_sent + Duration::from_millis(40),
+            "belt must back off: {:?}",
+            u.retry_not_before.saturating_duration_since(u.last_sent)
+        );
+        drop(g);
+        drop(tun);
+        client.shutdown();
+    }
+
+    /// P4: a piece that never reached a writer queue is re-sent at once,
+    /// even though its path looks fresh.
+    #[tokio::test]
+    async fn dropped_piece_is_resent_on_fresh_path() {
+        let client = Session::new_client(SessionConfig::default());
+        let _a = inject_live(&client, 1, "akcdn#0", 7);
+        let _b = inject_live(&client, 2, "soy#0", 7);
+        let (tun, st) = one_bulk_piece(&client).await;
+        let (from, offset) = {
+            let g = st.unacked.lock().unwrap();
+            let (o, u) = g.iter().next().unwrap();
+            (u.path_id, *o)
+        };
+        client.note_data_dropped(st.id, offset);
+        let h0 = hedges(&client);
+        let d0 = client.snapshot().data_dropped_resend;
+        client.debug_maintain();
+        assert_eq!(hedges(&client), h0 + 1);
+        assert_eq!(client.snapshot().data_dropped_resend, d0 + 1);
+        let g = st.unacked.lock().unwrap();
+        let u = g.values().next().unwrap();
+        assert_ne!(u.path_id, from);
+        assert!(!u.dropped, "successful enqueue clears the flag");
+        drop(g);
+        drop(tun);
+        client.shutdown();
+    }
+
+    /// P4: the belt still re-sends a piece a fresh path has silently eaten.
+    #[tokio::test]
+    async fn belt_resends_very_old_piece_on_fresh_path() {
+        let client = Session::new_client(SessionConfig::default());
+        let _a = inject_live(&client, 1, "akcdn#0", 7);
+        let _b = inject_live(&client, 2, "soy#0", 7);
+        let (tun, st) = one_bulk_piece(&client).await;
+        {
+            let mut u = st.unacked.lock().unwrap();
+            for x in u.values_mut() {
+                x.last_sent = Instant::now() - Duration::from_secs(6);
+            }
+        }
+        let h0 = hedges(&client);
+        client.debug_maintain();
+        assert_eq!(hedges(&client), h0 + 1, "belt (≤ 5 s) must fire at 6 s");
+        drop(tun);
+        client.shutdown();
+    }
+
     #[tokio::test]
     async fn close_retry_rehomes_first_closer() {
         let (client, server) = pair_echo(&["akcdn#0", "soy#0"]).await;
@@ -2841,6 +3116,9 @@ mod tests {
                     last_sent: Instant::now(),
                     tried: vec![path_id],
                     retry_not_before: Instant::now(),
+                    dropped: false,
+                    delivered_at_send: 0,
+                    delivered_time_at_send_us: 0,
                 },
             );
         }
@@ -2898,6 +3176,9 @@ mod tests {
                     last_sent: Instant::now(),
                     tried: vec![path_id],
                     retry_not_before: Instant::now(),
+                    dropped: false,
+                    delivered_at_send: 0,
+                    delivered_time_at_send_us: 0,
                 },
             );
         }

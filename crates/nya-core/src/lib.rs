@@ -20,6 +20,7 @@
 #![deny(unsafe_code)]
 
 mod auth;
+mod bw;
 mod catalog;
 mod cfg;
 mod export;

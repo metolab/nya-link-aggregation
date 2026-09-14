@@ -263,11 +263,15 @@ impl Session {
                         last_sent: Instant::now(),
                         tried: vec![path_id],
                         retry_not_before: Instant::now(),
+                        dropped: false,
+                        delivered_at_send: 0,
+                        delivered_time_at_send_us: 0,
                     },
                 );
             }
             if let Some(p) = self.get_path(path_id) {
                 p.add_inflight(n as u64);
+                self.stamp_delivered(&st, offset, &p);
             }
             let frame = Frame::StreamData(StreamData {
                 stream_id: id,
@@ -316,7 +320,9 @@ impl Session {
             if let Some(u) = st.unacked.lock().unwrap().get_mut(&offset) {
                 u.last_sent = now;
                 u.retry_not_before = now;
+                u.dropped = false;
             }
+            self.stamp_delivered(st, offset, &p);
         };
         loop {
             if self.is_dead() || st.reset.load(Ordering::Relaxed) {
@@ -360,9 +366,11 @@ impl Session {
         frame: Frame,
     ) {
         let Some(alt) = self.pick_retry(path_id) else {
+            self.note_data_dropped(st.id, offset);
             return;
         };
         if !self.send_on_path(alt, frame) {
+            self.note_data_dropped(st.id, offset);
             return;
         }
         self.set_sticky(st.id, alt);
@@ -372,10 +380,14 @@ impl Session {
                 u.path_id = alt;
                 u.last_sent = Instant::now();
                 u.retry_not_before = u.last_sent;
+                u.dropped = false;
                 Session::push_tried(&mut u.tried, alt);
             }
         }
         self.xfer_inflight(path_id, alt, n);
+        if let Some(p) = self.get_path(alt) {
+            self.stamp_delivered(st, offset, &p);
+        }
         self.note_migrate("send_blocked");
         debug!(
             stream_id = st.id,
@@ -705,16 +717,19 @@ impl Session {
                 .filter(|(off, u)| **off + u.data.len() as u64 <= ack.acked_offset)
                 .map(|(off, _)| *off)
                 .collect();
+            let mut freed = false;
             for k in drop_keys {
                 if let Some(u) = unacked.remove(&k) {
                     if let Some(p) = self.get_path(u.path_id) {
                         let loaded = p.inflight_bytes();
                         p.sub_inflight(u.data.len() as u64);
+                        freed = true;
+                        let sample = u.last_sent.elapsed();
+                        let t = &self.inner.cfg.tuning;
+                        self.note_ack_clock(&p, &u, sample);
                         // Only small frames (control / interactive). Bulk ACK
                         // elapsed time is transfer delay, not path RTT. Skip
                         // when the sample waited behind bulk inflight.
-                        let sample = u.last_sent.elapsed();
-                        let t = &self.inner.cfg.tuning;
                         let cap = self.rtt_sample_cap(&p);
                         // A lucky-low ACK (fast return path) must not pull a
                         // 60 ms class down into the 7 ms set.
@@ -731,8 +746,52 @@ impl Session {
                     }
                 }
             }
+            drop(unacked);
+            if freed {
+                self.inner.budget_wait.notify_waiters();
+            }
         }
         st.send_wait.notify_waiters();
+    }
+
+    /// P2.2: ACK-clock delivery-rate sample for the path that carried `u`.
+    /// `Δd` = bytes ACKed on the path since this piece went out, `Δt` = time
+    /// since the ACK that preceded its send. Independent of the standing
+    /// queue: a budget-limited path yields `budget/min_rtt` (budget
+    /// doubles), a saturated one yields the bottleneck rate. Only un-hedged
+    /// pieces sample (a hedged copy's clock started on another path).
+    fn note_ack_clock(&self, p: &crate::path::PathState, u: &Unacked, sample: Duration) {
+        let now_us = crate::metrics::mono_us().max(1);
+        let len = u.data.len() as u64;
+        let delivered = p.delivered.fetch_add(len, Ordering::Relaxed) + len;
+        let bulk = len > self.inner.cfg.tuning.interactive_max as u64;
+        if u.tried.len() == 1 {
+            let dd = delivered.saturating_sub(u.delivered_at_send);
+            let dt = if u.delivered_time_at_send_us == 0 {
+                sample.as_micros() as u64
+            } else {
+                now_us.saturating_sub(u.delivered_time_at_send_us)
+            };
+            let min_rtt_us = if p.rtt_known() {
+                p.rtt().as_micros() as u64
+            } else {
+                self.inner.cfg.tuning.unknown_rtt_us
+            };
+            if dd > 0 && dt >= min_rtt_us / 4 && dt > 0 {
+                let rate = (dd as u128 * 1_000_000 / dt as u128).min(u64::MAX as u128) as u64;
+                p.note_bw_sample(rate, now_us);
+            }
+            if bulk {
+                p.record_ack_rtt(sample);
+            }
+        }
+        if bulk {
+            self.inner
+                .metrics
+                .ack_loop_ms
+                .observe(sample.as_millis() as u64);
+        }
+        p.delivered_at_us.store(now_us, Ordering::Relaxed);
     }
 
     pub(super) fn on_peer_close(&self, close: StreamClose) {

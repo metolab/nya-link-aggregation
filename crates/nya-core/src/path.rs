@@ -80,6 +80,18 @@ pub struct PathState {
     bulk_queued: AtomicU64,
     /// `open_stream` hits that actually sent StreamOpen on this dest.
     pub picks: AtomicU64,
+    /// Bytes acknowledged on this path, cumulative (P2 ACK clock).
+    pub delivered: AtomicU64,
+    /// `mono_us` of the last `delivered` advance. 0 = never.
+    pub delivered_at_us: AtomicU64,
+    /// Loaded ACK RTT: EWMA(1/8) of last_sent→ACK for un-hedged bulk pieces
+    /// on this path, µs. 0 = unknown. Drives the P4 bulk hedge clock.
+    pub ack_rtt_us: AtomicU64,
+    /// Windowed max of ACK-clock delivery-rate samples, bytes/s (P2).
+    pub bw_filter: std::sync::Mutex<crate::bw::MinMax3>,
+    /// Send budget bounds, bytes; set by the session at path start.
+    pub budget_floor: AtomicU64,
+    pub budget_ceil: AtomicU64,
     /// Duplicated socket fd for `TCP_INFO` (P6). `None` off Linux, in unit
     /// tests over duplex pipes, and after path IO exit.
     pub tcp_fd: std::sync::Mutex<Option<crate::net::PathFd>>,
@@ -133,12 +145,83 @@ impl PathState {
             urgent_queued: AtomicU64::new(0),
             bulk_queued: AtomicU64::new(0),
             picks: AtomicU64::new(0),
+            delivered: AtomicU64::new(0),
+            delivered_at_us: AtomicU64::new(0),
+            ack_rtt_us: AtomicU64::new(0),
+            bw_filter: std::sync::Mutex::new(crate::bw::MinMax3::new()),
+            budget_floor: AtomicU64::new(crate::tuning::Tuning::STANDARD.inflight_bias),
+            budget_ceil: AtomicU64::new(
+                (crate::tuning::Tuning::STANDARD.chan as u64)
+                    .saturating_mul(nya_proto::MAX_STREAM_PAYLOAD as u64),
+            ),
             tcp_fd: std::sync::Mutex::new(None),
         })
     }
 
     pub fn link(&self) -> &str {
         link_key(&self.name)
+    }
+
+    /// Loaded ACK RTT (bulk piece send→ACK), if sampled.
+    pub fn ack_rtt(&self) -> Option<Duration> {
+        match self.ack_rtt_us.load(Ordering::Relaxed) {
+            0 => None,
+            us => Some(Duration::from_micros(us)),
+        }
+    }
+
+    /// EWMA(1/8) update of the loaded ACK RTT.
+    pub fn record_ack_rtt(&self, sample: Duration) {
+        let s = (sample.as_micros() as u64).max(1);
+        let _ = self
+            .ack_rtt_us
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                Some(if cur == 0 { s } else { (cur * 7 + s) / 8 })
+            });
+    }
+
+    /// Bandwidth filter window: `max(10 × min_rtt, 100 ms)`; unknown RTT
+    /// uses the 20 ms placeholder (200 ms window).
+    pub fn bw_window_us(&self) -> u64 {
+        let rtt_us = if self.rtt_known() {
+            self.rtt().as_micros() as u64
+        } else {
+            crate::tuning::Tuning::STANDARD.unknown_rtt_us
+        };
+        (rtt_us * 10).max(100_000)
+    }
+
+    /// Windowed-max delivery rate on this path, bytes/s. 0 = no fresh sample.
+    pub fn bw_bytes_s(&self) -> u64 {
+        let now = crate::metrics::mono_us();
+        self.bw_filter.lock().unwrap().get(now, self.bw_window_us())
+    }
+
+    pub(crate) fn note_bw_sample(&self, bytes_s: u64, now_us: u64) {
+        let win = self.bw_window_us();
+        self.bw_filter.lock().unwrap().update(bytes_s, now_us, win);
+    }
+
+    /// Per-path send budget (overlay cwnd): `clamp(2 × bw × min_rtt,
+    /// floor, ceil)`; floor when bandwidth or RTT is unknown.
+    pub fn budget_bytes(&self) -> u64 {
+        let floor = self.budget_floor.load(Ordering::Relaxed);
+        let ceil = self.budget_ceil.load(Ordering::Relaxed).max(floor);
+        let bw = self.bw_bytes_s();
+        if bw == 0 || !self.rtt_known() {
+            return floor;
+        }
+        let bdp = bw as f64 * self.rtt().as_secs_f64();
+        let twice = 2.0 * bdp;
+        if !twice.is_finite() {
+            return floor;
+        }
+        (twice as u64).clamp(floor, ceil)
+    }
+
+    /// Budget minus inflight; 0 when at or over budget.
+    pub fn room_bytes(&self) -> u64 {
+        self.budget_bytes().saturating_sub(self.inflight_bytes())
     }
 
     /// Kernel TCP state of this path's socket, if we hold a dup.
@@ -727,9 +810,14 @@ fn hold_stream_data(path: &PathState, frame: &Frame) -> bool {
 
 fn park_stream_data(path: &PathState, session: &Session, frame: Frame) {
     path.note_enqueue(false);
-    if path.writer.try_send(frame).is_err() {
+    if let Err(e) = path.writer.try_send(frame) {
         path.undo_enqueue(false);
         session.note_send_drop();
+        // P4: the piece sits in `unacked` on this path with nothing on the
+        // wire. Flag it so retry does not wait for the path to go silent.
+        if let Frame::StreamData(d) = e.into_inner() {
+            session.note_data_dropped(d.stream_id, d.offset);
+        }
     }
 }
 

@@ -28,6 +28,14 @@ pub struct Unacked {
     pub tried: Vec<u32>,
     /// Rate-limit failed retry attempts without moving last_sent (ACK RTT).
     pub retry_not_before: Instant,
+    /// P4: no frame for this piece reached a writer queue (park drop,
+    /// `send_on_path` false, give-up with no alt). Retry ignores path
+    /// freshness for such pieces; cleared on any successful enqueue.
+    pub dropped: bool,
+    /// P2: `path.delivered` / `path.delivered_at_us` captured at (re)send.
+    /// Bandwidth is sampled only from un-hedged pieces (`tried.len() == 1`).
+    pub delivered_at_send: u64,
+    pub delivered_time_at_send_us: u64,
 }
 
 pub struct StreamState {
