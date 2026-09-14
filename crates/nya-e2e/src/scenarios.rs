@@ -1797,7 +1797,7 @@ pub async fn churn_during_path_flap() -> Result<ScenarioReport> {
     let flapper = tokio::spawn(async move {
         let mut i = 0u32;
         while !stop_f.load(Ordering::Relaxed) {
-            if i % 2 == 0 {
+            if i.is_multiple_of(2) {
                 a.disconnect_conn(0);
             } else {
                 b.disconnect_conn(0);
@@ -1855,6 +1855,83 @@ fn bottleneck_spec(links: &[(&str, u64, u64, u64)], connections: u32) -> Harness
         connections,
         psk: "e2e-psk".into(),
     }
+}
+
+/// `NYA_E2E_TRACE_BULK=1`: 100 ms samples of every path's budget /
+/// bandwidth / ACK loop, every stream's window, and the emulated WAN's cwnd
+/// and delivered rate, on stderr. Off by default.
+fn bulk_tracer(h: &Harness) {
+    if std::env::var_os("NYA_E2E_TRACE_BULK").is_none() {
+        return;
+    }
+    let sess = h.session.clone();
+    let links: Vec<_> = h.links.to_vec();
+    tokio::spawn(async move {
+        let t0 = Instant::now();
+        let mut prev: Vec<(u64, u64)> = links.iter().map(|_| (0, 0)).collect();
+        loop {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let s = sess.snapshot();
+            let ls: Vec<String> = links
+                .iter()
+                .enumerate()
+                .map(|(i, l)| {
+                    let st = l.stats();
+                    let d = (st.bytes_fwd - prev[i].0, st.bytes_rev - prev[i].1);
+                    prev[i] = (st.bytes_fwd, st.bytes_rev);
+                    format!(
+                        "{}:cw={}/{} rtx={} qd={} fwd={}k/s rev={}k/s",
+                        st.name,
+                        st.cwnd_fwd,
+                        st.cwnd_rev,
+                        st.retrans,
+                        st.queue_drops,
+                        d.0 * 10 / 1024,
+                        d.1 * 10 / 1024
+                    )
+                })
+                .collect();
+            let paths: Vec<String> = s
+                .paths
+                .iter()
+                .map(|p| {
+                    format!(
+                        "{}:rtt={} inf={}k bud={}k bw={}k/s loop={}ms",
+                        p.name,
+                        p.rtt_us / 1000,
+                        p.inflight / 1024,
+                        p.budget_bytes / 1024,
+                        p.bw_bytes_s / 1024,
+                        p.ack_rtt_us / 1000
+                    )
+                })
+                .collect();
+            let streams: Vec<String> = sess
+                .all_stream_stats()
+                .iter()
+                .map(|(id, st)| {
+                    format!(
+                        "s{}:cap={}k win={}k wb={} bb={}",
+                        id,
+                        st.recv_cap / 1024,
+                        st.send_window / 1024,
+                        st.window_blocks,
+                        st.budget_blocks
+                    )
+                })
+                .collect();
+            eprintln!(
+                "TRACE t={:.1}s paths=[{}] streams=[{}] wan=[{}] probes={}/{}/{}",
+                t0.elapsed().as_secs_f64(),
+                paths.join(" "),
+                streams.join(" "),
+                ls.join(" "),
+                s.recv_cap_probes,
+                s.recv_cap_probe_kept,
+                s.recv_cap_probe_reverted
+            );
+        }
+    });
 }
 
 /// Per-direction goodput of a full-duplex bulk copy, bytes/s.
@@ -1979,17 +2056,48 @@ fn bulk_report(
             )
         })
         .collect();
+    let paths: Vec<String> = r
+        .snap
+        .paths
+        .iter()
+        .map(|p| {
+            format!(
+                "{}:rtt={}ms bud={}k bw={}k/s ackrtt={}ms del={}k{}",
+                p.name,
+                p.rtt_us / 1000,
+                p.budget_bytes / 1024,
+                p.bw_bytes_s / 1024,
+                p.ack_rtt_us / 1000,
+                p.delivered / 1024,
+                match p.tcp {
+                    Some(t) => format!(
+                        " tcp={}/{}/{}k {}ms rtx={}",
+                        t.cwnd_bytes / 1024,
+                        t.unacked_bytes / 1024,
+                        t.notsent_bytes / 1024,
+                        t.rtt_us / 1000,
+                        t.total_retrans
+                    ),
+                    None => String::new(),
+                }
+            )
+        })
+        .collect();
     r.notes.push(format!(
-        "bulk=copies=[{}] gate={:?} dup_rx={:.1}% hedge_d={} rtx_d={} window_blocks_d={} mig_d={} stall_p50={:?} links=[{}]",
+        "bulk=copies=[{}] gate={:?} dup_rx={:.1}% hedge_d={} rtx_d={} window_blocks_d={} budget_blocks_d={} mig_d={} stall_p50={:?} links=[{}] paths=[{}]",
         lines.join(", "),
         gate,
         dup * 100.0,
         r.snap.data_hedge.saturating_sub(snap0.data_hedge),
         r.snap.data_retransmit.saturating_sub(snap0.data_retransmit),
         r.snap.window_blocks.saturating_sub(snap0.window_blocks),
+        r.snap
+            .send_budget_blocks
+            .saturating_sub(snap0.send_budget_blocks),
         r.snap.migrates.saturating_sub(snap0.migrates),
         nya_core::percentile(&r.snap.stall_ms, nya_core::STALL_MS_BOUNDS, 50.0),
         links.join(" "),
+        paths.join(" "),
     ));
     r
 }
@@ -2000,20 +2108,27 @@ fn rate_gate(nbytes: usize, rate_bps: u64, frac: f64) -> Duration {
     Duration::from_secs_f64(nbytes as f64 / bytes_s)
 }
 
-/// One 50 Mbps / 10 ms link, one TCP: a lone bulk stream must reach ≥ 80 %
+/// One 50 Mbps / 10 ms link, one TCP: a lone bulk stream must reach ≥ 70 %
 /// of the link rate. This is the window-floor-lock row: 128 KiB / loop at
 /// a 2×BDP queue is ~40 % of the rate.
+///
+/// The gate is 70 % rather than 80 % because the emulated TCP is Reno: one
+/// queue overflow halves cwnd and additive increase needs ~0.7 s to win it
+/// back at 10 ms RTT, so a single drop episode costs ~10 % of a 2 s copy.
+/// Kernel CUBIC/BBR recover in a fraction of that; typical runs land at
+/// 85–97 % and the gate exists to catch the floor lock, not Reno's sawtooth.
 pub async fn bulk_bottleneck_single() -> Result<ScenarioReport> {
     const RATE: u64 = 50 * MBIT;
     let h = start(bottleneck_spec(&[("a", 10, RATE, 128 * 1024)], 1)).await?;
     let snap0 = h.session.snapshot();
+    bulk_tracer(&h);
     const N: usize = 12 * 1024 * 1024;
     let o = run_bulk(&h, N, Duration::from_secs(40)).await;
     Ok(bulk_report(
         "bulk_bottleneck_single",
         &h,
         &[o],
-        rate_gate(N, RATE, 0.8),
+        rate_gate(N, RATE, 0.7),
         &snap0,
     ))
 }
@@ -2025,6 +2140,7 @@ pub async fn bulk_shared_two_streams() -> Result<ScenarioReport> {
     let h = start(bottleneck_spec(&[("a", 10, RATE, 128 * 1024)], 1)).await?;
     let snap0 = h.session.snapshot();
     const N: usize = 6 * 1024 * 1024;
+    bulk_tracer(&h);
     let (a, b) = tokio::join!(
         run_bulk(&h, N, Duration::from_secs(40)),
         run_bulk(&h, N, Duration::from_secs(40))
@@ -2064,6 +2180,7 @@ pub async fn bulk_fanout_three_paths() -> Result<ScenarioReport> {
     ))
     .await?;
     let snap0 = h.session.snapshot();
+    bulk_tracer(&h);
     const N: usize = 12 * 1024 * 1024;
     let o = run_bulk(&h, N, Duration::from_secs(60)).await;
     let mut r = bulk_report(
@@ -2077,10 +2194,11 @@ pub async fn bulk_fanout_three_paths() -> Result<ScenarioReport> {
         .snap
         .paths
         .iter()
-        .filter(|p| p.picks > 0 || p.inflight > 0)
-        .map(|p| p.name.clone())
+        .filter(|p| p.delivered > 0)
+        .map(|p| format!("{}:{}MiB", p.name, p.delivered / (1024 * 1024)))
         .collect();
-    r.notes.push(format!("bulk=paths_seen={}", used.join(",")));
+    r.notes
+        .push(format!("bulk=paths_delivered={}", used.join(",")));
     Ok(r)
 }
 
@@ -2091,6 +2209,7 @@ pub async fn ping_under_bulk_bounded() -> Result<ScenarioReport> {
     const RATE: u64 = 20 * MBIT;
     let h = start(bottleneck_spec(&[("a", 10, RATE, 64 * 1024)], 1)).await?;
     let snap0 = h.session.snapshot();
+    bulk_tracer(&h);
     const N: usize = 6 * 1024 * 1024;
     let bulk = {
         let mut tcp = h.connect_socks_echo().await?;
@@ -2135,6 +2254,7 @@ pub async fn hedge_only_on_silence() -> Result<ScenarioReport> {
     ))
     .await?;
     let snap0 = h.session.snapshot();
+    bulk_tracer(&h);
     const N: usize = 10 * 1024 * 1024;
     let copy = {
         let mut tcp = h.connect_socks_echo().await?;
@@ -2202,6 +2322,11 @@ pub async fn hedge_only_on_silence() -> Result<ScenarioReport> {
 pub struct Scenario {
     pub name: &'static str,
     pub long: bool,
+    /// Runs alone: rate-limited WAN scenarios push ~5 k packets/s per link
+    /// direction through 1 ms timers, and a busy runtime turns timer lag
+    /// into a lower emulated link rate — a harness artefact, not overlay
+    /// behaviour. Exclusive scenarios take every job slot.
+    pub exclusive: bool,
     pub run:
         fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ScenarioReport>> + Send>>,
 }
@@ -2211,6 +2336,18 @@ macro_rules! sc {
         Scenario {
             name: $name,
             long: $long,
+            exclusive: false,
+            run: || Box::pin($f),
+        }
+    };
+}
+
+macro_rules! sc_excl {
+    ($name:expr, $f:expr) => {
+        Scenario {
+            name: $name,
+            long: false,
+            exclusive: true,
             run: || Box::pin($f),
         }
     };
@@ -2331,11 +2468,11 @@ pub fn catalog() -> Vec<Scenario> {
         sc!("bulk_plus_ping", false, bulk_plus_ping()),
         sc!("delay_spike_keeps_tcp", false, delay_spike_keeps_tcp()),
         sc!("same_class_mix_warm", false, same_class_mix_warm()),
-        sc!("bulk_bottleneck_single", false, bulk_bottleneck_single()),
-        sc!("bulk_shared_two_streams", false, bulk_shared_two_streams()),
-        sc!("bulk_fanout_three_paths", false, bulk_fanout_three_paths()),
-        sc!("ping_under_bulk_bounded", false, ping_under_bulk_bounded()),
-        sc!("hedge_only_on_silence", false, hedge_only_on_silence()),
+        sc_excl!("bulk_bottleneck_single", bulk_bottleneck_single()),
+        sc_excl!("bulk_shared_two_streams", bulk_shared_two_streams()),
+        sc_excl!("bulk_fanout_three_paths", bulk_fanout_three_paths()),
+        sc_excl!("ping_under_bulk_bounded", ping_under_bulk_bounded()),
+        sc_excl!("hedge_only_on_silence", hedge_only_on_silence()),
     ]
 }
 
@@ -2389,8 +2526,9 @@ async fn run_selected(
     let mut joins = tokio::task::JoinSet::new();
     for (idx, s) in selected.into_iter().enumerate() {
         let sem = sem.clone();
+        let want = if s.exclusive { jobs as u32 } else { 1 };
         joins.spawn(async move {
-            let _permit = sem.acquire_owned().await.expect("semaphore");
+            let _permit = sem.acquire_many_owned(want).await.expect("semaphore");
             info!(name = s.name, "scenario start");
             let r = match (s.run)().await {
                 Ok(r) => r,

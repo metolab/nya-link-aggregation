@@ -1,10 +1,14 @@
 //! Packet WAN between two TCP sockets.
 //!
 //! Bytes are sliced into MSS-sized packets, independently delayed, and
-//! independently dropped. The sender retransmits on RTO (2×SRTT, floor 20ms)
-//! and on loss halves cwnd — the same *shape* of behaviour as kernel TCP
-//! reacting to IP-layer drops. (This host has no CAP_NET_ADMIN, so we cannot
-//! insert `tc netem` in front of Linux TCP.)
+//! independently dropped. Loss recovery has the same *shape* as Linux TCP
+//! reacting to IP-layer drops: the receiver acknowledges every packet it
+//! gets (SACK), a packet with three later packets acknowledged is
+//! retransmitted at once (RACK/FACK), a tail loss is probed at 2×SRTT (TLP),
+//! and RTO = SRTT + 4×RTTVAR with the kernel's 200 ms floor is the backstop.
+//! cwnd is Reno: slow start to `ssthresh`, then +1 MSS per RTT; each loss
+//! episode halves it once. (This host has no CAP_NET_ADMIN, so
+//! we cannot insert `tc netem` in front of Linux TCP.)
 
 use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
@@ -26,6 +30,60 @@ struct Pkt {
     buf: Vec<u8>,
 }
 
+/// A packet on the wire: arrives at the far end at `at`.
+struct Scheduled {
+    at: Instant,
+    pkt: Pkt,
+}
+
+/// One ordered delivery clock per pipe: packets arrive in `at` order, so a
+/// FIFO bottleneck plus constant propagation delay never reorders (only
+/// jitter does). Per-packet timers would reorder every burst inside one
+/// timer tick and make any RACK-style loss detector fire spuriously.
+fn spawn_wire(
+    inner: Arc<ImpairInner>,
+    wire_tx: mpsc::UnboundedSender<Pkt>,
+) -> mpsc::UnboundedSender<Scheduled> {
+    let (tx, mut rx) = mpsc::unbounded_channel::<Scheduled>();
+    tokio::spawn(async move {
+        let mut heap: BTreeMap<(Instant, u64), Pkt> = BTreeMap::new();
+        let mut k: u64 = 0;
+        let mut closed = false;
+        loop {
+            if closed && heap.is_empty() {
+                break;
+            }
+            let next = heap.keys().next().map(|(at, _)| *at);
+            tokio::select! {
+                biased;
+                m = rx.recv(), if !closed => {
+                    match m {
+                        Some(s) => {
+                            heap.insert((s.at, k), s.pkt);
+                            k += 1;
+                        }
+                        None => closed = true,
+                    }
+                }
+                _ = async {
+                    match next {
+                        Some(at) => tokio::time::sleep_until(tokio::time::Instant::from_std(at)).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                }, if next.is_some() => {
+                    if let Some((_, pkt)) = heap.pop_first() {
+                        if wire_tx.send(pkt).is_err() {
+                            break;
+                        }
+                        inner.wake.notify_waiters();
+                    }
+                }
+            }
+        }
+    });
+    tx
+}
+
 pub(crate) async fn wan_pipe<R, W>(
     rd: &mut R,
     wr: &mut W,
@@ -37,7 +95,8 @@ where
     R: AsyncReadExt + Unpin,
     W: AsyncWriteExt + Unpin,
 {
-    let (wire_tx, mut wire_rx) = mpsc::unbounded_channel::<Pkt>();
+    let (wire_pkt_tx, mut wire_rx) = mpsc::unbounded_channel::<Pkt>();
+    let wire_tx = spawn_wire(inner.clone(), wire_pkt_tx);
     let (ack_tx, mut ack_rx) = mpsc::unbounded_channel::<u64>();
 
     let deliver = {
@@ -74,11 +133,9 @@ where
                     }
                     let _ = wr.flush().await;
                 } else if pkt.seq > expected {
+                    // SACK: acknowledge exactly what arrived.
                     reorder.insert(pkt.seq, pkt.buf);
-                    // dup ack for last in-order
-                    if expected > 0 {
-                        let _ = wr_ack.send(expected - 1);
-                    }
+                    let _ = wr_ack.send(pkt.seq);
                 } else {
                     // duplicate
                     let _ = wr_ack.send(pkt.seq);
@@ -91,7 +148,16 @@ where
         let mut inflight: BTreeMap<u64, (Vec<u8>, Instant, u32)> = BTreeMap::new();
         let mut next_seq: u64 = 0;
         let mut cwnd: u32 = INIT_CWND;
+        let mut ssthresh: u32 = u32::MAX;
+        let mut ca_acc: u32 = 0;
         let mut srtt = inner.rtt_us.load(Ordering::Relaxed).max(1);
+        let mut rttvar = srtt / 2;
+        let mut have_sample = false;
+        // Newest sequence a tail-loss probe has been sent for.
+        let mut tlp_done: Option<u64> = None;
+        // Sequence number past which the current loss episode ends; cwnd is
+        // halved once per episode (Linux "recovery point").
+        let mut recovery_end: Option<u64> = None;
         let mut buf = vec![0u8; MSS];
         let mut leftover: Vec<u8> = Vec::new();
 
@@ -99,22 +165,87 @@ where
             if inner.drop_all.load(Ordering::Relaxed) {
                 break;
             }
-            let rto = rto_of(srtt);
-            let next_deadline = inflight.values().map(|(_, t, _)| *t + rto).min();
+            if fwd {
+                inner.cwnd_fwd.store(cwnd as u64, Ordering::Relaxed);
+            } else {
+                inner.cwnd_rev.store(cwnd as u64, Ordering::Relaxed);
+            }
+            let rto = rto_of(srtt, rttvar);
+            let rto_at = inflight.values().map(|(_, t, _)| *t + rto).min();
+            let tlp_at = inflight
+                .iter()
+                .next_back()
+                .filter(|(s, _)| tlp_done != Some(**s))
+                .map(|(_, (_, t, _))| *t + tlp_of(srtt));
+            let next_deadline = match (rto_at, tlp_at) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
 
             tokio::select! {
                 biased;
                 _ = inner.wake.notified() => {}
                 ack = ack_rx.recv() => {
                     let Some(ack) = ack else { break; };
-                    if let Some((_, sent, _)) = inflight.remove(&ack) {
-                        let sample = sent.elapsed().as_micros() as u64;
-                        srtt = if srtt == inner.rtt_us.load(Ordering::Relaxed) {
-                            sample.max(1)
+                    let mut acked_sent: Option<Instant> = None;
+                    if let Some((_, sent, tries)) = inflight.remove(&ack) {
+                        acked_sent = Some(sent);
+                        if tries == 1 {
+                            // Karn: only never-retransmitted packets sample RTT.
+                            let sample = sent.elapsed().as_micros().max(1) as u64;
+                            if !have_sample {
+                                srtt = sample;
+                                rttvar = sample / 2;
+                                have_sample = true;
+                            } else {
+                                rttvar = (rttvar * 3 + srtt.abs_diff(sample)) / 4;
+                                srtt = (srtt * 7 + sample) / 8;
+                            }
+                        }
+                        if cwnd < ssthresh {
+                            cwnd += 1;
                         } else {
-                            (srtt * 7 + sample) / 8
-                        };
-                        cwnd = (cwnd + 1).min(inner.max_cwnd(MSS));
+                            ca_acc += 1;
+                            if ca_acc >= cwnd {
+                                ca_acc = 0;
+                                cwnd += 1;
+                            }
+                        }
+                        cwnd = cwnd.min(inner.max_cwnd(MSS));
+                    }
+                    if recovery_end.is_some_and(|e| ack >= e) {
+                        recovery_end = None;
+                    }
+                    // RACK: a packet sent a reordering window before one
+                    // that has been acknowledged is lost. Time-based, so
+                    // timer-granularity reordering of a burst is tolerated.
+                    let reo_wnd = Duration::from_micros((srtt / 4).max(1_000));
+                    let lost: Vec<u64> = match acked_sent {
+                        Some(t) => inflight
+                            .iter()
+                            .filter(|(_, (_, sent, _))| *sent + reo_wnd < t)
+                            .map(|(s, _)| *s)
+                            .collect(),
+                        None => Vec::new(),
+                    };
+                    if !lost.is_empty() {
+                        if recovery_end.is_none() {
+                            ssthresh = MIN_CWND.max(cwnd / 2);
+                            cwnd = ssthresh;
+                            recovery_end = Some(next_seq);
+                        }
+                        for seq in lost {
+                            if let Some((buf, last, tries)) = inflight.get_mut(&seq) {
+                                // One fast retransmit per packet per RTO.
+                                if last.elapsed() < tlp_of(srtt) {
+                                    continue;
+                                }
+                                *tries += 1;
+                                inner.retrans.fetch_add(1, Ordering::Relaxed);
+                                *last = Instant::now();
+                                transmit(&inner, &conn, seq, buf.clone(), &wire_tx, fwd);
+                            }
+                        }
                     }
                 }
                 _ = async {
@@ -125,24 +256,37 @@ where
                     }
                 }, if next_deadline.is_some() => {
                     let now = Instant::now();
-                    let rto = rto_of(srtt);
+                    let rto = rto_of(srtt, rttvar);
                     let due: Vec<u64> = inflight
                         .iter()
                         .filter(|(_, (_, t, _))| now >= *t + rto)
                         .map(|(s, _)| *s)
                         .collect();
                     if !due.is_empty() {
-                        cwnd = MIN_CWND.max(cwnd / 2);
-                    }
-                    for seq in due {
-                        if let Some((buf, last, tries)) = inflight.get_mut(&seq) {
-                            *tries += 1;
-                            if *tries > 12 {
-                                return Err(std::io::Error::other("wan rto give up"));
+                        // RTO: Linux collapses cwnd to 1 MSS; halving keeps
+                        // the shape without the full restart.
+                        ssthresh = MIN_CWND.max(cwnd / 2);
+                        cwnd = ssthresh;
+                        recovery_end = Some(next_seq);
+                        for seq in due {
+                            if let Some((buf, last, tries)) = inflight.get_mut(&seq) {
+                                *tries += 1;
+                                if *tries > 12 {
+                                    return Err(std::io::Error::other("wan rto give up"));
+                                }
+                                inner.retrans.fetch_add(1, Ordering::Relaxed);
+                                *last = Instant::now();
+                                transmit(&inner, &conn, seq, buf.clone(), &wire_tx, fwd);
                             }
+                        }
+                    } else if let Some((seq, (buf, _, tries))) = inflight.iter_mut().next_back() {
+                        // TLP: re-send the newest packet; its SACK exposes
+                        // any hole before it. Not a loss signal by itself.
+                        if tlp_done != Some(*seq) && now >= tlp_at.unwrap_or(now) {
+                            tlp_done = Some(*seq);
+                            *tries += 1;
                             inner.retrans.fetch_add(1, Ordering::Relaxed);
-                            *last = Instant::now();
-                            transmit(&inner, &conn, seq, buf.clone(), &wire_tx, fwd);
+                            transmit(&inner, &conn, *seq, buf.clone(), &wire_tx, fwd);
                         }
                     }
                 }
@@ -180,9 +324,15 @@ where
     Ok(())
 }
 
-fn rto_of(srtt_us: u64) -> Duration {
-    let us = (srtt_us * 2).clamp(20_000, 1_000_000);
+/// Linux RTO: `SRTT + 4×RTTVAR`, floored at `TCP_RTO_MIN` (200 ms).
+fn rto_of(srtt_us: u64, rttvar_us: u64) -> Duration {
+    let us = (srtt_us + 4 * rttvar_us).clamp(200_000, 1_000_000);
     Duration::from_micros(us)
+}
+
+/// Tail-loss probe: `2×SRTT`, floor 10 ms (Linux `tcp_schedule_loss_probe`).
+fn tlp_of(srtt_us: u64) -> Duration {
+    Duration::from_micros((srtt_us * 2).clamp(10_000, 1_000_000))
 }
 
 fn blocked(inner: &ImpairInner, conn: &ConnCtrl, fwd: bool) -> bool {
@@ -196,7 +346,7 @@ fn transmit(
     conn: &ConnCtrl,
     seq: u64,
     buf: Vec<u8>,
-    wire: &mpsc::UnboundedSender<Pkt>,
+    wire: &mpsc::UnboundedSender<Scheduled>,
     fwd: bool,
 ) {
     if inner.blackhole.load(Ordering::Relaxed) || conn.blackhole.load(Ordering::Relaxed) {
@@ -219,24 +369,10 @@ fn transmit(
         }
     };
     let delay = inner.one_way();
-    let tx = wire.clone();
-    let inner = inner.clone();
-    let n = buf.len() as u64;
-    tokio::spawn(async move {
-        if let Some(at) = depart {
-            tokio::time::sleep_until(tokio::time::Instant::from_std(at)).await;
-            let mut q = if fwd {
-                inner.q_fwd.lock().unwrap()
-            } else {
-                inner.q_rev.lock().unwrap()
-            };
-            q.queued_bytes = q.queued_bytes.saturating_sub(n);
-        }
-        if delay > Duration::ZERO {
-            tokio::time::sleep(delay).await;
-        }
-        let _ = tx.send(Pkt { seq, buf });
-        inner.wake.notify_waiters();
+    let at = depart.unwrap_or_else(Instant::now) + delay;
+    let _ = wire.send(Scheduled {
+        at,
+        pkt: Pkt { seq, buf },
     });
 }
 
@@ -255,12 +391,15 @@ fn bottleneck_depart(inner: &ImpairInner, fwd: bool, n: u64) -> Result<Option<In
     };
     let now = Instant::now();
     let start = q.next_free.filter(|t| *t > now).unwrap_or(now);
-    if qmax != 0 && q.queued_bytes + n > qmax {
+    // Backlog still to be serialised, in bytes.
+    let backlog = (start.saturating_duration_since(now).as_nanos() as u64).saturating_mul(rate)
+        / 8
+        / 1_000_000_000;
+    if qmax != 0 && backlog + n > qmax {
         return Err(());
     }
     let ser = Duration::from_nanos(n.saturating_mul(8).saturating_mul(1_000_000_000) / rate);
     let depart = start + ser;
     q.next_free = Some(depart);
-    q.queued_bytes += n;
     Ok(Some(depart))
 }

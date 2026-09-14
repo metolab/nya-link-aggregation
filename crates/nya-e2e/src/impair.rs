@@ -49,8 +49,9 @@ impl Default for ImpairConfig {
 /// Shared per-direction bottleneck: departure clock + bytes waiting.
 #[derive(Default)]
 pub(crate) struct QueueState {
+    /// When the bottleneck finishes serialising everything queued so far;
+    /// the backlog in bytes is `(next_free - now) × rate`.
     pub next_free: Option<std::time::Instant>,
-    pub queued_bytes: u64,
 }
 
 pub(crate) struct ImpairInner {
@@ -72,6 +73,8 @@ pub(crate) struct ImpairInner {
     /// 0 = unbounded.
     pub queue_bytes: AtomicU64,
     pub queue_drops: AtomicU64,
+    pub cwnd_fwd: AtomicU64,
+    pub cwnd_rev: AtomicU64,
     pub q_fwd: Mutex<QueueState>,
     pub q_rev: Mutex<QueueState>,
     kills: Mutex<Vec<tokio::sync::watch::Sender<bool>>>,
@@ -149,6 +152,9 @@ pub struct LinkStats {
     pub rate_bps: u64,
     /// Tail-drops at the bottleneck queue.
     pub queue_drops: u64,
+    /// Emulated TCP cwnd (packets) of the newest fwd / rev pipe.
+    pub cwnd_fwd: u64,
+    pub cwnd_rev: u64,
 }
 
 impl LinkHandle {
@@ -167,6 +173,8 @@ impl LinkHandle {
             retrans: self.inner.retrans.load(Ordering::Relaxed),
             rate_bps: self.inner.rate_bps.load(Ordering::Relaxed),
             queue_drops: self.inner.queue_drops.load(Ordering::Relaxed),
+            cwnd_fwd: self.inner.cwnd_fwd.load(Ordering::Relaxed),
+            cwnd_rev: self.inner.cwnd_rev.load(Ordering::Relaxed),
         }
     }
 
@@ -337,6 +345,8 @@ pub async fn spawn_link(
         rate_bps: AtomicU64::new(cfg.rate_bps.unwrap_or(0)),
         queue_bytes: AtomicU64::new(cfg.queue_bytes.unwrap_or(0)),
         queue_drops: AtomicU64::new(0),
+        cwnd_fwd: AtomicU64::new(0),
+        cwnd_rev: AtomicU64::new(0),
         q_fwd: Mutex::new(QueueState::default()),
         q_rev: Mutex::new(QueueState::default()),
         kills: Mutex::new(Vec::new()),

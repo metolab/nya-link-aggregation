@@ -298,6 +298,22 @@ pub async fn bulk_stream(tcp: &mut TcpStream, nbytes: usize) -> Result<(Duration
             }
             for (i, b) in buf[..n].iter().enumerate() {
                 if *b != ((off + i) % 251) as u8 {
+                    if intact {
+                        // First corruption: where, and which stream offset the
+                        // received byte actually belongs to (if the pattern
+                        // matches some other position within 251).
+                        let want = ((off + i) % 251) as u8;
+                        let shift = (*b as i64 - want as i64).rem_euclid(251);
+                        tracing::error!(
+                            at = off + i,
+                            want,
+                            got = *b,
+                            shift,
+                            read_len = n,
+                            read_at = off,
+                            "bulk_stream: first corrupt byte"
+                        );
+                    }
                     intact = false;
                 }
             }
