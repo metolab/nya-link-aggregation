@@ -224,7 +224,11 @@ impl Session {
             self.maybe_hol(st);
         }
         let mut stalled = 0u64;
+        for st in bulk.iter() {
+            self.debug_bulk_stream(st);
+        }
         for st in bulk.iter().chain(rest.iter()) {
+            self.debug_zero_window(st);
             self.scan_stall(st);
             if st.stalled.load(Ordering::Relaxed) {
                 stalled += 1;
@@ -388,7 +392,7 @@ impl Session {
         self.retry_expired_unacked(&st);
     }
 
-    fn conn_has_interactive(&self, path_id: u32) -> bool {
+    pub(super) fn conn_has_interactive(&self, path_id: u32) -> bool {
         let now = mono_ms();
         let linger_ms = self.inner.cfg.tuning.close_linger.as_millis() as u64;
         self.inner.streams.lock().unwrap().values().any(|st| {
@@ -647,6 +651,91 @@ impl Session {
             st.stalled.store(false, Ordering::Relaxed);
             st.stall_from_ms.store(0, Ordering::Relaxed);
         }
+    }
+
+    /// Twice a second per bulk stream: the limiter numbers on this side
+    /// (peer window, path budgets, in-flight, blocks), so a slow transfer
+    /// can be attributed from the log of either end.
+    fn debug_bulk_stream(&self, st: &StreamState) {
+        if !tracing::enabled!(tracing::Level::DEBUG) {
+            return;
+        }
+        let now_ms = crate::metrics::mono_ms();
+        let last = st.bulk_logged_ms.load(Ordering::Relaxed);
+        if last != 0 && now_ms.saturating_sub(last) < 500 {
+            return;
+        }
+        st.bulk_logged_ms.store(now_ms.max(1), Ordering::Relaxed);
+        let paths: Vec<String> = self
+            .path_list()
+            .iter()
+            .filter(|p| p.is_alive())
+            .map(|p| {
+                format!(
+                    "{}:bud={}k inf={}k bw={}k/s loop={}ms",
+                    p.name,
+                    p.budget_bytes() / 1024,
+                    p.inflight_bytes() / 1024,
+                    p.bw_bytes_s() / 1024,
+                    p.ack_rtt().map(|d| d.as_millis()).unwrap_or(0)
+                )
+            })
+            .collect();
+        debug!(
+            stream = st.id,
+            client = self.inner.is_client,
+            send_window = st.send_window.load(Ordering::Relaxed),
+            inflight_send = st.inflight_send(),
+            sticky = st.sticky.load(Ordering::Relaxed),
+            window_blocks = st.window_blocks.load(Ordering::Relaxed),
+            budget_blocks = st.budget_blocks.load(Ordering::Relaxed),
+            recv_cap = st.recv_cap.load(Ordering::Relaxed),
+            buffered_in = st.buffered_in.load(Ordering::Relaxed),
+            recv_buffered = st.recv_buffered.load(Ordering::Relaxed),
+            paths = %paths.join(" "),
+            "bulk stream"
+        );
+    }
+
+    /// Once a second while a stream sits on a zero window in either
+    /// direction: the numbers that decide the window, so a stuck transfer
+    /// can be read from the log instead of guessed at.
+    fn debug_zero_window(&self, st: &StreamState) {
+        if !tracing::enabled!(tracing::Level::DEBUG) {
+            return;
+        }
+        let adv = st.advertised_window();
+        let send_window = st.send_window.load(Ordering::Relaxed);
+        if adv != 0 && send_window != 0 {
+            st.stuck_logged_ms.store(0, Ordering::Relaxed);
+            return;
+        }
+        let now_ms = crate::metrics::mono_ms();
+        let last = st.stuck_logged_ms.load(Ordering::Relaxed);
+        if last != 0 && now_ms.saturating_sub(last) < 1000 {
+            return;
+        }
+        st.stuck_logged_ms.store(now_ms.max(1), Ordering::Relaxed);
+        let last_recv_path = st.last_recv_path.load(Ordering::Relaxed);
+        let unacked = st.unacked.lock().unwrap().len();
+        debug!(
+            stream = st.id,
+            client = self.inner.is_client,
+            send_window,
+            send_next = st.send_next.load(Ordering::Relaxed),
+            send_acked = st.send_acked.load(Ordering::Relaxed),
+            unacked,
+            recv_cap = st.recv_cap.load(Ordering::Relaxed),
+            buffered_in = st.buffered_in.load(Ordering::Relaxed),
+            recv_buffered = st.recv_buffered.load(Ordering::Relaxed),
+            recv_next = st.recv_next.load(Ordering::Relaxed),
+            advertised = adv,
+            last_recv_path,
+            last_recv_path_alive = self.get_path(last_recv_path).is_some_and(|p| p.is_alive()),
+            sticky = st.sticky.load(Ordering::Relaxed),
+            ack_dirty = st.ack_dirty.load(Ordering::Relaxed),
+            "zero window"
+        );
     }
 
     fn degrade_for(&self, p: &PathState) -> Duration {

@@ -232,9 +232,29 @@ pub fn visit_metrics(ps: &ProcessSnapshot, sink: &mut impl MetricSink) {
         s.ack_after_fin,
     );
     sink.counter(
+        "nya_recv_cap_probes_total",
+        "P3b receiver window probes started (cap doubled for 4 min_rtt)",
+        s.recv_cap_probes,
+    );
+    sink.counter(
+        "nya_recv_cap_probe_kept_total",
+        "P3b probes kept: delivery rate rose >= 25 %",
+        s.recv_cap_probe_kept,
+    );
+    sink.counter(
+        "nya_recv_cap_probe_reverted_total",
+        "P3b probes reverted: no rate gain, cap fell back",
+        s.recv_cap_probe_reverted,
+    );
+    sink.counter(
         "nya_data_dropped_resend_total",
         "pieces re-sent after the frame never reached a writer queue",
         s.data_dropped_resend,
+    );
+    sink.counter(
+        "nya_data_sacked_total",
+        "pieces released by a SACK range: delivered behind a hole on another path",
+        s.data_sacked,
     );
     sink.counter(
         "nya_picks_unknown_rtt_total",
@@ -602,6 +622,30 @@ pub fn visit_metrics(ps: &ProcessSnapshot, sink: &mut impl MetricSink) {
             "1 if RTT sampled",
             &lab,
             u64::from(pth.rtt_known),
+        );
+        sink.gauge(
+            "nya_path_budget_bytes",
+            "P2 send budget (2 × bw × min_rtt, clamped)",
+            &lab,
+            pth.budget_bytes,
+        );
+        sink.gauge(
+            "nya_path_bw_bytes_s",
+            "ACK-clock delivery rate, windowed max",
+            &lab,
+            pth.bw_bytes_s,
+        );
+        sink.gauge(
+            "nya_path_ack_rtt_us",
+            "loaded bulk send→ACK EWMA",
+            &lab,
+            pth.ack_rtt_us,
+        );
+        sink.counter_labeled(
+            "nya_path_delivered_bytes_total",
+            "payload bytes ACKed on this path",
+            &lab,
+            pth.delivered,
         );
         // Kernel TCP view (P6). Zero when the platform cannot answer.
         let t = pth.tcp.unwrap_or_default();

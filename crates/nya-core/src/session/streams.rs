@@ -185,6 +185,16 @@ impl Session {
                         .metrics
                         .window_blocks
                         .fetch_add(1, Ordering::Relaxed);
+                    st.window_blocks.fetch_add(1, Ordering::Relaxed);
+                    // P3b evidence: the peer's window, not our paths, is
+                    // the limiter right now.
+                    if crate::scheduler::any_bulk_room(&self.path_list()) {
+                        self.inner
+                            .metrics
+                            .send_window_limited_with_room
+                            .fetch_add(1, Ordering::Relaxed);
+                        st.window_limited_with_room.fetch_add(1, Ordering::Relaxed);
+                    }
                     window_waited = true;
                 }
                 if self.is_dead() || st.reset.load(Ordering::Relaxed) {
@@ -211,13 +221,36 @@ impl Session {
             } else {
                 PickPref::Interactive
             };
+            let mut budget_waited = false;
+            let parked_at = Instant::now();
+            // Overflow pieces ride a sibling without moving sticky (KD6).
+            let mut overflow = false;
             let mut path_id = loop {
+                // Arm the budget wake before looking, so an ACK that lands
+                // between the room check and the await is not lost.
+                let budget_wake = self.inner.budget_wait.notified();
+                tokio::pin!(budget_wake);
+                budget_wake.as_mut().enable();
+                let sticky = st.sticky.load(Ordering::Relaxed);
                 let picked = if pref == PickPref::Interactive {
-                    self.interactive_affinity(st.sticky.load(Ordering::Relaxed))
+                    self.interactive_affinity(sticky)
                         .or_else(|| self.pick_pref(pref))
                 } else {
-                    self.bulk_affinity(st.sticky.load(Ordering::Relaxed))
-                        .or_else(|| self.pick_pref(pref))
+                    overflow = false;
+                    self.bulk_affinity(sticky)
+                        .filter(|id| self.get_path(*id).is_some_and(|p| p.room_bytes() >= 1))
+                        .or_else(|| {
+                            let alt = self.bulk_overflow_pick(sticky);
+                            overflow = alt.is_some();
+                            alt
+                        })
+                        .or_else(|| {
+                            if crate::scheduler::any_bulk_room(&self.path_list()) {
+                                self.pick_pref(pref)
+                            } else {
+                                None
+                            }
+                        })
                 };
                 if let Some(p) = picked {
                     break p;
@@ -225,13 +258,28 @@ impl Session {
                 if self.is_dead() || st.reset.load(Ordering::Relaxed) {
                     return Err(SessionError::Reset);
                 }
-                tokio::select! {
-                    _ = self.inner.ready.notified() => {}
-                    _ = tokio::time::sleep(self.inner.cfg.all_down_timeout) => {
-                        if !self.has_alive_path() {
-                            return Err(SessionError::NoPath);
+                if pref == PickPref::Any && !budget_waited && self.has_alive_path() {
+                    self.inner
+                        .metrics
+                        .send_budget_blocks
+                        .fetch_add(1, Ordering::Relaxed);
+                    st.budget_blocks.fetch_add(1, Ordering::Relaxed);
+                    budget_waited = true;
+                    for p in self.path_list() {
+                        if p.is_alive() && p.room_bytes() == 0 {
+                            p.note_budget_limited();
                         }
                     }
+                }
+                if parked_at.elapsed() >= self.inner.cfg.all_down_timeout && !self.has_alive_path()
+                {
+                    return Err(SessionError::NoPath);
+                }
+                tokio::select! {
+                    _ = self.inner.ready.notified() => {}
+                    _ = &mut budget_wake => {}
+                    _ = st.send_wait.notified() => {}
+                    _ = tokio::time::sleep(self.inner.cfg.all_down_timeout) => {}
                 }
             };
             let becoming_bulk =
@@ -246,13 +294,17 @@ impl Session {
                         "hol"
                     );
                     path_id = dest;
+                    overflow = false;
                     self.inner
                         .metrics
                         .hol_rebalances
                         .fetch_add(1, Ordering::Relaxed);
                 }
             }
-            self.set_sticky(id, path_id);
+            if !overflow {
+                self.set_sticky(id, path_id);
+            }
+            st.note_path_used(path_id);
             {
                 let mut unacked = st.unacked.lock().unwrap();
                 unacked.insert(
@@ -266,6 +318,8 @@ impl Session {
                         dropped: false,
                         delivered_at_send: 0,
                         delivered_time_at_send_us: 0,
+                        sent_us: 0,
+                        first_tx_at_send_us: 0,
                     },
                 );
             }
@@ -486,7 +540,12 @@ impl Session {
                 Err(actual) => cur = actual,
             }
         }
-        self.send_ack(&st, st.last_recv_path.load(Ordering::Relaxed));
+        // The app freed a channel slot: hand over whatever in-order data
+        // `drain_recv` left in `recv_buf` when the channel was full. Arrival
+        // is the only other drain trigger, and the tail of a transfer (or a
+        // sender that is waiting on our window) brings no arrival. This
+        // also sends the window update.
+        self.drain_recv(&st, st.last_recv_path.load(Ordering::Relaxed));
     }
 
     pub(super) fn on_data(&self, path_id: u32, data: StreamData) {
@@ -518,6 +577,7 @@ impl Session {
                 .metrics
                 .data_dup_rx_bytes
                 .fetch_add(len, Ordering::Relaxed);
+            st.dup_rx_bytes.fetch_add(len, Ordering::Relaxed);
             self.inner
                 .metrics
                 .ack_after_fin
@@ -533,6 +593,7 @@ impl Session {
                 .metrics
                 .data_dup_rx_bytes
                 .fetch_add(len, Ordering::Relaxed);
+            st.dup_rx_bytes.fetch_add(len, Ordering::Relaxed);
             self.send_ack(&st, path_id);
             return;
         }
@@ -543,6 +604,7 @@ impl Session {
                 .metrics
                 .data_dup_rx_bytes
                 .fetch_add(old_len, Ordering::Relaxed);
+            st.dup_rx_bytes.fetch_add(old_len, Ordering::Relaxed);
             let _ = st
                 .recv_buffered
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
@@ -551,44 +613,62 @@ impl Session {
         }
         st.recv_buffered.fetch_add(new_len, Ordering::Relaxed);
         drop(buf);
+        if data.offset > st.recv_next.load(Ordering::Relaxed) {
+            st.last_hole_arrival.store(data.offset, Ordering::Relaxed);
+        }
+        // P3b: did this piece end on an edge we advertised (sender was
+        // window-limited)?
+        let rate = st.deliver_rate_ewma.load(Ordering::Relaxed);
+        let min_rtt = self.bdp_rtt(&st).unwrap_or(Duration::ZERO);
+        let tol = (nya_proto::MAX_STREAM_PAYLOAD as u64)
+            .max((rate as f64 * min_rtt.as_secs_f64() / 8.0) as u64);
+        st.note_arrival(data.offset + new_len, tol);
         self.drain_recv(&st, path_id);
     }
 
+    /// Hand in-order chunks to the application. The whole step — take the
+    /// chunk at `recv_next`, `try_send`, advance — runs under the
+    /// `recv_buf` lock: DATA for one stream arrives on several path reader
+    /// tasks at once, and releasing the lock between "advance `recv_next`"
+    /// and "the channel was full, rewind" let a second drain deliver the
+    /// *following* chunk first — out-of-order bytes to the app. `try_send`
+    /// never blocks, so holding the lock across it is safe.
     fn drain_recv(&self, st: &StreamState, ack_path: u32) {
         let mut delivered = 0u64;
-        loop {
+        {
             let mut buf = st.recv_buf.lock().unwrap();
-            let next = st.recv_next.load(Ordering::Relaxed);
-            let Some(chunk) = buf.remove(&next) else {
-                break;
-            };
-            let len = chunk.len() as u64;
-            let _ = st
-                .recv_buffered
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                    Some(v.saturating_sub(len))
-                });
-            st.recv_next.store(next + len, Ordering::Relaxed);
-            st.buffered_in.fetch_add(len, Ordering::Relaxed);
-            drop(buf);
-            if st
-                .inbound_tx
-                .try_send(Inbound::Data(Bytes::from(chunk.clone())))
-                .is_err()
-            {
-                st.recv_next.store(next, Ordering::Relaxed);
-                st.buffered_in.fetch_sub(len, Ordering::Relaxed);
-                st.recv_buf.lock().unwrap().insert(next, chunk);
-                st.recv_buffered.fetch_add(len, Ordering::Relaxed);
-                break;
+            loop {
+                let next = st.recv_next.load(Ordering::Relaxed);
+                let Some(chunk) = buf.remove(&next) else {
+                    break;
+                };
+                let len = chunk.len() as u64;
+                match st.inbound_tx.try_send(Inbound::Data(Bytes::from(chunk))) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        let chunk = match e.into_inner() {
+                            Inbound::Data(b) => b.to_vec(),
+                            _ => unreachable!("drain_recv only sends Data"),
+                        };
+                        buf.insert(next, chunk);
+                        break;
+                    }
+                }
+                let _ = st
+                    .recv_buffered
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                        Some(v.saturating_sub(len))
+                    });
+                st.recv_next.store(next + len, Ordering::Relaxed);
+                st.buffered_in.fetch_add(len, Ordering::Relaxed);
+                delivered += len;
+                st.last_recv_ms
+                    .store(crate::metrics::mono_ms().max(1), Ordering::Relaxed);
             }
-            delivered += len;
-            st.last_recv_ms
-                .store(crate::metrics::mono_ms().max(1), Ordering::Relaxed);
         }
         if delivered > 0 {
-            st.note_deliver(delivered, self.deliver_min_dt(st));
-            self.tune_recv_cap(st);
+            let sampled = st.note_deliver(delivered, self.deliver_min_dt(st));
+            self.tune_recv_cap_sampled(st, sampled);
         }
         self.send_ack(st, ack_path);
         self.try_finish_recv_close(st);
@@ -609,8 +689,98 @@ impl Session {
     }
 
     fn tune_recv_cap(&self, st: &StreamState) {
-        st.recv_cap
-            .store(self.recv_cap_target(st), Ordering::Relaxed);
+        self.tune_recv_cap_sampled(st, false);
+    }
+
+    /// Receiver window: the BDP formula (`2 · rate · rtt`) as the base, and
+    /// the P3b probe controller on top. The formula alone is a fixed point
+    /// at the floor whenever the ACK loop carries more than one RTT of
+    /// queueing (`W' = W · 2R/L`), and the kernel TCP under us builds that
+    /// queue on its own; so when the sender is provably window-limited
+    /// (DATA keeps ending on our advertised edge) and the app keeps up, the
+    /// cap is doubled for `4 · min_rtt`. The probe's own delivery rate is
+    /// then compared with the rate before it: it is kept unless delivery
+    /// got *worse* (≥ 10 % down) or the app fell behind — with per-path
+    /// send budgets (P2) bounding what is on the wire, a larger window
+    /// costs memory, not queue, and shrinking it under a sender that has
+    /// filled it collapses the advertised window to zero. A kept cap is
+    /// held while the rate stays within half of what earned it. `sampled`
+    /// = a new rate sample closed this call; decisions happen only then.
+    fn tune_recv_cap_sampled(&self, st: &StreamState, sampled: bool) {
+        let base = self.recv_cap_target(st);
+        let floor = st.initial_window;
+        let ceil = floor.saturating_mul(self.inner.cfg.tuning.chan as u32);
+        let cur = st.recv_cap.load(Ordering::Relaxed).clamp(floor, ceil);
+        let rate = st.deliver_rate_ewma.load(Ordering::Relaxed);
+        let app = st.buffered_in.load(Ordering::Relaxed) + st.recv_buffered.load(Ordering::Relaxed)
+            > u64::from(cur) / 2;
+        let mut c = st.win_ctl.lock().unwrap();
+        let held = |c: &crate::stream::WinCtl| {
+            if rate.saturating_mul(2) >= c.hold_rate && !app {
+                c.hold_cap
+            } else {
+                0
+            }
+        };
+        let mut cap = cur;
+        if sampled {
+            let now = Instant::now();
+            let min_rtt = self
+                .bdp_rtt(st)
+                .unwrap_or(Duration::from_micros(self.inner.cfg.tuning.unknown_rtt_us));
+            let wl = st.edge_hits.swap(0, Ordering::Relaxed) > 0;
+            if app {
+                c.hold_cap = 0;
+                c.hold_rate = 0;
+            }
+            match c.probing {
+                Some((cap0, rate0, since, next0)) => {
+                    let el = now.saturating_duration_since(since);
+                    if el >= min_rtt * 4 {
+                        let got = st.recv_next.load(Ordering::Relaxed).saturating_sub(next0);
+                        let probe_rate = (got as f64 / el.as_secs_f64()) as u64;
+                        let worse = probe_rate.saturating_mul(10) < rate0.saturating_mul(9);
+                        if worse || app {
+                            cap = cap0.max(base);
+                            self.inner
+                                .metrics
+                                .recv_cap_probe_reverted
+                                .fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            c.hold_cap = cur;
+                            c.hold_rate = probe_rate.max(rate);
+                            self.inner
+                                .metrics
+                                .recv_cap_probe_kept
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                        c.probing = None;
+                        c.last_probe_end = Some(now);
+                    }
+                }
+                None => {
+                    let cooled = c
+                        .last_probe_end
+                        .is_none_or(|t| now.saturating_duration_since(t) >= min_rtt * 8);
+                    if wl && !app && cooled && cur < ceil && rate > 0 {
+                        c.probing = Some((cur, rate, now, st.recv_next.load(Ordering::Relaxed)));
+                        cap = cur.saturating_mul(2).min(ceil);
+                        self.inner
+                            .metrics
+                            .recv_cap_probes
+                            .fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        cap = base.max(held(&c));
+                    }
+                }
+            }
+        } else if c.probing.is_none() {
+            cap = base.max(held(&c));
+        }
+        drop(c);
+        let cap = cap.clamp(floor, ceil);
+        st.recv_cap.store(cap, Ordering::Relaxed);
+        st.recv_cap_max.fetch_max(cap, Ordering::Relaxed);
     }
 
     fn recv_cap_target(&self, st: &StreamState) -> u32 {
@@ -642,12 +812,19 @@ impl Session {
             .unwrap_or(self.inner.cfg.tuning.maintain_interval)
     }
 
-    /// Sticky fast EWMA if that dest is alive and known; else pool min.
-    /// Unknown 20 ms is not an RTT — do not grow.
+    /// RTT of the loop this stream's DATA actually rides (P3a): the last
+    /// arrival path first (a download receiver's sticky is only its request
+    /// path), then sticky, then the pool min. Unknown 20 ms is not an RTT —
+    /// do not grow.
     fn bdp_rtt(&self, st: &StreamState) -> Option<Duration> {
-        let sticky = st.sticky.load(Ordering::Relaxed);
-        if sticky != 0 {
-            if let Some(p) = self.get_path(sticky) {
+        for id in [
+            st.last_recv_path.load(Ordering::Relaxed),
+            st.sticky.load(Ordering::Relaxed),
+        ] {
+            if id == 0 {
+                continue;
+            }
+            if let Some(p) = self.get_path(id) {
                 if p.is_alive() && p.rtt_known() {
                     return Some(p.rtt());
                 }
@@ -661,7 +838,13 @@ impl Session {
             stream_id: st.id,
             acked_offset: st.recv_next.load(Ordering::Relaxed),
             window: st.advertised_window(),
+            sack: st.sack_ranges(),
         };
+        // P3b: the sender may run up to exactly this edge.
+        let min_rtt = self
+            .bdp_rtt(st)
+            .unwrap_or(Duration::from_micros(self.inner.cfg.tuning.unknown_rtt_us));
+        st.note_ack_edge(ack.acked_offset + u64::from(ack.window), min_rtt);
         if self.store_ack(st, path_id, &ack) {
             return;
         }
@@ -707,6 +890,7 @@ impl Session {
         st.send_window.store(ack.window, Ordering::Relaxed);
         self.forget_open(ack.stream_id);
         let prev = st.send_acked.load(Ordering::Relaxed);
+        let mut freed = false;
         if ack.acked_offset > prev {
             st.send_acked.store(ack.acked_offset, Ordering::Relaxed);
             st.last_ack_ms
@@ -717,41 +901,76 @@ impl Session {
                 .filter(|(off, u)| **off + u.data.len() as u64 <= ack.acked_offset)
                 .map(|(off, _)| *off)
                 .collect();
-            let mut freed = false;
             for k in drop_keys {
                 if let Some(u) = unacked.remove(&k) {
-                    if let Some(p) = self.get_path(u.path_id) {
-                        let loaded = p.inflight_bytes();
-                        p.sub_inflight(u.data.len() as u64);
-                        freed = true;
-                        let sample = u.last_sent.elapsed();
-                        let t = &self.inner.cfg.tuning;
-                        self.note_ack_clock(&p, &u, sample);
-                        // Only small frames (control / interactive). Bulk ACK
-                        // elapsed time is transfer delay, not path RTT. Skip
-                        // when the sample waited behind bulk inflight.
-                        let cap = self.rtt_sample_cap(&p);
-                        // A lucky-low ACK (fast return path) must not pull a
-                        // 60 ms class down into the 7 ms set.
-                        let not_lucky_low = !p.class_known() || sample * 2 >= p.class_rtt();
-                        if u.data.len() <= t.interactive_max
-                            && sample > t.ack_rtt_min
-                            && sample < t.ack_rtt_max
-                            && sample <= cap
-                            && not_lucky_low
-                            && loaded < t.inflight_bias
-                        {
-                            p.record_rtt(sample);
-                        }
-                    }
+                    freed |= self.release_piece(&u);
                 }
             }
-            drop(unacked);
-            if freed {
-                self.inner.budget_wait.notify_waiters();
+        }
+        // SACK: pieces the receiver holds behind a hole. Delivered, so they
+        // must not be hedged again; the path that carried them gets its
+        // ACK-clock and inflight credit now, not when the hole fills.
+        if !ack.sack.is_empty() {
+            let mut unacked = st.unacked.lock().unwrap();
+            let drop_keys: Vec<u64> = unacked
+                .iter()
+                .filter(|(off, u)| {
+                    let end = **off + u.data.len() as u64;
+                    ack.sack.iter().any(|(a, b)| *a <= **off && end <= *b)
+                })
+                .map(|(off, _)| *off)
+                .collect();
+            let n = drop_keys.len() as u64;
+            for k in drop_keys {
+                if let Some(u) = unacked.remove(&k) {
+                    freed |= self.release_piece(&u);
+                }
+            }
+            if n > 0 {
+                st.last_sack_ms
+                    .store(crate::metrics::mono_ms().max(1), Ordering::Relaxed);
+                st.sacked.fetch_add(n, Ordering::Relaxed);
+                self.inner
+                    .metrics
+                    .data_sacked
+                    .fetch_add(n, Ordering::Relaxed);
             }
         }
+        if freed {
+            self.inner.budget_wait.notify_waiters();
+        }
         st.send_wait.notify_waiters();
+    }
+
+    /// Accounting for one acknowledged piece: path inflight, ACK-clock
+    /// sample, and (small frames only) an RTT sample. `true` when a path
+    /// got inflight back.
+    fn release_piece(&self, u: &Unacked) -> bool {
+        let Some(p) = self.get_path(u.path_id) else {
+            return false;
+        };
+        let loaded = p.inflight_bytes();
+        p.sub_inflight(u.data.len() as u64);
+        let sample = u.last_sent.elapsed();
+        let t = &self.inner.cfg.tuning;
+        self.note_ack_clock(&p, u, sample);
+        // Only small frames (control / interactive). Bulk ACK elapsed time
+        // is transfer delay, not path RTT. Skip when the sample waited
+        // behind bulk inflight.
+        let cap = self.rtt_sample_cap(&p);
+        // A lucky-low ACK (fast return path) must not pull a 60 ms class
+        // down into the 7 ms set.
+        let not_lucky_low = !p.class_known() || sample * 2 >= p.class_rtt();
+        if u.data.len() <= t.interactive_max
+            && sample > t.ack_rtt_min
+            && sample < t.ack_rtt_max
+            && sample <= cap
+            && not_lucky_low
+            && loaded < t.inflight_bias
+        {
+            p.record_rtt(sample);
+        }
+        true
     }
 
     /// P2.2: ACK-clock delivery-rate sample for the path that carried `u`.
@@ -767,22 +986,31 @@ impl Session {
         let bulk = len > self.inner.cfg.tuning.interactive_max as u64;
         if u.tried.len() == 1 {
             let dd = delivered.saturating_sub(u.delivered_at_send);
-            let dt = if u.delivered_time_at_send_us == 0 {
+            let ack_us = if u.delivered_time_at_send_us == 0 {
                 sample.as_micros() as u64
             } else {
                 now_us.saturating_sub(u.delivered_time_at_send_us)
             };
-            let min_rtt_us = if p.rtt_known() {
-                p.rtt().as_micros() as u64
-            } else {
-                self.inner.cfg.tuning.unknown_rtt_us
-            };
+            // BBR: the sample interval is the longer of the send-side and
+            // ACK-side clocks, so a burst of coalesced ACKs cannot read as
+            // a rate the sender never achieved.
+            let snd_us = u.sent_us.saturating_sub(u.first_tx_at_send_us);
+            let dt = ack_us.max(snd_us);
+            let min_rtt_us = p
+                .min_rtt()
+                .map(|d| d.as_micros() as u64)
+                .unwrap_or(self.inner.cfg.tuning.unknown_rtt_us);
             if dd > 0 && dt >= min_rtt_us / 4 && dt > 0 {
                 let rate = (dd as u128 * 1_000_000 / dt as u128).min(u64::MAX as u128) as u64;
                 p.note_bw_sample(rate, now_us);
             }
+            p.note_loop_rtt(sample);
             if bulk {
                 p.record_ack_rtt(sample);
+            }
+            // Newest delivered piece moves the send-side clock forward.
+            if u.sent_us > p.first_tx_us.load(Ordering::Relaxed) {
+                p.first_tx_us.store(u.sent_us, Ordering::Relaxed);
             }
         }
         if bulk {

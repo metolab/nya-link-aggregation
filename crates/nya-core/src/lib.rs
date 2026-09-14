@@ -59,7 +59,7 @@ pub use metrics::{
 };
 pub use net::{parse_tcp_info, tune_path_socket, PathFd, SocketTuning, TcpInfo};
 pub use session::{IncomingStream, Session, SessionError, SessionTable};
-pub use stream::TunnelStream;
+pub use stream::{StreamStats, TunnelStream};
 pub use tls::{
     client_tls_config, connect_pinned, export_from_client, export_from_server,
     export_keying_material, install_crypto, load_server_config, parse_pin_hex, spki_sha256,

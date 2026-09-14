@@ -25,9 +25,12 @@ impl MinMax3 {
         }
     }
 
-    /// Current windowed max, or 0 when no sample is younger than `win_us`.
+    /// Current windowed max, or 0 when no sample is younger than `win_us`
+    /// (slot 2 always holds the newest sample). An old max is still the
+    /// answer while younger samples exist: sliding it out is `update`'s
+    /// job, exactly as in BBR's `minmax_get`.
     pub fn get(&self, now_us: u64, win_us: u64) -> u64 {
-        if self.s[0].t == 0 || now_us.saturating_sub(self.s[0].t) > win_us {
+        if self.s[0].t == 0 || now_us.saturating_sub(self.s[2].t) > win_us {
             return 0;
         }
         self.s[0].v
@@ -80,11 +83,57 @@ impl MinMax3 {
     }
 }
 
+/// Windowed minimum built on [`MinMax3`] by storing `u64::MAX - v`.
+#[derive(Clone, Debug, Default)]
+pub struct WindowedMin(MinMax3);
+
+impl WindowedMin {
+    pub const fn new() -> Self {
+        Self(MinMax3::new())
+    }
+
+    /// Current windowed min, or `None` when no sample is younger than `win_us`.
+    pub fn get(&self, now_us: u64, win_us: u64) -> Option<u64> {
+        if self.0.s[0].t == 0 || now_us.saturating_sub(self.0.s[2].t) > win_us {
+            return None;
+        }
+        Some(u64::MAX - self.0.s[0].v)
+    }
+
+    pub fn update(&mut self, v: u64, t_us: u64, win_us: u64) -> u64 {
+        u64::MAX - self.0.update(u64::MAX - v, t_us, win_us)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const WIN: u64 = 1_000_000;
+
+    #[test]
+    fn windowed_min_tracks_low_and_expires() {
+        let mut m = WindowedMin::new();
+        assert_eq!(m.get(1, WIN), None);
+        m.update(30_000, 1, WIN);
+        m.update(10_000, 100_000, WIN);
+        assert_eq!(m.get(300_000, WIN), Some(10_000));
+        // Queueing-inflated samples never raise a fresh min.
+        for i in 0..20u64 {
+            m.update(50_000, 300_000 + i * 10_000, WIN);
+        }
+        assert_eq!(m.get(500_000, WIN), Some(10_000));
+        // Once the 10 ms sample ages out, a younger candidate takes over
+        // (BBR minmax semantics: the best challenger seen after the quarter
+        // window, not a rescan).
+        let r = m.update(45_000, 1_200_000, WIN);
+        assert!(r > 10_000 && r <= 50_000, "{r}");
+        assert_eq!(m.get(1_200_000, WIN), Some(r));
+        // A lower sample is adopted immediately.
+        assert_eq!(m.update(12_000, 1_300_000, WIN), 12_000);
+        // Silence past the window: nothing fresh.
+        assert_eq!(m.get(2_400_000, WIN), None);
+    }
 
     #[test]
     fn empty_is_zero() {

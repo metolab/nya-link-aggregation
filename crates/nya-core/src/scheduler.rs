@@ -255,6 +255,51 @@ fn path_score(p: &PathState, cfg: &SessionConfig, pref: PickPref) -> (u64, bool)
     (score, p.rtt_known())
 }
 
+/// P2 fan-out: a same-class dest with at least one frame of budget room
+/// for a bulk stream whose sticky is at budget. `has_interactive(id)` keeps
+/// bulk off a TCP that carries an interactive stream unless nothing else
+/// has room (HOL; `maybe_hol` rebalances on the next tick). Sticky is not
+/// changed by the caller — overflow pieces do not restick (KD6).
+pub(crate) fn bulk_overflow_pick(
+    paths: &[Arc<PathState>],
+    cfg: &SessionConfig,
+    sticky: u32,
+    has_interactive: impl Fn(u32) -> bool,
+) -> Option<u32> {
+    let set = fastest_class_set(paths, cfg);
+    let room: Vec<&Arc<PathState>> = set
+        .into_iter()
+        .filter(|p| {
+            p.id != sticky
+                && p.is_schedulable()
+                && is_loss_fresh(cfg, p)
+                && p.room_bytes() >= nya_proto::MAX_STREAM_PAYLOAD as u64
+        })
+        .collect();
+    if room.is_empty() {
+        return None;
+    }
+    let quiet: Vec<&Arc<PathState>> = room
+        .iter()
+        .copied()
+        .filter(|p| !has_interactive(p.id))
+        .collect();
+    let cands = if quiet.is_empty() { room } else { quiet };
+    pick_from_scored(&cands, cfg, PickPref::Any)
+}
+
+/// P2: does any schedulable dest have budget room? When false a bulk
+/// sender parks on `budget_wait` instead of pushing past every path's
+/// budget. Freshness is deliberately not required: a lone silent path with
+/// room still takes the legacy pick (its own loss clock decides), and a
+/// parked sender is only woken by ACKs, which a silent empty path never
+/// produces.
+pub(crate) fn any_bulk_room(paths: &[Arc<PathState>]) -> bool {
+    paths
+        .iter()
+        .any(|p| p.is_schedulable() && p.room_bytes() >= 1)
+}
+
 /// Per-path input to [`health::loss_timeout`] for pick freshness.
 /// `min(fast, class)` so a poisoned fast EWMA cannot hide a silent path
 /// while class is still the healthy one. Slow-only freeze (class 7 ms,

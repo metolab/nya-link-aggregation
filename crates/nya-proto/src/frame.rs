@@ -139,7 +139,16 @@ pub struct StreamAck {
     pub stream_id: u32,
     pub acked_offset: u64,
     pub window: u32,
+    /// Selective acknowledgement: `[start, end)` byte ranges buffered past
+    /// `acked_offset`. Optional trailing field (`u8` count, then pairs of
+    /// `u64`); old peers ignore the suffix, and old senders leave it empty.
+    /// Without it a hole on one path leaves every delivered piece behind
+    /// it "unacked" on the other paths, and hedging them is pure duplicate.
+    pub sack: Vec<(u64, u64)>,
 }
+
+/// Most SACK ranges one ACK carries (146-byte frame).
+pub const MAX_SACK_RANGES: usize = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamClose {
@@ -239,6 +248,14 @@ impl Frame {
                 o.extend_from_slice(&s.stream_id.to_be_bytes());
                 o.extend_from_slice(&s.acked_offset.to_be_bytes());
                 o.extend_from_slice(&s.window.to_be_bytes());
+                if !s.sack.is_empty() {
+                    let n = s.sack.len().min(MAX_SACK_RANGES);
+                    o.push(n as u8);
+                    for (a, b) in &s.sack[..n] {
+                        o.extend_from_slice(&a.to_be_bytes());
+                        o.extend_from_slice(&b.to_be_bytes());
+                    }
+                }
             }
             Frame::StreamClose(s) => {
                 o.push(T_CLOSE);
@@ -330,11 +347,26 @@ impl Frame {
                     data,
                 })
             }
-            T_ACK => Frame::StreamAck(StreamAck {
-                stream_id: p.u32()?,
-                acked_offset: p.u64()?,
-                window: p.u32()?,
-            }),
+            T_ACK => {
+                let stream_id = p.u32()?;
+                let acked_offset = p.u64()?;
+                let window = p.u32()?;
+                let mut sack = Vec::new();
+                if !p.rest().is_empty() {
+                    let n = usize::from(p.u8()?).min(MAX_SACK_RANGES);
+                    for _ in 0..n {
+                        let a = p.u64()?;
+                        let b = p.u64()?;
+                        sack.push((a, b));
+                    }
+                }
+                Frame::StreamAck(StreamAck {
+                    stream_id,
+                    acked_offset,
+                    window,
+                    sack,
+                })
+            }
             T_CLOSE => {
                 let stream_id = p.u32()?;
                 let final_offset = if p.rest().len() >= 8 {
@@ -458,6 +490,13 @@ mod tests {
             stream_id: 1,
             acked_offset: 5,
             window: 128000,
+            sack: vec![],
+        }));
+        roundtrip(Frame::StreamAck(StreamAck {
+            stream_id: 1,
+            acked_offset: 5,
+            window: 128000,
+            sack: vec![(100, 200), (300, 450)],
         }));
         roundtrip(Frame::StreamReset(StreamReset {
             stream_id: 3,
@@ -490,6 +529,21 @@ mod tests {
             Frame::StreamClose(c) => {
                 assert_eq!(c.stream_id, 7);
                 assert_eq!(c.final_offset, None);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn ack_old_bytes_have_empty_sack() {
+        let mut o = vec![T_ACK];
+        o.extend_from_slice(&7u32.to_be_bytes());
+        o.extend_from_slice(&99u64.to_be_bytes());
+        o.extend_from_slice(&1u32.to_be_bytes());
+        match Frame::decode(&o).unwrap() {
+            Frame::StreamAck(a) => {
+                assert_eq!(a.acked_offset, 99);
+                assert!(a.sack.is_empty());
             }
             other => panic!("{other:?}"),
         }

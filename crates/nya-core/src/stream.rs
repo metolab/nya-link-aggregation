@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::io;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -36,6 +36,10 @@ pub struct Unacked {
     /// Bandwidth is sampled only from un-hedged pieces (`tried.len() == 1`).
     pub delivered_at_send: u64,
     pub delivered_time_at_send_us: u64,
+    /// `mono_us` of this (re)send and of the path's first send since its
+    /// last ACK; the send-side interval of the BBR rate sample.
+    pub sent_us: u64,
+    pub first_tx_at_send_us: u64,
 }
 
 pub struct StreamState {
@@ -53,6 +57,17 @@ pub struct StreamState {
     pub recv_buffered: AtomicU64,
     /// Last STREAM_DATA arrival path. 0 = none.
     pub last_recv_path: AtomicU32,
+    /// Offset of the newest out-of-order piece buffered; its SACK range
+    /// goes first (TCP's "most recent block" rule).
+    pub last_hole_arrival: AtomicU64,
+    /// Pieces released by SACK (delivered behind a hole on another path).
+    pub sacked: AtomicU64,
+    /// 0 = never. Written when a SACK range released a piece.
+    pub last_sack_ms: AtomicU64,
+    /// Rate limit for the stuck-stream debug line. 0 = never logged.
+    pub stuck_logged_ms: AtomicU64,
+    /// Rate limit for the bulk-stream debug line. 0 = never logged.
+    pub bulk_logged_ms: AtomicU64,
     pub ack_dirty: AtomicBool,
     /// 0 = not waiting. Set when dirty goes 0→1; kept until that gen is Sent.
     pub ack_flush_from_us: AtomicU64,
@@ -69,6 +84,14 @@ pub struct StreamState {
     pub recv_cap: AtomicU32,
     /// `drain_recv` bytes/s EWMA (α = 1/8). 0 until a sample spanning ≥ one RTT.
     pub deliver_rate_ewma: AtomicU64,
+    /// P3b: `(acked_offset + window, t)` edges we advertised, newest last.
+    /// A window-limited sender's DATA ends exactly on one of them.
+    pub(crate) edge_ring: Mutex<VecDeque<(u64, Instant)>>,
+    /// P3b: DATA arrivals that landed on an advertised edge since the last
+    /// rate sample.
+    pub edge_hits: AtomicU64,
+    /// P3b receiver window controller.
+    pub(crate) win_ctl: Mutex<WinCtl>,
     /// Bytes since the last rate sample. Coalesced so FramedRead gaps are not a rate.
     pending_deliver: AtomicU64,
     last_deliver: Mutex<Option<Instant>>,
@@ -88,6 +111,56 @@ pub struct StreamState {
     pub counted_close: AtomicBool,
     /// 0 = not closing. First FIN (local or peer) stamps `mono_ms`.
     pub close_started_ms: AtomicU64,
+    /// Per-stream limiter evidence, read at stream end for the hop span (P6).
+    pub window_blocks: AtomicU64,
+    pub budget_blocks: AtomicU64,
+    pub window_limited_with_room: AtomicU64,
+    /// Max `recv_cap` ever advertised (receiver side).
+    pub recv_cap_max: AtomicU32,
+    /// Bulk/interactive pieces re-sent on another path for this stream.
+    pub hedges: AtomicU64,
+    /// Duplicate payload bytes received on this stream.
+    pub dup_rx_bytes: AtomicU64,
+    /// Distinct dests this stream sent DATA on (bounded set).
+    pub paths_used: Mutex<Vec<u32>>,
+}
+
+/// Per-stream limiter summary for `nya.hop` spans (P6).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StreamStats {
+    /// Current receive cap we advertise from and the peer's last window.
+    pub recv_cap: u32,
+    pub send_window: u32,
+    pub window_blocks: u64,
+    pub budget_blocks: u64,
+    pub window_limited_with_room: u64,
+    pub recv_cap_max: u32,
+    pub hedges: u64,
+    pub dup_rx_bytes: u64,
+    pub paths_used: u32,
+    /// Bytes sent by this side (`send_next`).
+    pub sent: u64,
+    /// Bytes delivered in order to the application (`recv_next`).
+    pub received: u64,
+}
+
+impl StreamStats {
+    /// Which side of the loop waited most: `window` (peer's advertised
+    /// window with path room available), `budget` (own path budget),
+    /// `path` (window with no room anywhere), or `none`.
+    pub fn limiter(&self) -> &'static str {
+        if self.window_blocks == 0 && self.budget_blocks == 0 {
+            return "none";
+        }
+        if self.budget_blocks >= self.window_blocks {
+            return "budget";
+        }
+        if self.window_limited_with_room * 2 >= self.window_blocks {
+            "window"
+        } else {
+            "path"
+        }
+    }
 }
 
 impl StreamState {
@@ -105,6 +178,11 @@ impl StreamState {
             recv_buf: Mutex::new(BTreeMap::new()),
             recv_buffered: AtomicU64::new(0),
             last_recv_path: AtomicU32::new(0),
+            last_hole_arrival: AtomicU64::new(0),
+            sacked: AtomicU64::new(0),
+            last_sack_ms: AtomicU64::new(0),
+            stuck_logged_ms: AtomicU64::new(0),
+            bulk_logged_ms: AtomicU64::new(0),
             ack_dirty: AtomicBool::new(false),
             ack_flush_from_us: AtomicU64::new(0),
             recv_fin: AtomicBool::new(false),
@@ -116,6 +194,9 @@ impl StreamState {
             initial_window,
             recv_cap: AtomicU32::new(initial_window),
             deliver_rate_ewma: AtomicU64::new(0),
+            edge_ring: Mutex::new(VecDeque::new()),
+            edge_hits: AtomicU64::new(0),
+            win_ctl: Mutex::new(WinCtl::default()),
             pending_deliver: AtomicU64::new(0),
             last_deliver: Mutex::new(None),
             last_stick_change: Mutex::new(Instant::now()),
@@ -127,7 +208,70 @@ impl StreamState {
             opened_ms: AtomicU64::new(mono_ms().max(1)),
             counted_close: AtomicBool::new(false),
             close_started_ms: AtomicU64::new(0),
+            window_blocks: AtomicU64::new(0),
+            budget_blocks: AtomicU64::new(0),
+            window_limited_with_room: AtomicU64::new(0),
+            recv_cap_max: AtomicU32::new(initial_window),
+            hedges: AtomicU64::new(0),
+            dup_rx_bytes: AtomicU64::new(0),
+            paths_used: Mutex::new(Vec::new()),
         })
+    }
+
+    /// Remember a dest this stream sent DATA on (first 16 distinct).
+    /// SACK ranges for the next ACK: coalesced runs of `recv_buf`, the run
+    /// holding the newest arrival first, then the highest runs. Bounded.
+    pub fn sack_ranges(&self) -> Vec<(u64, u64)> {
+        let buf = self.recv_buf.lock().unwrap();
+        if buf.is_empty() {
+            return Vec::new();
+        }
+        let mut runs: Vec<(u64, u64)> = Vec::new();
+        for (off, chunk) in buf.iter() {
+            let end = off + chunk.len() as u64;
+            match runs.last_mut() {
+                Some(last) if last.1 == *off => last.1 = end,
+                _ => runs.push((*off, end)),
+            }
+        }
+        drop(buf);
+        let newest = self.last_hole_arrival.load(Ordering::Relaxed);
+        let mut out: Vec<(u64, u64)> = Vec::with_capacity(nya_proto::MAX_SACK_RANGES);
+        if let Some(r) = runs.iter().find(|r| r.0 <= newest && newest < r.1) {
+            out.push(*r);
+        }
+        for r in runs.iter().rev() {
+            if out.len() >= nya_proto::MAX_SACK_RANGES {
+                break;
+            }
+            if !out.contains(r) {
+                out.push(*r);
+            }
+        }
+        out
+    }
+
+    pub fn note_path_used(&self, path_id: u32) {
+        let mut g = self.paths_used.lock().unwrap();
+        if !g.contains(&path_id) && g.len() < 16 {
+            g.push(path_id);
+        }
+    }
+
+    pub fn stats(&self) -> StreamStats {
+        StreamStats {
+            recv_cap: self.recv_cap.load(Ordering::Relaxed),
+            send_window: self.send_window.load(Ordering::Relaxed),
+            window_blocks: self.window_blocks.load(Ordering::Relaxed),
+            budget_blocks: self.budget_blocks.load(Ordering::Relaxed),
+            window_limited_with_room: self.window_limited_with_room.load(Ordering::Relaxed),
+            recv_cap_max: self.recv_cap_max.load(Ordering::Relaxed),
+            hedges: self.hedges.load(Ordering::Relaxed),
+            dup_rx_bytes: self.dup_rx_bytes.load(Ordering::Relaxed),
+            paths_used: self.paths_used.lock().unwrap().len() as u32,
+            sent: self.send_next.load(Ordering::Relaxed),
+            received: self.recv_next.load(Ordering::Relaxed),
+        }
     }
 
     pub fn is_steerable(&self) -> bool {
@@ -172,28 +316,29 @@ impl StreamState {
 
     /// Coalesce until `dt >= min_dt` (one RTT, or maintain_interval). First
     /// bytes are kept; a collapsed-but-nonzero Instant is not a rate.
-    pub(crate) fn note_deliver(&self, len: u64, min_dt: Duration) {
+    /// Returns `true` when a new rate sample was recorded.
+    pub(crate) fn note_deliver(&self, len: u64, min_dt: Duration) -> bool {
         if len == 0 {
-            return;
+            return false;
         }
         let now = Instant::now();
         let mut last = self.last_deliver.lock().unwrap();
         let pending = self.pending_deliver.fetch_add(len, Ordering::Relaxed) + len;
         let Some(prev) = *last else {
             *last = Some(now);
-            return;
+            return false;
         };
         let dt = now.saturating_duration_since(prev);
         // Decode-speed FramedRead gaps are tens of µs; require a full RTT.
         if dt.is_zero() || dt < min_dt {
-            return;
+            return false;
         }
         *last = Some(now);
         self.pending_deliver.store(0, Ordering::Relaxed);
         drop(last);
         let sample = (pending as f64 / dt.as_secs_f64()) as u64;
         if sample == 0 {
-            return;
+            return false;
         }
         let old = self.deliver_rate_ewma.load(Ordering::Relaxed);
         // α = 1/8, same 7/8 as class RTT — not a Tuning field.
@@ -203,12 +348,60 @@ impl StreamState {
             old.saturating_mul(7).saturating_add(sample) / 8
         };
         self.deliver_rate_ewma.store(ewma, Ordering::Relaxed);
+        true
+    }
+
+    /// P3b: remember an advertised edge, at most one per `min_rtt / 8`.
+    pub(crate) fn note_ack_edge(&self, edge: u64, min_rtt: Duration) {
+        let now = Instant::now();
+        let mut ring = self.edge_ring.lock().unwrap();
+        if let Some((last_edge, t)) = ring.back() {
+            if *last_edge == edge || now.saturating_duration_since(*t) < min_rtt / 8 {
+                return;
+            }
+        }
+        if ring.len() >= EDGE_RING {
+            ring.pop_front();
+        }
+        ring.push_back((edge, now));
+    }
+
+    /// P3b: DATA ending at `arr` landed on an advertised edge (± `tol`)?
+    pub(crate) fn note_arrival(&self, arr: u64, tol: u64) -> bool {
+        let hit = self
+            .edge_ring
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(edge, _)| edge.abs_diff(arr) <= tol);
+        if hit {
+            self.edge_hits.fetch_add(1, Ordering::Relaxed);
+        }
+        hit
     }
 
     #[cfg(test)]
     pub(crate) fn debug_set_deliver_clock(&self, start: Instant) {
         *self.last_deliver.lock().unwrap() = Some(start);
     }
+}
+
+/// P3b edge ring depth.
+pub const EDGE_RING: usize = 64;
+
+/// P3b receiver window controller state (see `Session::tune_recv_cap`).
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct WinCtl {
+    /// `Some((cap0, rate0, since, recv_next0))` while a probe (cap doubled)
+    /// is running: the cap and EWMA rate before it, when it began, and the
+    /// in-order offset then, so the probe's own delivery rate is measured
+    /// directly instead of through the α = 1/8 EWMA.
+    pub probing: Option<(u32, u64, Instant, u64)>,
+    /// Cap and rate of the last successful probe; kept while the rate stays
+    /// ≥ half of `hold_rate` and the app keeps up.
+    pub hold_cap: u32,
+    pub hold_rate: u64,
+    pub last_probe_end: Option<Instant>,
 }
 
 pub struct TunnelStream {

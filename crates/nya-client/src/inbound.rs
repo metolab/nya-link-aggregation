@@ -270,6 +270,8 @@ async fn copy_with_hop(
         Ok(_) => (HopOutcome::Ok, None),
         Err(e) => (HopOutcome::CopyErr, Some(io_err_kind(e))),
     };
+    // `overlay` still owns the tunnel half here, so the stream is live.
+    let stream = session.stream_stats(stream_id);
     session.process().record_hop(HopSample {
         role: HopRole::Client,
         stream_id,
@@ -284,6 +286,7 @@ async fn copy_with_hop(
         rx_bytes: Some(clock.rx_bytes()),
         tx_bytes: Some(clock.tx_bytes()),
         copy_err,
+        stream,
         ..Default::default()
     });
 }

@@ -280,6 +280,9 @@ pub struct HopSample {
     pub rx_bytes: Option<u64>,
     pub tx_bytes: Option<u64>,
     pub copy_err: Option<String>,
+    /// Per-stream limiter summary taken at copy end, before the tunnel
+    /// half is dropped (P6). `None` for open/dial failures.
+    pub stream: Option<crate::stream::StreamStats>,
 }
 
 impl HopSample {
@@ -335,6 +338,19 @@ impl HopSample {
         if let Some(ref e) = self.copy_err {
             parts.push(format!("copy_err={e}"));
         }
+        if let Some(ref st) = self.stream {
+            parts.push(format!(
+                "limiter={} wblk={} bblk={} wroom={} cap_max={} hedges={} dup_rx={} paths={}",
+                st.limiter(),
+                st.window_blocks,
+                st.budget_blocks,
+                st.window_limited_with_room,
+                st.recv_cap_max,
+                st.hedges,
+                st.dup_rx_bytes,
+                st.paths_used
+            ));
+        }
         parts.join(" ")
     }
 
@@ -368,6 +384,14 @@ impl HopSample {
             nya.rx_bytes = tracing::field::Empty,
             nya.tx_bytes = tracing::field::Empty,
             nya.copy_err = tracing::field::Empty,
+            nya.limiter = tracing::field::Empty,
+            nya.window_blocks = tracing::field::Empty,
+            nya.budget_blocks = tracing::field::Empty,
+            nya.window_limited_with_room = tracing::field::Empty,
+            nya.recv_cap_max = tracing::field::Empty,
+            nya.hedges = tracing::field::Empty,
+            nya.dup_rx_bytes = tracing::field::Empty,
+            nya.paths_used = tracing::field::Empty,
         );
         fn rec(span: &tracing::Span, name: &'static str, v: Option<u64>) {
             if let Some(v) = v {
@@ -395,6 +419,16 @@ impl HopSample {
         rec(&span, "nya.tx_bytes", self.tx_bytes);
         if let Some(ref e) = self.copy_err {
             span.record("nya.copy_err", e.as_str());
+        }
+        if let Some(ref st) = self.stream {
+            span.record("nya.limiter", st.limiter());
+            span.record("nya.window_blocks", st.window_blocks);
+            span.record("nya.budget_blocks", st.budget_blocks);
+            span.record("nya.window_limited_with_room", st.window_limited_with_room);
+            span.record("nya.recv_cap_max", u64::from(st.recv_cap_max));
+            span.record("nya.hedges", st.hedges);
+            span.record("nya.dup_rx_bytes", st.dup_rx_bytes);
+            span.record("nya.paths_used", u64::from(st.paths_used));
         }
         let _g = span.entered();
     }

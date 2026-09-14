@@ -89,6 +89,11 @@ impl IncomingStream {
     pub fn session_fp(&self) -> Option<String> {
         self.session.session_fp()
     }
+
+    /// The owning session (for `stream_stats` after `io` has been moved).
+    pub fn session_handle(&self) -> Session {
+        self.session.clone()
+    }
 }
 
 pub(crate) struct Inner {
@@ -575,6 +580,32 @@ impl Session {
         }
     }
 
+    /// P2 fan-out target for a bulk stream whose sticky is at budget.
+    fn bulk_overflow_pick(&self, sticky: u32) -> Option<u32> {
+        let paths = self.path_list();
+        crate::scheduler::bulk_overflow_pick(&paths, &self.inner.cfg, sticky, |id| {
+            self.conn_has_interactive(id)
+        })
+    }
+
+    /// Per-stream limiter summary (P6), for the hop span at copy end.
+    pub fn stream_stats(&self, id: u32) -> Option<crate::stream::StreamStats> {
+        self.get_stream(id).map(|st| st.stats())
+    }
+
+    /// Limiter summary of every live stream.
+    pub fn all_stream_stats(&self) -> Vec<(u32, crate::stream::StreamStats)> {
+        let streams: Vec<_> = self
+            .inner
+            .streams
+            .lock()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect();
+        streams.iter().map(|st| (st.id, st.stats())).collect()
+    }
+
     fn pick_retry(&self, avoid: u32) -> Option<u32> {
         pick_retry_path(&self.path_list(), &self.inner.cfg, &[avoid])
     }
@@ -699,21 +730,42 @@ impl Session {
     }
 
     /// P2: remember the path ACK clock at (re)send so `on_ack` can turn this
-    /// piece's ACK into a delivery-rate sample.
+    /// piece's ACK into a delivery-rate sample (BBR `tcp_rate_skb_sent`).
     pub(super) fn stamp_delivered(&self, st: &StreamState, offset: u64, p: &PathState) {
+        let now_us = crate::metrics::mono_us().max(1);
+        // Pipe was empty: restart both clocks so an idle gap is not rate.
+        if p.inflight_bytes()
+            <= st
+                .unacked
+                .lock()
+                .unwrap()
+                .get(&offset)
+                .map_or(0, |u| u.data.len() as u64)
+        {
+            p.first_tx_us.store(now_us, Ordering::Relaxed);
+            p.delivered_at_us.store(now_us, Ordering::Relaxed);
+        }
         if let Some(u) = st.unacked.lock().unwrap().get_mut(&offset) {
             u.delivered_at_send = p.delivered.load(Ordering::Relaxed);
             u.delivered_time_at_send_us = p.delivered_at_us.load(Ordering::Relaxed);
+            u.sent_us = now_us;
+            u.first_tx_at_send_us = p.first_tx_us.load(Ordering::Relaxed);
         }
     }
 
     /// Expired unacked copies: one send on a *different* path. Never in-place.
     ///
     /// Interactive pieces keep the age clock (`retry_after`). Bulk pieces
-    /// are re-sent only when the **path** is silent (`!is_loss_fresh`),
-    /// when they never reached the wire (`dropped`), or on the slow belt:
-    /// a fresh path's per-frame ACKs prove it is delivering, and a bulk
-    /// ACK loop longer than the 20 ms clock is transfer delay, not loss.
+    /// are re-sent only when the **path** has been silent for a full
+    /// `retry_after_bulk` (≈ 2 × its loaded ACK loop), when they never
+    /// reached the wire (`dropped`), or on the slow belt. A path's
+    /// per-frame ACKs prove it is delivering, and a bulk ACK loop longer
+    /// than the 20 ms clock is transfer delay, not loss. The silence bound
+    /// is the loop, not the 20 ms `is_loss_fresh` clock: the TCP under a
+    /// bulk path goes quiet for about one loop on every fast-retransmit
+    /// recovery (a 1–2 % loss IX does this every few hundred ms), and
+    /// hedging each of those is the duplicate storm P4 exists to end. An
+    /// RTO-class stall (≥ 200 ms) or a blackhole still trips it.
     fn retry_expired_unacked(&self, st: &StreamState) {
         if !st.is_steerable() {
             return;
@@ -732,6 +784,23 @@ impl Session {
             .map(|p| p.id)
             .collect();
         let interactive_max = self.inner.cfg.tuning.interactive_max;
+        // A short piece of a bulk stream (window/budget remainder, socket
+        // read boundary) rides the same bulk queue as its neighbours; the
+        // 20 ms interactive age clock would hedge it on every loaded loop.
+        let stream_bulk = st.bulk.load(Ordering::Relaxed);
+        // Belt: the receiver silently dropped something only if ACK
+        // progress (cumulative or selective) has stopped too. While the
+        // receiver keeps acknowledging, old pieces on other paths are just
+        // behind a hole (or past the SACK budget), and re-sending them is
+        // pure duplicate.
+        let ack_stalled_ms = match st
+            .last_ack_ms
+            .load(Ordering::Relaxed)
+            .max(st.last_sack_ms.load(Ordering::Relaxed))
+        {
+            0 => u64::MAX,
+            t => now_ms.saturating_sub(t),
+        };
         struct Due {
             offset: u64,
             from: u32,
@@ -739,38 +808,75 @@ impl Session {
             tried: Vec<u32>,
             dropped: bool,
             bulk: bool,
+            why: &'static str,
         }
         let expired: Vec<Due> = {
             let unacked = st.unacked.lock().unwrap();
+            if stalled_long
+                && now_ms.saturating_sub(st.stuck_logged_ms.load(Ordering::Relaxed)) >= 1000
+            {
+                st.stuck_logged_ms.store(now_ms, Ordering::Relaxed);
+                if let Some((off, u)) = unacked.iter().next() {
+                    tracing::debug!(
+                        stream = st.id,
+                        unacked = unacked.len(),
+                        head = off,
+                        head_path = u.path_id,
+                        head_tried = ?u.tried,
+                        head_age_ms = u.last_sent.elapsed().as_millis() as u64,
+                        head_dropped = u.dropped,
+                        ack_stalled_ms,
+                        send_acked = st.send_acked.load(Ordering::Relaxed),
+                        send_next = st.send_next.load(Ordering::Relaxed),
+                        window = st.send_window.load(Ordering::Relaxed),
+                        alive = ?alive,
+                        "stream stalled with unacked data"
+                    );
+                }
+            }
             unacked
                 .iter()
-                .filter(|(_, u)| {
+                .filter_map(|(off, u)| {
                     if now < u.retry_not_before {
-                        return false;
-                    }
-                    if u.dropped {
-                        return true;
+                        return None;
                     }
                     let age = u.last_sent.elapsed();
-                    let bulk = u.data.len() > interactive_max;
-                    match self.get_path(u.path_id) {
-                        None => true,
-                        Some(p) if !p.is_alive() => true,
-                        Some(_) if !bulk => age >= self.retry_after(u.path_id),
-                        Some(p) => {
-                            (!crate::scheduler::is_loss_fresh(&self.inner.cfg, &p)
-                                && age >= self.retry_after_bulk(&p))
-                                || age >= self.hedge_belt(&p, u.tried.len())
+                    let bulk = stream_bulk || u.data.len() > interactive_max;
+                    let why = if u.dropped {
+                        "dropped"
+                    } else {
+                        match self.get_path(u.path_id) {
+                            None => "gone",
+                            Some(p) if !p.is_alive() => "down",
+                            Some(_) if !bulk => {
+                                if age >= self.retry_after(u.path_id) {
+                                    "age"
+                                } else {
+                                    return None;
+                                }
+                            }
+                            Some(p) => {
+                                let quiet = self.retry_after_bulk(&p);
+                                let belt = self.hedge_belt(&p, u.tried.len());
+                                if p.last_rx_ago() >= quiet && age >= quiet {
+                                    "silence"
+                                } else if age >= belt && ack_stalled_ms >= belt.as_millis() as u64 {
+                                    "belt"
+                                } else {
+                                    return None;
+                                }
+                            }
                         }
-                    }
-                })
-                .map(|(off, u)| Due {
-                    offset: *off,
-                    from: u.path_id,
-                    data: u.data.clone(),
-                    tried: u.tried.clone(),
-                    dropped: u.dropped,
-                    bulk: u.data.len() > interactive_max,
+                    };
+                    Some(Due {
+                        offset: *off,
+                        from: u.path_id,
+                        data: u.data.clone(),
+                        tried: u.tried.clone(),
+                        dropped: u.dropped,
+                        bulk,
+                        why,
+                    })
                 })
                 .collect()
         };
@@ -781,6 +887,7 @@ impl Session {
             mut tried,
             dropped,
             bulk,
+            why,
         } in expired
         {
             if stalled_long && alive.iter().all(|id| tried.contains(id)) {
@@ -799,6 +906,16 @@ impl Session {
                 continue;
             };
             if self.get_path(alt).is_some_and(|p| p.is_write_stalled()) {
+                continue;
+            }
+            // Belt re-send leaves a *fresh* path; a silent alternative
+            // (blackholed, not yet down) would only bury the copy. Wait for
+            // a fresh one or for the down-rehome.
+            if why == "belt"
+                && self
+                    .get_path(alt)
+                    .is_some_and(|p| !crate::scheduler::is_loss_fresh(&self.inner.cfg, &p))
+            {
                 continue;
             }
             if self.send_data_frame(st.id, offset, data, alt) {
@@ -821,7 +938,22 @@ impl Session {
                         .data_dropped_resend
                         .fetch_add(1, Ordering::Relaxed);
                 }
+                st.hedges.fetch_add(1, Ordering::Relaxed);
+                st.note_path_used(alt);
                 self.note_retry(from, alt);
+                tracing::debug!(
+                    stream = st.id,
+                    offset,
+                    from,
+                    to = alt,
+                    why,
+                    bulk,
+                    tries = tried.len(),
+                    last_rx_ms = from_path
+                        .as_ref()
+                        .map(|p| p.last_rx_ago().as_millis() as u64),
+                    "data re-sent"
+                );
             } else if let Some(u) = st.unacked.lock().unwrap().get_mut(&offset) {
                 Self::push_tried(&mut u.tried, alt);
                 u.dropped = true;
@@ -1407,6 +1539,8 @@ impl Session {
         if let Some(p) = self.get_path(to) {
             u.delivered_at_send = p.delivered.load(Ordering::Relaxed);
             u.delivered_time_at_send_us = p.delivered_at_us.load(Ordering::Relaxed);
+            u.sent_us = crate::metrics::mono_us().max(1);
+            u.first_tx_at_send_us = p.first_tx_us.load(Ordering::Relaxed);
         }
     }
 
@@ -1438,6 +1572,8 @@ impl Session {
                 .metrics
                 .data_retransmit
                 .fetch_add(n, Ordering::Relaxed);
+            st.hedges.fetch_add(n, Ordering::Relaxed);
+            st.note_path_used(to);
         }
     }
 
@@ -2566,6 +2702,193 @@ mod tests {
         client.shutdown();
     }
 
+    /// P4: while the receiver keeps acknowledging (cumulative or SACK),
+    /// an old piece on a fresh path is behind a hole, not eaten.
+    #[tokio::test]
+    async fn belt_waits_while_acks_progress() {
+        let client = Session::new_client(SessionConfig::default());
+        let _a = inject_live(&client, 1, "akcdn#0", 7);
+        let _b = inject_live(&client, 2, "soy#0", 7);
+        let (tun, st) = one_bulk_piece(&client).await;
+        {
+            let mut u = st.unacked.lock().unwrap();
+            for x in u.values_mut() {
+                x.last_sent = Instant::now() - Duration::from_secs(6);
+            }
+        }
+        st.last_sack_ms
+            .store(crate::metrics::mono_ms().max(1), Ordering::Relaxed);
+        let h0 = hedges(&client);
+        client.debug_maintain();
+        assert_eq!(hedges(&client), h0, "SACK progress a moment ago: no belt");
+        st.last_sack_ms.store(0, Ordering::Relaxed);
+        st.last_ack_ms
+            .store(crate::metrics::mono_ms().max(1), Ordering::Relaxed);
+        client.debug_maintain();
+        assert_eq!(
+            hedges(&client),
+            h0,
+            "cumulative progress a moment ago: no belt"
+        );
+        drop(tun);
+        client.shutdown();
+    }
+
+    /// SACK: a range past `acked_offset` releases the pieces inside it,
+    /// credits the carrying path, and leaves the hole in `unacked`.
+    #[tokio::test]
+    async fn sack_releases_pieces_behind_hole() {
+        let client = Session::new_client(SessionConfig::default());
+        let (p, _w, _u) = inject_live(&client, 1, "akcdn#0", 7);
+        let mut tun = client
+            .open_stream(Target {
+                host: "t".into(),
+                port: 1,
+            })
+            .await
+            .unwrap();
+        let st = client.get_stream(tun.id).unwrap();
+        tun.write_all(&vec![0x42u8; 40_000]).await.unwrap();
+        let deadline = Instant::now() + Duration::from_millis(300);
+        loop {
+            if st.unacked.lock().unwrap().len() >= 3 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "40 kB must leave ≥ 3 pieces");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let pieces: Vec<(u64, u64)> = st
+            .unacked
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(o, u)| (*o, *o + u.data.len() as u64))
+            .collect();
+        let inflight0 = p.inflight_bytes();
+        let (hole, second) = (pieces[0], pieces[1]);
+        client.on_ack(StreamAck {
+            stream_id: st.id,
+            acked_offset: 0,
+            window: 1 << 20,
+            sack: vec![(second.0, second.1)],
+        });
+        {
+            let g = st.unacked.lock().unwrap();
+            assert!(g.contains_key(&hole.0), "hole stays");
+            assert!(!g.contains_key(&second.0), "sacked piece released");
+            assert_eq!(g.len(), pieces.len() - 1);
+        }
+        assert_eq!(p.inflight_bytes(), inflight0 - (second.1 - second.0));
+        assert_eq!(client.snapshot().data_sacked, 1);
+        assert_ne!(st.last_sack_ms.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            st.send_acked.load(Ordering::Relaxed),
+            0,
+            "cumulative untouched"
+        );
+        // A range covering only part of a piece releases nothing.
+        client.on_ack(StreamAck {
+            stream_id: st.id,
+            acked_offset: 0,
+            window: 1 << 20,
+            sack: vec![(hole.0 + 1, hole.1)],
+        });
+        assert!(st.unacked.lock().unwrap().contains_key(&hole.0));
+        drop(tun);
+        client.shutdown();
+    }
+
+    /// Receiver: out-of-order pieces are advertised as SACK ranges, the
+    /// newest arrival's run first; in-order data is not.
+    #[tokio::test]
+    async fn receiver_acks_carry_sack_ranges() {
+        let client = Session::new_client(SessionConfig::default());
+        let (p, _w, _u) = inject_live(&client, 1, "a#0", 7);
+        let tun = client
+            .open_stream(Target {
+                host: "t".into(),
+                port: 1,
+            })
+            .await
+            .unwrap();
+        let st = client.get_stream(tun.id).unwrap();
+        let sid = tun.id;
+        for off in [2000u64, 3000, 5000] {
+            client.on_data(
+                p.id,
+                StreamData {
+                    stream_id: sid,
+                    offset: off,
+                    data: vec![0xab; 1000],
+                },
+            );
+        }
+        assert_eq!(st.sack_ranges(), vec![(5000, 6000), (2000, 4000)]);
+        let ack = p.pending_acks.lock().unwrap().get(&sid).cloned().unwrap();
+        assert_eq!(ack.acked_offset, 0);
+        assert_eq!(ack.sack, vec![(5000, 6000), (2000, 4000)]);
+        client.on_data(
+            p.id,
+            StreamData {
+                stream_id: sid,
+                offset: 0,
+                data: vec![0xab; 2000],
+            },
+        );
+        assert_eq!(st.recv_next.load(Ordering::Relaxed), 4000);
+        assert_eq!(st.sack_ranges(), vec![(5000, 6000)]);
+        drop(tun);
+        client.shutdown();
+    }
+
+    /// In-order data the full channel could not take is handed over when
+    /// the app reads, not only on the next arrival.
+    #[tokio::test]
+    async fn app_read_drains_leftover_in_order_data() {
+        let mut cfg = SessionConfig::default();
+        cfg.tuning.chan = 1;
+        let client = Session::new_client(cfg);
+        let (p, _w, _u) = inject_live(&client, 1, "a#0", 7);
+        let mut tun = client
+            .open_stream(Target {
+                host: "t".into(),
+                port: 1,
+            })
+            .await
+            .unwrap();
+        let st = client.get_stream(tun.id).unwrap();
+        let sid = tun.id;
+        for off in [0u64, 1000, 2000] {
+            client.on_data(
+                p.id,
+                StreamData {
+                    stream_id: sid,
+                    offset: off,
+                    data: vec![(off / 1000) as u8; 1000],
+                },
+            );
+        }
+        assert_eq!(
+            st.recv_next.load(Ordering::Relaxed),
+            1000,
+            "channel of 1 took one"
+        );
+        assert_eq!(st.recv_buffered.load(Ordering::Relaxed), 2000);
+        // Reading the whole 3000 bytes only completes if the tail left in
+        // recv_buf is drained by the app-read hook (no more arrivals).
+        let mut buf = vec![0u8; 3000];
+        tokio::time::timeout(Duration::from_secs(2), tun.read_exact(&mut buf))
+            .await
+            .expect("tail must drain without a new arrival")
+            .unwrap();
+        assert_eq!(buf[0], 0);
+        assert_eq!(buf[1500], 1);
+        assert_eq!(buf[2999], 2);
+        assert_eq!(st.recv_buffered.load(Ordering::Relaxed), 0);
+        drop(tun);
+        client.shutdown();
+    }
+
     #[tokio::test]
     async fn close_retry_rehomes_first_closer() {
         let (client, server) = pair_echo(&["akcdn#0", "soy#0"]).await;
@@ -3119,6 +3442,8 @@ mod tests {
                     dropped: false,
                     delivered_at_send: 0,
                     delivered_time_at_send_us: 0,
+                    sent_us: 0,
+                    first_tx_at_send_us: 0,
                 },
             );
         }
@@ -3179,6 +3504,8 @@ mod tests {
                     dropped: false,
                     delivered_at_send: 0,
                     delivered_time_at_send_us: 0,
+                    sent_us: 0,
+                    first_tx_at_send_us: 0,
                 },
             );
         }
@@ -4033,6 +4360,7 @@ mod tests {
                 stream_id: id,
                 acked_offset: next,
                 window: 128 * 1024,
+                sack: vec![],
             }),
         );
         tun.shutdown().await.unwrap();
@@ -4085,6 +4413,7 @@ mod tests {
                 stream_id: id,
                 acked_offset: st.send_next.load(Ordering::Relaxed),
                 window: 128 * 1024,
+                sack: vec![],
             }),
         );
         client.remember_reset(id, 1, ResetReason::Timeout);
@@ -4150,6 +4479,7 @@ mod tests {
                 stream_id: id,
                 acked_offset: 0,
                 window: 128 * 1024,
+                sack: vec![],
             }),
         );
         drop(tun);
@@ -4220,6 +4550,7 @@ mod tests {
                 stream_id: 1,
                 acked_offset: next,
                 window: 128 * 1024,
+                sack: vec![],
             }),
         );
         drop(inc);
@@ -4257,6 +4588,7 @@ mod tests {
                 stream_id: id,
                 acked_offset: 0,
                 window: 128 * 1024,
+                sack: vec![],
             }),
         );
         client.handle_frame(
@@ -4715,6 +5047,7 @@ mod tests {
                         stream_id: i,
                         acked_offset: 0,
                         window: 1,
+                        sack: vec![],
                     },
                 );
             }
@@ -4769,6 +5102,7 @@ mod tests {
                 stream_id: st.id,
                 acked_offset: 100,
                 window: 1,
+                sack: vec![],
             },
         );
         st.recv_next.store(200, Ordering::Relaxed);
@@ -5362,6 +5696,7 @@ mod tests {
             stream_id: st.id,
             acked_offset: acked,
             window: 128 * 1024,
+            sack: vec![],
         });
         assert_eq!(
             p.rtt_ewma_us.load(Ordering::Relaxed),
@@ -5408,6 +5743,7 @@ mod tests {
             stream_id: st.id,
             acked_offset: acked,
             window: 128 * 1024,
+            sack: vec![],
         });
         let after = p.rtt_ewma_us.load(Ordering::Relaxed);
         assert_ne!(after, before, "~10 ms ACK may still move EWMA");

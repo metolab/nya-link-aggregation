@@ -27,6 +27,40 @@ pub fn link_key(name: &str) -> &str {
     name.rsplit_once('#').map(|(l, _)| l).unwrap_or(name)
 }
 
+/// BBR keeps its RTprop over 10 s; same here for the budget's min RTT.
+pub const MIN_RTT_WIN_US: u64 = 10_000_000;
+/// Budget controller constants (see `PathState::end_budget_round`).
+pub const BUDGET_GROW: f64 = 1.5;
+/// A step is ≥ 15 % over the last full bandwidth. BBR uses 25 % with a
+/// 2.89× pacing gain that overshoots the pipe before the test can fail;
+/// budget steps here are ×1.5 with no overshoot, so 25 % stops one step
+/// short (≈ 80 % of the link, measured) and 15 % lands at ≥ 90 %.
+pub const BUDGET_GROWTH_MIN: f64 = 0.15;
+/// BBR `bbr_full_bw_cnt`: rounds without a step before the pipe is full.
+pub const BUDGET_FULL_ROUNDS: u64 = 3;
+pub const BUDGET_PROBE: f64 = 1.25;
+/// Limited rounds between probes once growth has stopped. The probe is
+/// the only way up after a plateau or a sag (bandwidth cannot rise before
+/// the budget does), so it must come often enough to recover within a
+/// transfer: 4 loops ≈ 100–200 ms.
+pub const BUDGET_PROBE_EVERY: u64 = 4;
+pub const BUDGET_IDLE_SHRINK: u64 = 8;
+/// The budget never exceeds this many times the bytes the path's best
+/// round rate carries in one minimum loop, whatever the step test
+/// believes. A TCP in loss recovery under a saturated path hands back its
+/// backlog in bursts that the round test can read as headroom; without the
+/// ceiling that feedback ran the budget to 5× the pipe and the loop to 4×
+/// its minimum. BBR's `cwnd_gain` is 2; one more BDP here because the
+/// minimum loop is measured with empty queues while a reverse bulk flow
+/// (upload while downloading, the echo workloads) holds our ACKs behind
+/// its data for a good part of a BDP, and 2× then starves the forward
+/// direction (measured: 75–85 % of the link against 97 % at 3×).
+pub const BUDGET_CAP_GAIN: u64 = 3;
+
+fn mul(v: u64, g: f64) -> u64 {
+    (v as f64 * g).min(u64::MAX as f64) as u64
+}
+
 pub struct PathState {
     pub id: u32,
     pub name: String,
@@ -89,9 +123,46 @@ pub struct PathState {
     pub ack_rtt_us: AtomicU64,
     /// Windowed max of ACK-clock delivery-rate samples, bytes/s (P2).
     pub bw_filter: std::sync::Mutex<crate::bw::MinMax3>,
+    /// Send time of the first piece sent after the last ACK (BBR
+    /// `first_tx_mstamp`); the send-side clock of a rate sample.
+    pub first_tx_us: AtomicU64,
+    /// Windowed min of accepted RTT samples over `MIN_RTT_WIN_US` (P2
+    /// budget uses the true floor, not a load-inflated EWMA).
+    pub min_rtt_filter: std::sync::Mutex<crate::bw::WindowedMin>,
     /// Send budget bounds, bytes; set by the session at path start.
     pub budget_floor: AtomicU64,
     pub budget_ceil: AtomicU64,
+    /// Budget controller (P2.3). `budget` is the current allowance;
+    /// `round_start_us` marks the current ACK-RTT round; `round_bw_ref` is
+    /// `bw_full`, the last bandwidth that stepped up ≥ 25 %; `round_limited`
+    /// is set when a bulk send parked on this budget during the round;
+    /// `flat_rounds` / `sag_rounds` count consecutive rounds without a step
+    /// / with bandwidth ≥ 25 % under `bw_full`; `idle_rounds` counts rounds
+    /// that never parked; `probe_from` is the budget to fall back to if a
+    /// probe round fails.
+    pub budget: AtomicU64,
+    pub round_start_us: AtomicU64,
+    pub round_bw_ref: AtomicU64,
+    pub round_limited: AtomicBool,
+    pub flat_rounds: AtomicU64,
+    pub sag_rounds: AtomicU64,
+    pub idle_rounds: AtomicU64,
+    pub probe_from: AtomicU64,
+    /// `delivered` at round start: the controller judges growth on the
+    /// round's delivered average, not on the per-ACK max. Without pacing
+    /// the send-side clock of a sample is a burst, so a stretch ACK (TCP
+    /// loss recovery under us, ACKs queued behind reverse bulk) reads as a
+    /// rate the link never had, and the max filter would keep it for a
+    /// whole window. `prev_round_bw` is the rate of an as-yet unconfirmed
+    /// step round (0 = none).
+    pub round_delivered: AtomicU64,
+    pub prev_round_bw: AtomicU64,
+    /// Windowed max of the round averages: the bandwidth the budget
+    /// ceiling `BUDGET_CAP_GAIN × bw × min_loop` is built on.
+    pub round_bw_max: std::sync::Mutex<crate::bw::MinMax3>,
+    /// Previous round's average (0 = none), for the two-round min the
+    /// ceiling filter is fed with.
+    pub last_round_bw: AtomicU64,
     /// Duplicated socket fd for `TCP_INFO` (P6). `None` off Linux, in unit
     /// tests over duplex pipes, and after path IO exit.
     pub tcp_fd: std::sync::Mutex<Option<crate::net::PathFd>>,
@@ -149,6 +220,20 @@ impl PathState {
             delivered_at_us: AtomicU64::new(0),
             ack_rtt_us: AtomicU64::new(0),
             bw_filter: std::sync::Mutex::new(crate::bw::MinMax3::new()),
+            first_tx_us: AtomicU64::new(0),
+            min_rtt_filter: std::sync::Mutex::new(crate::bw::WindowedMin::new()),
+            budget: AtomicU64::new(crate::tuning::Tuning::STANDARD.inflight_bias),
+            round_start_us: AtomicU64::new(0),
+            round_bw_ref: AtomicU64::new(0),
+            round_limited: AtomicBool::new(false),
+            flat_rounds: AtomicU64::new(0),
+            sag_rounds: AtomicU64::new(0),
+            idle_rounds: AtomicU64::new(0),
+            probe_from: AtomicU64::new(0),
+            round_delivered: AtomicU64::new(0),
+            prev_round_bw: AtomicU64::new(0),
+            round_bw_max: std::sync::Mutex::new(crate::bw::MinMax3::new()),
+            last_round_bw: AtomicU64::new(0),
             budget_floor: AtomicU64::new(crate::tuning::Tuning::STANDARD.inflight_bias),
             budget_ceil: AtomicU64::new(
                 (crate::tuning::Tuning::STANDARD.chan as u64)
@@ -191,6 +276,37 @@ impl PathState {
         (rtt_us * 10).max(100_000)
     }
 
+    /// Any round trip this path completed (probe or un-hedged data piece)
+    /// feeds the budget's RTT floor. Data samples matter: they include the
+    /// kernel's standing queue, which the budget must cover or it, not TCP,
+    /// becomes the throughput limiter (BBR's RTprop is likewise taken from
+    /// delivered data, not from idle probes).
+    pub fn note_loop_rtt(&self, rtt: Duration) {
+        let sample = (rtt.as_micros() as u64).max(1);
+        self.min_rtt_filter.lock().unwrap().update(
+            sample,
+            crate::metrics::mono_us().max(1),
+            MIN_RTT_WIN_US,
+        );
+    }
+
+    /// Floor RTT for the budget: windowed min of loop samples; the fast EWMA
+    /// when the window is empty. `None` while RTT is unknown.
+    pub fn min_rtt(&self) -> Option<Duration> {
+        if !self.rtt_known() {
+            return None;
+        }
+        let now = crate::metrics::mono_us();
+        let m = self
+            .min_rtt_filter
+            .lock()
+            .unwrap()
+            .get(now, MIN_RTT_WIN_US)
+            .map(Duration::from_micros)
+            .unwrap_or_else(|| self.rtt());
+        Some(m)
+    }
+
     /// Windowed-max delivery rate on this path, bytes/s. 0 = no fresh sample.
     pub fn bw_bytes_s(&self) -> u64 {
         let now = crate::metrics::mono_us();
@@ -199,24 +315,185 @@ impl PathState {
 
     pub(crate) fn note_bw_sample(&self, bytes_s: u64, now_us: u64) {
         let win = self.bw_window_us();
-        self.bw_filter.lock().unwrap().update(bytes_s, now_us, win);
+        let was = self.bw_filter.lock().unwrap().get(now_us, win);
+        let max = self.bw_filter.lock().unwrap().update(bytes_s, now_us, win);
+        if was == 0 {
+            // Idle gap emptied the filter: restart from the floor (BBR
+            // "restart from idle"); the first limited rounds regrow it.
+            self.budget
+                .store(self.budget_floor.load(Ordering::Relaxed), Ordering::Relaxed);
+            self.round_start_us.store(now_us, Ordering::Relaxed);
+            self.round_delivered
+                .store(self.delivered.load(Ordering::Relaxed), Ordering::Relaxed);
+            self.prev_round_bw.store(0, Ordering::Relaxed);
+            self.last_round_bw.store(0, Ordering::Relaxed);
+            self.round_bw_ref.store(0, Ordering::Relaxed);
+            self.round_limited.store(false, Ordering::Relaxed);
+            self.flat_rounds.store(0, Ordering::Relaxed);
+            self.sag_rounds.store(0, Ordering::Relaxed);
+            self.idle_rounds.store(0, Ordering::Relaxed);
+            self.probe_from.store(0, Ordering::Relaxed);
+            return;
+        }
+        let round_us = self
+            .ack_rtt()
+            .or_else(|| self.min_rtt())
+            .map(|d| d.as_micros() as u64)
+            .unwrap_or(Tuning::STANDARD.unknown_rtt_us)
+            .max(1);
+        let start = self.round_start_us.load(Ordering::Relaxed);
+        if now_us.saturating_sub(start) < round_us {
+            return;
+        }
+        let _ = max;
+        self.end_budget_round(now_us);
     }
 
-    /// Per-path send budget (overlay cwnd): `clamp(2 × bw × min_rtt,
-    /// floor, ceil)`; floor when bandwidth or RTT is unknown.
+    /// Mark this path budget-limited in the current round (a bulk send
+    /// found no room here).
+    pub fn note_budget_limited(&self) {
+        self.round_limited.store(true, Ordering::Relaxed);
+    }
+
+    /// One ACK-RTT round of the budget controller. Sitting on TCP, the
+    /// overlay cannot know the kernel's cwnd or the queue under it, so the
+    /// budget is not a BDP formula (a budget-limited delivery sample is
+    /// `budget / loop_rtt`, which only restates the budget). Instead it is
+    /// BBR's full-pipe test applied to the budget: `bw_full` is the highest
+    /// bandwidth that beat its predecessor by ≥ `BUDGET_GROWTH_MIN`; each
+    /// limited round that sets a new `bw_full` raises the budget by
+    /// `BUDGET_GROW`; `BUDGET_FULL_ROUNDS` limited rounds without such a
+    /// step mean extra allowance buys nothing and growth stops. From then
+    /// on every `BUDGET_PROBE_EVERY` limited rounds the budget is raised by
+    /// `BUDGET_PROBE` for one round and kept only if bandwidth followed
+    /// (ProbeBW). Rounds that never park leave the budget alone; after
+    /// `BUDGET_IDLE_SHRINK` such rounds it settles to `2 × bw × loop_rtt`
+    /// (≈ 2 × what is actually in flight). `BUDGET_FULL_ROUNDS` rounds with
+    /// bandwidth ≥ 25 % under `bw_full` re-arm growth from the lower level.
+    fn end_budget_round(&self, now_us: u64) {
+        let floor = self.budget_floor.load(Ordering::Relaxed);
+        let ceil = self.budget_ceil.load(Ordering::Relaxed).max(floor);
+        let start = self.round_start_us.swap(now_us, Ordering::Relaxed);
+        let delivered = self.delivered.load(Ordering::Relaxed);
+        let dd = delivered.saturating_sub(self.round_delivered.swap(delivered, Ordering::Relaxed));
+        let dt = now_us.saturating_sub(start).max(1);
+        let bw_now = (dd as u128 * 1_000_000 / dt as u128).min(u64::MAX as u128) as u64;
+        // Long window (as the min loop): a budget-limited sag must not pull
+        // the ceiling down with it — `bw × min_loop` under a longer loop is
+        // below what the budget already carries, and the ceiling would
+        // then chase the budget down (the fixed point the round test
+        // exists to avoid).
+        // Fed with the lower of two consecutive rounds: one fat round (a
+        // released backlog) cannot lift the ceiling, two in a row can.
+        let last = self.last_round_bw.swap(bw_now, Ordering::Relaxed);
+        let confirmed = if last == 0 { bw_now } else { bw_now.min(last) };
+        let bw_max = self
+            .round_bw_max
+            .lock()
+            .unwrap()
+            .update(confirmed, now_us, MIN_RTT_WIN_US);
+        let cap = match self.min_rtt() {
+            Some(m) if bw_max > 0 => {
+                let bdp = (bw_max as u128 * m.as_micros() / 1_000_000) as u64;
+                bdp.saturating_mul(BUDGET_CAP_GAIN).max(floor)
+            }
+            _ => ceil,
+        };
+        let ceil = ceil.min(cap).max(floor);
+        let limited = self.round_limited.swap(false, Ordering::Relaxed);
+        let cur = self.budget.load(Ordering::Relaxed).clamp(floor, ceil);
+        let full = self.round_bw_ref.load(Ordering::Relaxed);
+        let step_now = bw_now as f64 >= full as f64 * (1.0 + BUDGET_GROWTH_MIN);
+        // A step counts only when two consecutive rounds clear the bar. A
+        // backlog the TCP under us releases after loss recovery lands as
+        // one fat round followed by a lean one; real headroom shows in
+        // every round after the budget grew.
+        let pending = self.prev_round_bw.load(Ordering::Relaxed);
+        let stepped = step_now && pending != 0;
+        self.prev_round_bw.store(
+            if step_now && !stepped { bw_now } else { 0 },
+            Ordering::Relaxed,
+        );
+        let sagged = full > 0 && (bw_now as f64) < full as f64 * (1.0 - BUDGET_GROWTH_MIN);
+        let probe_from = self.probe_from.swap(0, Ordering::Relaxed);
+        let loop_us = self.ack_rtt().map(|d| d.as_micros() as u64).unwrap_or(0);
+        let carried = (bw_now as u128 * loop_us as u128 / 1_000_000) as u64;
+
+        if stepped {
+            self.round_bw_ref
+                .store(bw_now.min(pending), Ordering::Relaxed);
+            self.flat_rounds.store(0, Ordering::Relaxed);
+            self.sag_rounds.store(0, Ordering::Relaxed);
+        } else if step_now {
+            // First round over the bar: wait for the confirmation.
+            self.sag_rounds.store(0, Ordering::Relaxed);
+        } else if sagged {
+            let sag = self.sag_rounds.fetch_add(1, Ordering::Relaxed) + 1;
+            if sag >= BUDGET_FULL_ROUNDS {
+                // Path lost capacity (or its loop lengthened under someone
+                // else's queue): re-arm from where it is now. Bandwidth
+                // cannot rise before the budget does, so from here the
+                // probes carry the recovery, not the step test.
+                self.round_bw_ref.store(bw_now, Ordering::Relaxed);
+                self.prev_round_bw.store(0, Ordering::Relaxed);
+                self.flat_rounds.store(0, Ordering::Relaxed);
+                self.sag_rounds.store(0, Ordering::Relaxed);
+                self.idle_rounds.store(0, Ordering::Relaxed);
+                let next = cur.min(carried.saturating_mul(2)).max(floor);
+                self.budget
+                    .store(next.clamp(floor, ceil), Ordering::Relaxed);
+                return;
+            }
+        } else {
+            self.sag_rounds.store(0, Ordering::Relaxed);
+        }
+
+        let next = if limited {
+            self.idle_rounds.store(0, Ordering::Relaxed);
+            if probe_from != 0 {
+                // A ×1.25 probe can raise bandwidth by at most 25 %, so the
+                // full step bar would never keep one; half of it means the
+                // link had room.
+                if bw_now as f64 >= full as f64 * (1.0 + BUDGET_GROWTH_MIN / 2.0) {
+                    self.round_bw_ref.store(bw_now, Ordering::Relaxed);
+                    self.flat_rounds.store(0, Ordering::Relaxed);
+                    cur
+                } else {
+                    // Probe bought nothing: back to the held allowance.
+                    probe_from
+                }
+            } else if stepped {
+                mul(cur, BUDGET_GROW)
+            } else if step_now {
+                cur
+            } else {
+                let flat = self.flat_rounds.fetch_add(1, Ordering::Relaxed) + 1;
+                if flat >= BUDGET_FULL_ROUNDS
+                    && (flat - BUDGET_FULL_ROUNDS).is_multiple_of(BUDGET_PROBE_EVERY)
+                {
+                    self.probe_from.store(cur, Ordering::Relaxed);
+                    mul(cur, BUDGET_PROBE)
+                } else {
+                    cur
+                }
+            }
+        } else {
+            let idle = self.idle_rounds.fetch_add(1, Ordering::Relaxed) + 1;
+            if idle >= BUDGET_IDLE_SHRINK {
+                cur.min(carried.saturating_mul(2)).max(floor)
+            } else {
+                cur
+            }
+        };
+        self.budget
+            .store(next.clamp(floor, ceil), Ordering::Relaxed);
+    }
+
+    /// Per-path send budget (overlay cwnd), bytes.
     pub fn budget_bytes(&self) -> u64 {
         let floor = self.budget_floor.load(Ordering::Relaxed);
         let ceil = self.budget_ceil.load(Ordering::Relaxed).max(floor);
-        let bw = self.bw_bytes_s();
-        if bw == 0 || !self.rtt_known() {
-            return floor;
-        }
-        let bdp = bw as f64 * self.rtt().as_secs_f64();
-        let twice = 2.0 * bdp;
-        if !twice.is_finite() {
-            return floor;
-        }
-        (twice as u64).clamp(floor, ceil)
+        self.budget.load(Ordering::Relaxed).clamp(floor, ceil)
     }
 
     /// Budget minus inflight; 0 when at or over budget.
@@ -395,7 +672,7 @@ impl PathState {
         let mut g = self.pending_acks.lock().unwrap();
         match g.entry(ack.stream_id) {
             std::collections::hash_map::Entry::Occupied(e)
-                if e.get().acked_offset >= ack.acked_offset => {}
+                if e.get().acked_offset > ack.acked_offset => {}
             std::collections::hash_map::Entry::Occupied(mut e) => {
                 e.insert(ack);
             }
@@ -482,6 +759,7 @@ impl PathState {
 
     pub fn record_rtt(&self, rtt: Duration) {
         let sample = rtt.as_micros() as u64;
+        self.note_loop_rtt(rtt);
         let old = self.rtt_ewma_us.load(Ordering::Relaxed);
         let fast = if old == 0 {
             sample
@@ -1253,11 +1531,13 @@ mod tests {
             stream_id: 1,
             acked_offset: 200,
             window: 2,
+            sack: vec![],
         });
         p.restore_acks([StreamAck {
             stream_id: 1,
             acked_offset: 100,
             window: 1,
+            sack: vec![],
         }]);
         let g = p.pending_acks.lock().unwrap();
         let ack = g.get(&1).unwrap();

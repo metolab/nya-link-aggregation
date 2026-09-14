@@ -102,6 +102,7 @@ pub async fn handle_incoming(mut incoming: mpsc::Receiver<IncomingStream>) {
                     let slots = Arc::new(OriginPeerSlots::default());
                     let mut origin = HopProbe::wrap(tcp, origin_clock.clone())
                         .sample_peer_last_on_read(overlay_clock.clone(), slots.clone());
+                    let stats_src = inc.session_handle();
                     let mut overlay = HopProbe::wrap(inc.io, overlay_clock.clone());
                     let t_copy = Instant::now();
                     let copy = tokio::io::copy_bidirectional(&mut origin, &mut overlay).await;
@@ -128,6 +129,8 @@ pub async fn handle_incoming(mut incoming: mpsc::Receiver<IncomingStream>) {
                         rx_bytes: Some(origin_clock.rx_bytes()),
                         tx_bytes: Some(origin_clock.tx_bytes()),
                         copy_err,
+                        // `overlay` still owns the tunnel half: stream is live.
+                        stream: stats_src.stream_stats(stream_id),
                         ..Default::default()
                     });
                 }

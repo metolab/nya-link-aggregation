@@ -197,8 +197,14 @@ pub struct Counters {
     pub data_dup_rx_bytes: AtomicU64,
     /// ACKs sent for duplicates after recv_fin / past close_off (P5).
     pub ack_after_fin: AtomicU64,
+    /// P3b receiver window probes started / kept / reverted.
+    pub recv_cap_probes: AtomicU64,
+    pub recv_cap_probe_kept: AtomicU64,
+    pub recv_cap_probe_reverted: AtomicU64,
     /// Pieces re-sent because the frame never reached a writer queue (P4).
     pub data_dropped_resend: AtomicU64,
+    /// Pieces released by a SACK range (delivered behind a hole).
+    pub data_sacked: AtomicU64,
     pub picks_unknown_rtt: AtomicU64,
     pub picks_unknown_over_known: AtomicU64,
     pub failbacks: AtomicU64,
@@ -257,7 +263,11 @@ impl Default for Counters {
             send_window_limited_with_room: AtomicU64::new(0),
             data_dup_rx_bytes: AtomicU64::new(0),
             ack_after_fin: AtomicU64::new(0),
+            recv_cap_probes: AtomicU64::new(0),
+            recv_cap_probe_kept: AtomicU64::new(0),
+            recv_cap_probe_reverted: AtomicU64::new(0),
             data_dropped_resend: AtomicU64::new(0),
+            data_sacked: AtomicU64::new(0),
             picks_unknown_rtt: AtomicU64::new(0),
             picks_unknown_over_known: AtomicU64::new(0),
             failbacks: AtomicU64::new(0),
@@ -315,6 +325,14 @@ pub struct PathSnap {
     pub picks: u64,
     /// Kernel `TCP_INFO` of the path socket (Linux; `None` elsewhere / tests).
     pub tcp: Option<crate::net::TcpInfo>,
+    /// P2 send budget (overlay cwnd), bytes.
+    pub budget_bytes: u64,
+    /// P2 ACK-clock delivery rate, bytes/s (windowed max; 0 = none).
+    pub bw_bytes_s: u64,
+    /// Loaded ACK RTT, µs (0 = unknown).
+    pub ack_rtt_us: u64,
+    /// Bytes ACKed on this path, cumulative.
+    pub delivered: u64,
 }
 
 /// Named WAN link (`a` / `b`), rolled up from its TCP connections (`a#0`, `a#1`).
@@ -446,7 +464,11 @@ pub struct Snapshot {
     pub send_window_limited_with_room: u64,
     pub data_dup_rx_bytes: u64,
     pub ack_after_fin: u64,
+    pub recv_cap_probes: u64,
+    pub recv_cap_probe_kept: u64,
+    pub recv_cap_probe_reverted: u64,
     pub data_dropped_resend: u64,
+    pub data_sacked: u64,
     pub picks_unknown_rtt: u64,
     pub picks_unknown_over_known: u64,
     pub failbacks: u64,
@@ -510,7 +532,11 @@ impl Snapshot {
         self.send_window_limited_with_room += other.send_window_limited_with_room;
         self.data_dup_rx_bytes += other.data_dup_rx_bytes;
         self.ack_after_fin += other.ack_after_fin;
+        self.recv_cap_probes += other.recv_cap_probes;
+        self.recv_cap_probe_kept += other.recv_cap_probe_kept;
+        self.recv_cap_probe_reverted += other.recv_cap_probe_reverted;
         self.data_dropped_resend += other.data_dropped_resend;
+        self.data_sacked += other.data_sacked;
         self.picks_unknown_rtt += other.picks_unknown_rtt;
         self.picks_unknown_over_known += other.picks_unknown_over_known;
         self.failbacks += other.failbacks;
@@ -571,7 +597,11 @@ impl Counters {
                 .load(Ordering::Relaxed),
             data_dup_rx_bytes: self.data_dup_rx_bytes.load(Ordering::Relaxed),
             ack_after_fin: self.ack_after_fin.load(Ordering::Relaxed),
+            recv_cap_probes: self.recv_cap_probes.load(Ordering::Relaxed),
+            recv_cap_probe_kept: self.recv_cap_probe_kept.load(Ordering::Relaxed),
+            recv_cap_probe_reverted: self.recv_cap_probe_reverted.load(Ordering::Relaxed),
             data_dropped_resend: self.data_dropped_resend.load(Ordering::Relaxed),
+            data_sacked: self.data_sacked.load(Ordering::Relaxed),
             picks_unknown_rtt: self.picks_unknown_rtt.load(Ordering::Relaxed),
             picks_unknown_over_known: self.picks_unknown_over_known.load(Ordering::Relaxed),
             failbacks: self.failbacks.load(Ordering::Relaxed),
@@ -627,6 +657,10 @@ impl Counters {
                     backup: false,
                     picks: p.picks.load(Ordering::Relaxed),
                     tcp: p.tcp_info(),
+                    budget_bytes: p.budget_bytes(),
+                    bw_bytes_s: p.bw_bytes_s(),
+                    ack_rtt_us: p.ack_rtt_us.load(Ordering::Relaxed),
+                    delivered: p.delivered.load(Ordering::Relaxed),
                 })
                 .collect(),
             links: Vec::new(),

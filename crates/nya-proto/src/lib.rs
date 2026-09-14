@@ -12,6 +12,7 @@ pub use codec::{read_frame, write_frame, MAX_FRAME_SIZE};
 pub use frame::{
     CreateSession, CreateSessionOk, Frame, HandshakeErr, JoinSession, JoinSessionOk, Ping, Pong,
     ProtoError, ResetReason, StreamAck, StreamClose, StreamData, StreamOpen, StreamReset, Target,
+    MAX_SACK_RANGES,
 };
 
 pub const PROTOCOL_VERSION: u8 = 2;
