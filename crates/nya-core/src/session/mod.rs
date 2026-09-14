@@ -330,6 +330,28 @@ impl Session {
     where
         T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
+        self.start_path_fd(name, io, None)
+    }
+
+    /// [`add_path`](Self::add_path) with the underlying socket's dup for
+    /// `TCP_INFO` gauges. Binaries pass `PathFd::dup_from(&tcp)`.
+    pub async fn add_path_fd<T>(&self, name: String, io: T, fd: Option<crate::net::PathFd>)
+    where
+        T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let rx = self.start_path_fd(name, io, fd);
+        let _ = rx.await;
+    }
+
+    pub fn start_path_fd<T>(
+        &self,
+        name: String,
+        io: T,
+        fd: Option<crate::net::PathFd>,
+    ) -> tokio::sync::oneshot::Receiver<()>
+    where
+        T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
         if self.is_dead() {
             let _ = done_tx.send(());
@@ -346,6 +368,7 @@ impl Session {
         let (tx, rx) = mpsc::channel(chan);
         let (utx, urx) = mpsc::channel(chan);
         let path = PathState::with_writers(id, name.clone(), tx, utx);
+        *path.tcp_fd.lock().unwrap() = fd;
         path.stable_up_hold_us.store(
             self.inner.cfg.tuning.stable_up_hold.as_micros() as u64,
             Ordering::Relaxed,

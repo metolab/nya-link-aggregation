@@ -282,6 +282,8 @@ pub struct PathSnap {
     pub ack_pending: u64,
     pub backup: bool,
     pub picks: u64,
+    /// Kernel `TCP_INFO` of the path socket (Linux; `None` elsewhere / tests).
+    pub tcp: Option<crate::net::TcpInfo>,
 }
 
 /// Named WAN link (`a` / `b`), rolled up from its TCP connections (`a#0`, `a#1`).
@@ -570,6 +572,7 @@ impl Counters {
                     ack_pending: p.ack_pending(),
                     backup: false,
                     picks: p.picks.load(Ordering::Relaxed),
+                    tcp: p.tcp_info(),
                 })
                 .collect(),
             links: Vec::new(),

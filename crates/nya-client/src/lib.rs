@@ -307,7 +307,10 @@ async fn connect_one(
         .process()
         .reconnect_ok
         .fetch_add(1, Ordering::Relaxed);
-    session.add_path(path_name.to_string(), tls).await;
+    let path_fd = nya_core::PathFd::dup_from(tls.get_ref().0);
+    session
+        .add_path_fd(path_name.to_string(), tls, path_fd)
+        .await;
     Ok(())
 }
 

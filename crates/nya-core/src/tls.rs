@@ -192,7 +192,7 @@ pub async fn connect_pinned(
         .await
         .map_err(|e| TlsError::General(e.to_string()))?;
     tracing::debug!(%addr, "tcp connected");
-    let _ = tcp.set_nodelay(true);
+    crate::net::tune_path_socket(&tcp);
     let host = addr
         .rsplit_once(':')
         .map(|(h, _)| h.trim_matches(|c| c == '[' || c == ']'))

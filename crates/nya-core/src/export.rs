@@ -223,7 +223,7 @@ fn format_paths(paths: &[crate::metrics::PathSnap]) -> String {
         .iter()
         .map(|p| {
             format!(
-                "{}={}/{}/{}ms {} inf={} st={} cong={} rx={} tx={} ping={} q={}/{}{}{}{}",
+                "{}={}/{}/{}ms {} inf={} st={} cong={} rx={} tx={} ping={} q={}/{}{}{}{}{}",
                 p.name,
                 p.rtt_us / 1000,
                 p.stable_rtt_us / 1000,
@@ -243,6 +243,18 @@ fn format_paths(paths: &[crate::metrics::PathSnap]) -> String {
                     format!(" p={}", p.picks)
                 } else {
                     String::new()
+                },
+                match p.tcp {
+                    // cwnd / unacked / notsent in KiB, kernel srtt ms, retrans
+                    Some(t) => format!(
+                        " tcp={}/{}/{}k {}ms rtx={}",
+                        t.cwnd_bytes / 1024,
+                        t.unacked_bytes / 1024,
+                        t.notsent_bytes / 1024,
+                        t.rtt_us / 1000,
+                        t.total_retrans
+                    ),
+                    None => String::new(),
                 },
             )
         })
@@ -426,7 +438,7 @@ mod tests {
         assert!(names.contains("nya_path_rtt_us"));
         assert!(names.contains("nya_failover_ms_bucket"));
         let n_counter = names.iter().filter(|n| n.ends_with("_total")).count();
-        assert_eq!(n_counter, 54, "{names:?}");
+        assert_eq!(n_counter, 55, "{names:?}");
         assert!(names.contains("nya_path_ack_pending"));
         assert!(names.contains("nya_ack_flush_us_bucket"));
         assert!(names.contains("nya_path_outlier_recycle_total"));

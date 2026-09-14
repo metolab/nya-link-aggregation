@@ -564,6 +564,51 @@ pub fn visit_metrics(ps: &ProcessSnapshot, sink: &mut impl MetricSink) {
             &lab,
             u64::from(pth.rtt_known),
         );
+        // Kernel TCP view (P6). Zero when the platform cannot answer.
+        let t = pth.tcp.unwrap_or_default();
+        sink.gauge(
+            "nya_path_tcp_known",
+            "1 if TCP_INFO readable",
+            &lab,
+            u64::from(pth.tcp.is_some()),
+        );
+        sink.gauge(
+            "nya_path_tcp_cwnd_bytes",
+            "kernel snd_cwnd × mss",
+            &lab,
+            t.cwnd_bytes,
+        );
+        sink.gauge("nya_path_tcp_rtt_us", "kernel srtt", &lab, t.rtt_us as u64);
+        sink.gauge(
+            "nya_path_tcp_min_rtt_us",
+            "kernel min rtt",
+            &lab,
+            t.min_rtt_us as u64,
+        );
+        sink.gauge(
+            "nya_path_tcp_unacked_bytes",
+            "kernel unacked × mss",
+            &lab,
+            t.unacked_bytes,
+        );
+        sink.gauge(
+            "nya_path_tcp_notsent_bytes",
+            "kernel not-yet-sent bytes",
+            &lab,
+            t.notsent_bytes as u64,
+        );
+        sink.gauge(
+            "nya_path_tcp_delivery_rate_bytes_s",
+            "kernel delivery rate",
+            &lab,
+            t.delivery_rate_bytes_s,
+        );
+        sink.counter_labeled(
+            "nya_path_tcp_retrans_total",
+            "kernel total_retrans of this socket",
+            &lab,
+            t.total_retrans as u64,
+        );
     }
 }
 

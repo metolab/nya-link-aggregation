@@ -16,7 +16,8 @@
 //! * [`path`] — per-connection RTT, inflight, dual writer queues
 //! * [`session`] — multiplexed streams + steering
 //! * [`Tuning`] — hidden implementation knobs (not TOML)
-#![forbid(unsafe_code)]
+// One scoped exception: `net::imp::tcp_info` (`getsockopt(TCP_INFO)`), see there.
+#![deny(unsafe_code)]
 
 mod auth;
 mod catalog;
@@ -26,6 +27,7 @@ mod handshake;
 mod health;
 mod hop;
 mod metrics;
+pub mod net;
 mod path;
 mod scheduler;
 mod session;
@@ -54,6 +56,7 @@ pub use metrics::{
     ProcessSnapshot, Snapshot as SessionSnapshot, ACK_FLUSH_US_BOUNDS, FAILOVER_MS_BOUNDS,
     LIFETIME_MS_BOUNDS, STALL_MS_BOUNDS,
 };
+pub use net::{parse_tcp_info, tune_path_socket, PathFd, SocketTuning, TcpInfo};
 pub use session::{IncomingStream, Session, SessionError, SessionTable};
 pub use stream::TunnelStream;
 pub use tls::{

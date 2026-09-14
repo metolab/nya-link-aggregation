@@ -80,6 +80,9 @@ pub struct PathState {
     bulk_queued: AtomicU64,
     /// `open_stream` hits that actually sent StreamOpen on this dest.
     pub picks: AtomicU64,
+    /// Duplicated socket fd for `TCP_INFO` (P6). `None` off Linux, in unit
+    /// tests over duplex pipes, and after path IO exit.
+    pub tcp_fd: std::sync::Mutex<Option<crate::net::PathFd>>,
 }
 
 impl PathState {
@@ -130,11 +133,21 @@ impl PathState {
             urgent_queued: AtomicU64::new(0),
             bulk_queued: AtomicU64::new(0),
             picks: AtomicU64::new(0),
+            tcp_fd: std::sync::Mutex::new(None),
         })
     }
 
     pub fn link(&self) -> &str {
         link_key(&self.name)
+    }
+
+    /// Kernel TCP state of this path's socket, if we hold a dup.
+    pub fn tcp_info(&self) -> Option<crate::net::TcpInfo> {
+        self.tcp_fd
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|f| f.tcp_info())
     }
 
     pub fn inflight_bytes(&self) -> u64 {
@@ -1123,6 +1136,8 @@ pub fn spawn_path_io<T>(
                 }
             }
         }
+        // Close our TCP_INFO dup before the socket halves drop.
+        *path.tcp_fd.lock().unwrap() = None;
         session.path_failed(path.id);
         // Drop parked unsent rows on this Arc. If maintain already path_failed,
         // that call was a no-op; merge leftovers onto alt from the local Arc.

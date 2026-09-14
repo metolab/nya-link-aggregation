@@ -192,6 +192,8 @@ async fn serve_one(
     psk: Arc<Vec<u8>>,
 ) -> Result<()> {
     tcp.set_nodelay(true)?;
+    nya_core::tune_path_socket(&tcp);
+    let path_fd = nya_core::PathFd::dup_from(&tcp);
     if table.is_closed() {
         return Ok(());
     }
@@ -255,7 +257,7 @@ async fn serve_one(
                 )
                 .entered();
             }
-            session.add_path(path_name, tls).await;
+            session.add_path_fd(path_name, tls, path_fd).await;
         }
         Ok(HandshakeResult::Joined { session, path_name }) => {
             {
@@ -285,7 +287,7 @@ async fn serve_one(
                 )
                 .entered();
             }
-            session.add_path(path_name, tls).await;
+            session.add_path_fd(path_name, tls, path_fd).await;
         }
         Err(e) if handshake_is_noise(&e) => {
             table.process().inc_handshake_fail(&e);

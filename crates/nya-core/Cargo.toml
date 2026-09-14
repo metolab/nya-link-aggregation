@@ -28,6 +28,8 @@ futures-util = { version = "0.3", features = ["sink"] }
 tracing.workspace = true
 x509-parser.workspace = true
 dns-lookup = "4"
+libc.workspace = true
+socket2 = { version = "0.6", features = ["all"] }
 
 [dev-dependencies]
 rcgen.workspace = true
