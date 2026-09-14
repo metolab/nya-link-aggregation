@@ -20,7 +20,6 @@ use super::impair::{ConnCtrl, ImpairInner};
 const MSS: usize = 1200;
 const INIT_CWND: u32 = 16;
 const MIN_CWND: u32 = 2;
-const MAX_CWND: u32 = 64;
 
 struct Pkt {
     seq: u64,
@@ -115,7 +114,7 @@ where
                         } else {
                             (srtt * 7 + sample) / 8
                         };
-                        cwnd = (cwnd + 1).min(MAX_CWND);
+                        cwnd = (cwnd + 1).min(inner.max_cwnd(MSS));
                     }
                 }
                 _ = async {
@@ -143,7 +142,7 @@ where
                             }
                             inner.retrans.fetch_add(1, Ordering::Relaxed);
                             *last = Instant::now();
-                            transmit(&inner, &conn, seq, buf.clone(), &wire_tx);
+                            transmit(&inner, &conn, seq, buf.clone(), &wire_tx, fwd);
                         }
                     }
                 }
@@ -160,7 +159,7 @@ where
                         let seq = next_seq;
                         next_seq += 1;
                         inflight.insert(seq, (pkt.clone(), Instant::now(), 1));
-                        transmit(&inner, &conn, seq, pkt, &wire_tx);
+                        transmit(&inner, &conn, seq, pkt, &wire_tx, fwd);
                         if take < MSS {
                             break;
                         }
@@ -198,6 +197,7 @@ fn transmit(
     seq: u64,
     buf: Vec<u8>,
     wire: &mpsc::UnboundedSender<Pkt>,
+    fwd: bool,
 ) {
     if inner.blackhole.load(Ordering::Relaxed) || conn.blackhole.load(Ordering::Relaxed) {
         return;
@@ -207,14 +207,60 @@ fn transmit(
         inner.drops.fetch_add(1, Ordering::Relaxed);
         return; // lost this attempt; sender will RTO
     }
+    // Shared bottleneck: one FIFO + departure clock per link direction. All
+    // connections on the link queue behind each other, exactly like a real
+    // access link; tail-drop when the byte queue is full.
+    let depart = match bottleneck_depart(inner, fwd, buf.len() as u64) {
+        Ok(d) => d,
+        Err(()) => {
+            inner.queue_drops.fetch_add(1, Ordering::Relaxed);
+            inner.drops.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+    };
     let delay = inner.one_way();
     let tx = wire.clone();
     let inner = inner.clone();
+    let n = buf.len() as u64;
     tokio::spawn(async move {
+        if let Some(at) = depart {
+            tokio::time::sleep_until(tokio::time::Instant::from_std(at)).await;
+            let mut q = if fwd {
+                inner.q_fwd.lock().unwrap()
+            } else {
+                inner.q_rev.lock().unwrap()
+            };
+            q.queued_bytes = q.queued_bytes.saturating_sub(n);
+        }
         if delay > Duration::ZERO {
             tokio::time::sleep(delay).await;
         }
         let _ = tx.send(Pkt { seq, buf });
         inner.wake.notify_waiters();
     });
+}
+
+/// `Ok(None)`: no rate limit. `Ok(Some(t))`: departs the bottleneck at `t`.
+/// `Err`: queue full, packet dropped.
+fn bottleneck_depart(inner: &ImpairInner, fwd: bool, n: u64) -> Result<Option<Instant>, ()> {
+    let rate = inner.rate_bps.load(Ordering::Relaxed);
+    if rate == 0 {
+        return Ok(None);
+    }
+    let qmax = inner.queue_bytes.load(Ordering::Relaxed);
+    let mut q = if fwd {
+        inner.q_fwd.lock().unwrap()
+    } else {
+        inner.q_rev.lock().unwrap()
+    };
+    let now = Instant::now();
+    let start = q.next_free.filter(|t| *t > now).unwrap_or(now);
+    if qmax != 0 && q.queued_bytes + n > qmax {
+        return Err(());
+    }
+    let ser = Duration::from_nanos(n.saturating_mul(8).saturating_mul(1_000_000_000) / rate);
+    let depart = start + ser;
+    q.next_free = Some(depart);
+    q.queued_bytes += n;
+    Ok(Some(depart))
 }

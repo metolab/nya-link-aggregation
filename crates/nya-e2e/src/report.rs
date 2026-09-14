@@ -201,7 +201,7 @@ pub fn print_suite(reports: &[ScenarioReport]) {
                     || n.contains("stream table leak")
                     || n.contains("migrate storm")
                     || n.contains("short-stream"));
-            if show || n.contains("churn=") {
+            if show || n.contains("churn=") || n.starts_with("bulk=") {
                 println!("    note: {n}");
             }
         }

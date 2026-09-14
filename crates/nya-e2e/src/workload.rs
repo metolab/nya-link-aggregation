@@ -265,3 +265,48 @@ pub async fn bulk_echo(tcp: &mut TcpStream, nbytes: usize) -> Result<(Duration, 
     }
     Ok((t0.elapsed(), recv == send))
 }
+
+/// Full-duplex bulk through the echo: write `nbytes` as fast as the stream
+/// accepts while reading the echo concurrently. Unlike [`bulk_echo`] (16 KiB
+/// stop-and-wait) this saturates the path in both directions, so elapsed
+/// time measures throughput, not round trips. Returns (elapsed, intact).
+pub async fn bulk_stream(tcp: &mut TcpStream, nbytes: usize) -> Result<(Duration, bool)> {
+    let (mut rd, mut wr) = tcp.split();
+    let t0 = Instant::now();
+    let writer = async move {
+        let mut chunk = vec![0u8; 64 * 1024];
+        let mut off = 0usize;
+        while off < nbytes {
+            let n = (nbytes - off).min(chunk.len());
+            for (i, b) in chunk[..n].iter_mut().enumerate() {
+                *b = ((off + i) % 251) as u8;
+            }
+            wr.write_all(&chunk[..n]).await?;
+            off += n;
+        }
+        wr.flush().await?;
+        Ok::<(), std::io::Error>(())
+    };
+    let reader = async move {
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut off = 0usize;
+        let mut intact = true;
+        while off < nbytes {
+            let n = rd.read(&mut buf).await?;
+            if n == 0 {
+                return Ok::<(usize, bool), std::io::Error>((off, false));
+            }
+            for (i, b) in buf[..n].iter().enumerate() {
+                if *b != ((off + i) % 251) as u8 {
+                    intact = false;
+                }
+            }
+            off += n;
+        }
+        Ok((off, intact))
+    };
+    let (w, r) = tokio::join!(writer, reader);
+    w?;
+    let (got, intact) = r?;
+    Ok((t0.elapsed(), intact && got == nbytes))
+}

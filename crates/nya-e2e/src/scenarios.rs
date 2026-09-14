@@ -1828,6 +1828,377 @@ pub async fn churn_during_path_flap() -> Result<ScenarioReport> {
     Ok(r)
 }
 
+// ---------------------------------------------------------------------------
+// Bottleneck bulk (design-path-budget-ack-clock): rate-limited links with a
+// shared byte FIFO. These are the only rows where the WAN, not the overlay,
+// is meant to be the limiter — goodput must approach the link rate.
+// ---------------------------------------------------------------------------
+
+const MBIT: u64 = 1_000_000;
+
+fn bottleneck_spec(links: &[(&str, u64, u64, u64)], connections: u32) -> HarnessSpec {
+    HarnessSpec {
+        link_cfgs: links
+            .iter()
+            .map(|(name, rtt_ms, rate_bps, queue_bytes)| {
+                (
+                    (*name).to_string(),
+                    ImpairConfig {
+                        rtt: Duration::from_millis(*rtt_ms),
+                        rate_bps: Some(*rate_bps),
+                        queue_bytes: Some(*queue_bytes),
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect(),
+        connections,
+        psk: "e2e-psk".into(),
+    }
+}
+
+/// Per-direction goodput of a full-duplex bulk copy, bytes/s.
+fn goodput(nbytes: usize, d: Duration) -> f64 {
+    nbytes as f64 / d.as_secs_f64().max(1e-9)
+}
+
+struct BulkOutcome {
+    nbytes: usize,
+    elapsed: Option<Duration>,
+    intact: bool,
+    timed_out: bool,
+    io_error: bool,
+}
+
+async fn run_bulk(h: &Harness, nbytes: usize, watchdog: Duration) -> BulkOutcome {
+    let Ok(mut tcp) = h.connect_socks_echo().await else {
+        return BulkOutcome {
+            nbytes,
+            elapsed: None,
+            intact: false,
+            timed_out: false,
+            io_error: true,
+        };
+    };
+    match tokio::time::timeout(watchdog, crate::workload::bulk_stream(&mut tcp, nbytes)).await {
+        Ok(Ok((d, intact))) => BulkOutcome {
+            nbytes,
+            elapsed: Some(d),
+            intact,
+            timed_out: false,
+            io_error: false,
+        },
+        Ok(Err(_)) => BulkOutcome {
+            nbytes,
+            elapsed: None,
+            intact: false,
+            timed_out: false,
+            io_error: true,
+        },
+        Err(_) => BulkOutcome {
+            nbytes,
+            elapsed: None,
+            intact: false,
+            timed_out: true,
+            io_error: false,
+        },
+    }
+}
+
+/// Report: one sample per copy (rtt = elapsed), gate is a p99 on elapsed.
+/// `min_rate` is the goodput floor in bytes/s per copy (aggregate for the
+/// concurrent rows is checked by the caller via `notes` + `min_success`).
+fn bulk_report(
+    name: &str,
+    h: &Harness,
+    outcomes: &[BulkOutcome],
+    gate: Duration,
+    snap0: &nya_core::SessionSnapshot,
+) -> ScenarioReport {
+    let mut stats = WorkloadStats::default();
+    let mut lines = Vec::new();
+    for o in outcomes {
+        match o.elapsed {
+            Some(d) if o.intact => {
+                stats.bytes_ok += o.nbytes as u64;
+                stats.samples.push(crate::workload::PingSample {
+                    at: Instant::now() - d,
+                    rtt: Some(d),
+                });
+                lines.push(format!(
+                    "{}MiB/{:.2}s={:.2}MB/s",
+                    o.nbytes / (1024 * 1024),
+                    d.as_secs_f64(),
+                    goodput(o.nbytes, d) / 1e6
+                ));
+            }
+            _ => {
+                stats.io_errors += u64::from(o.io_error || !o.intact);
+                stats.timeouts += u64::from(o.timed_out);
+                stats.disconnect |= o.io_error;
+                stats.samples.push(crate::workload::PingSample {
+                    at: Instant::now(),
+                    rtt: None,
+                });
+                lines.push(format!(
+                    "{}MiB FAIL intact={} timeout={} io={}",
+                    o.nbytes / (1024 * 1024),
+                    o.intact,
+                    o.timed_out,
+                    o.io_error
+                ));
+            }
+        }
+    }
+    let mut r = finish(
+        name,
+        h,
+        stats,
+        Sla {
+            must_survive: true,
+            p99_ms: Some(gate.as_millis() as u64),
+            failover_ms: None,
+            min_success: 1.0,
+        },
+        None,
+    );
+    let app_rx: u64 = outcomes.iter().map(|o| o.nbytes as u64).sum();
+    let ov_rx = r.snap.bytes_data_rx.saturating_sub(snap0.bytes_data_rx);
+    let dup = ov_rx.saturating_sub(app_rx) as f64 / app_rx.max(1) as f64;
+    let links: Vec<String> = h
+        .links
+        .iter()
+        .map(|l| {
+            let s = l.stats();
+            format!(
+                "{}:rate={}Mbps qdrops={} retrans={}",
+                s.name,
+                s.rate_bps / MBIT,
+                s.queue_drops,
+                s.retrans
+            )
+        })
+        .collect();
+    r.notes.push(format!(
+        "bulk=copies=[{}] gate={:?} dup_rx={:.1}% hedge_d={} rtx_d={} window_blocks_d={} mig_d={} stall_p50={:?} links=[{}]",
+        lines.join(", "),
+        gate,
+        dup * 100.0,
+        r.snap.data_hedge.saturating_sub(snap0.data_hedge),
+        r.snap.data_retransmit.saturating_sub(snap0.data_retransmit),
+        r.snap.window_blocks.saturating_sub(snap0.window_blocks),
+        r.snap.migrates.saturating_sub(snap0.migrates),
+        nya_core::percentile(&r.snap.stall_ms, nya_core::STALL_MS_BOUNDS, 50.0),
+        links.join(" "),
+    ));
+    r
+}
+
+/// Gate elapsed for `nbytes` at `frac` of `rate_bps` (per direction).
+fn rate_gate(nbytes: usize, rate_bps: u64, frac: f64) -> Duration {
+    let bytes_s = rate_bps as f64 / 8.0 * frac;
+    Duration::from_secs_f64(nbytes as f64 / bytes_s)
+}
+
+/// One 50 Mbps / 10 ms link, one TCP: a lone bulk stream must reach ≥ 80 %
+/// of the link rate. This is the window-floor-lock row: 128 KiB / loop at
+/// a 2×BDP queue is ~40 % of the rate.
+pub async fn bulk_bottleneck_single() -> Result<ScenarioReport> {
+    const RATE: u64 = 50 * MBIT;
+    let h = start(bottleneck_spec(&[("a", 10, RATE, 128 * 1024)], 1)).await?;
+    let snap0 = h.session.snapshot();
+    const N: usize = 12 * 1024 * 1024;
+    let o = run_bulk(&h, N, Duration::from_secs(40)).await;
+    Ok(bulk_report(
+        "bulk_bottleneck_single",
+        &h,
+        &[o],
+        rate_gate(N, RATE, 0.8),
+        &snap0,
+    ))
+}
+
+/// Two bulk streams on the same 50 Mbps TCP: aggregate ≥ 80 % and the
+/// receiver must not see hedge duplicates (in-order TCP ⇒ no per-piece loss).
+pub async fn bulk_shared_two_streams() -> Result<ScenarioReport> {
+    const RATE: u64 = 50 * MBIT;
+    let h = start(bottleneck_spec(&[("a", 10, RATE, 128 * 1024)], 1)).await?;
+    let snap0 = h.session.snapshot();
+    const N: usize = 6 * 1024 * 1024;
+    let (a, b) = tokio::join!(
+        run_bulk(&h, N, Duration::from_secs(40)),
+        run_bulk(&h, N, Duration::from_secs(40))
+    );
+    // Each copy shares the link: gate is 2N at 80 % of the rate.
+    let mut r = bulk_report(
+        "bulk_shared_two_streams",
+        &h,
+        &[a, b],
+        rate_gate(2 * N, RATE, 0.8),
+        &snap0,
+    );
+    let app_rx = 2 * N as u64;
+    let ov_rx = r.snap.bytes_data_rx.saturating_sub(snap0.bytes_data_rx);
+    if ov_rx > app_rx + app_rx / 50 {
+        r.notes.push(format!(
+            "duplicate payload {} > 2% of {}",
+            ov_rx.saturating_sub(app_rx),
+            app_rx
+        ));
+        r.sla.min_success = 2.0;
+    }
+    Ok(r)
+}
+
+/// Three 20 Mbps links, one TCP each: a single bulk stream must fan out once
+/// its sticky path is at budget. Gate: ≥ 2 links' worth at 80 %.
+pub async fn bulk_fanout_three_paths() -> Result<ScenarioReport> {
+    const RATE: u64 = 20 * MBIT;
+    let h = start(bottleneck_spec(
+        &[
+            ("a", 10, RATE, 64 * 1024),
+            ("b", 10, RATE, 64 * 1024),
+            ("c", 10, RATE, 64 * 1024),
+        ],
+        1,
+    ))
+    .await?;
+    let snap0 = h.session.snapshot();
+    const N: usize = 12 * 1024 * 1024;
+    let o = run_bulk(&h, N, Duration::from_secs(60)).await;
+    let mut r = bulk_report(
+        "bulk_fanout_three_paths",
+        &h,
+        &[o],
+        rate_gate(N, 2 * RATE, 0.8),
+        &snap0,
+    );
+    let used: Vec<String> = r
+        .snap
+        .paths
+        .iter()
+        .filter(|p| p.picks > 0 || p.inflight > 0)
+        .map(|p| p.name.clone())
+        .collect();
+    r.notes.push(format!("bulk=paths_seen={}", used.join(",")));
+    Ok(r)
+}
+
+/// Interactive echo beside a bulk copy on one 20 Mbps TCP. The kernel
+/// send buffer and the link FIFO are the only queues allowed in front of a
+/// ping: p99 must stay within a few link-queue drains, not seconds.
+pub async fn ping_under_bulk_bounded() -> Result<ScenarioReport> {
+    const RATE: u64 = 20 * MBIT;
+    let h = start(bottleneck_spec(&[("a", 10, RATE, 64 * 1024)], 1)).await?;
+    let snap0 = h.session.snapshot();
+    const N: usize = 6 * 1024 * 1024;
+    let bulk = {
+        let mut tcp = h.connect_socks_echo().await?;
+        tokio::spawn(async move { crate::workload::bulk_stream(&mut tcp, N).await })
+    };
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let mut tcp = h.connect_socks_echo().await?;
+    let stats = ping_for(&mut tcp, Duration::from_secs(2), PING, PING_TO).await;
+    let bulk_ok = matches!(bulk.await, Ok(Ok((_, true))));
+    let mut r = finish(
+        "ping_under_bulk_bounded",
+        &h,
+        stats,
+        Sla {
+            must_survive: true,
+            p99_ms: Some(300),
+            failover_ms: None,
+            min_success: 0.95,
+        },
+        None,
+    );
+    r.notes.push(format!(
+        "bulk=ok={bulk_ok} hedge_d={} window_blocks_d={} stall_p50={:?}",
+        r.snap.data_hedge.saturating_sub(snap0.data_hedge),
+        r.snap.window_blocks.saturating_sub(snap0.window_blocks),
+        nya_core::percentile(&r.snap.stall_ms, nya_core::STALL_MS_BOUNDS, 50.0),
+    ));
+    if !bulk_ok {
+        r.notes.push("bulk copy failed".into());
+        r.sla.min_success = 2.0;
+    }
+    Ok(r)
+}
+
+/// Two 20 Mbps links. Bulk on a healthy pool must produce zero hedges; a
+/// 1 s blackhole on the sticky link must still complete the copy.
+pub async fn hedge_only_on_silence() -> Result<ScenarioReport> {
+    const RATE: u64 = 20 * MBIT;
+    let h = start(bottleneck_spec(
+        &[("a", 10, RATE, 64 * 1024), ("b", 10, RATE, 64 * 1024)],
+        1,
+    ))
+    .await?;
+    let snap0 = h.session.snapshot();
+    const N: usize = 10 * 1024 * 1024;
+    let copy = {
+        let mut tcp = h.connect_socks_echo().await?;
+        tokio::spawn(async move { crate::workload::bulk_stream(&mut tcp, N).await })
+    };
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let healthy = h.session.snapshot();
+    let hedge_healthy = healthy.data_hedge.saturating_sub(snap0.data_hedge);
+    let rtx_healthy = healthy
+        .data_retransmit
+        .saturating_sub(snap0.data_retransmit);
+    // Blackhole whichever link carries the most in-flight bytes.
+    let victim = healthy
+        .links
+        .iter()
+        .max_by_key(|l| l.inflight)
+        .map(|l| l.name.clone())
+        .unwrap_or_else(|| "a".into());
+    h.link(&victim).set_blackhole(true);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    h.link(&victim).set_blackhole(false);
+    let o = match tokio::time::timeout(Duration::from_secs(40), copy).await {
+        Ok(Ok(Ok((d, intact)))) => BulkOutcome {
+            nbytes: N,
+            elapsed: Some(d),
+            intact,
+            timed_out: false,
+            io_error: false,
+        },
+        Ok(_) => BulkOutcome {
+            nbytes: N,
+            elapsed: None,
+            intact: false,
+            timed_out: false,
+            io_error: true,
+        },
+        Err(_) => BulkOutcome {
+            nbytes: N,
+            elapsed: None,
+            intact: false,
+            timed_out: true,
+            io_error: false,
+        },
+    };
+    // 10 MiB over two 20 Mbps links ≈ 2.1 s ideal; allow the 1 s hole plus
+    // recovery.
+    let mut r = bulk_report(
+        "hedge_only_on_silence",
+        &h,
+        &[o],
+        rate_gate(N, 2 * RATE, 0.8) + Duration::from_secs(4),
+        &snap0,
+    );
+    r.notes.push(format!(
+        "bulk=victim={victim} hedge_healthy={hedge_healthy} rtx_healthy={rtx_healthy} path_down_d={}",
+        r.snap.path_down.saturating_sub(snap0.path_down)
+    ));
+    if hedge_healthy > 0 {
+        r.notes.push("bulk hedged on a healthy (fresh) path".into());
+        r.sla.min_success = 2.0;
+    }
+    Ok(r)
+}
+
 pub struct Scenario {
     pub name: &'static str,
     pub long: bool,
@@ -1960,6 +2331,11 @@ pub fn catalog() -> Vec<Scenario> {
         sc!("bulk_plus_ping", false, bulk_plus_ping()),
         sc!("delay_spike_keeps_tcp", false, delay_spike_keeps_tcp()),
         sc!("same_class_mix_warm", false, same_class_mix_warm()),
+        sc!("bulk_bottleneck_single", false, bulk_bottleneck_single()),
+        sc!("bulk_shared_two_streams", false, bulk_shared_two_streams()),
+        sc!("bulk_fanout_three_paths", false, bulk_fanout_three_paths()),
+        sc!("ping_under_bulk_bounded", false, ping_under_bulk_bounded()),
+        sc!("hedge_only_on_silence", false, hedge_only_on_silence()),
     ]
 }
 

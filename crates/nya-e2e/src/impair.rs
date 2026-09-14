@@ -25,6 +25,12 @@ pub struct ImpairConfig {
     /// 0.0–1.0. A chunk is extra-stalled (RTO-like) with this probability.
     pub loss: f64,
     pub blackhole: bool,
+    /// Link bottleneck, bits per second, shared by every TCP connection on
+    /// the link and per direction. `None` = no rate limit (today's WAN).
+    pub rate_bps: Option<u64>,
+    /// Byte-bounded FIFO ahead of the bottleneck. Tail-drop when full; the
+    /// emulated TCP then RTOs and halves cwnd. `None` = unbounded queue.
+    pub queue_bytes: Option<u64>,
 }
 
 impl Default for ImpairConfig {
@@ -34,8 +40,17 @@ impl Default for ImpairConfig {
             jitter: Duration::ZERO,
             loss: 0.0,
             blackhole: false,
+            rate_bps: None,
+            queue_bytes: None,
         }
     }
+}
+
+/// Shared per-direction bottleneck: departure clock + bytes waiting.
+#[derive(Default)]
+pub(crate) struct QueueState {
+    pub next_free: Option<std::time::Instant>,
+    pub queued_bytes: u64,
 }
 
 pub(crate) struct ImpairInner {
@@ -52,6 +67,13 @@ pub(crate) struct ImpairInner {
     pub retrans: AtomicU64,
     pub conns: AtomicU64,
     pub drops: AtomicU64,
+    /// 0 = unlimited.
+    pub rate_bps: AtomicU64,
+    /// 0 = unbounded.
+    pub queue_bytes: AtomicU64,
+    pub queue_drops: AtomicU64,
+    pub q_fwd: Mutex<QueueState>,
+    pub q_rev: Mutex<QueueState>,
     kills: Mutex<Vec<tokio::sync::watch::Sender<bool>>>,
     conns_ctrl: Mutex<Vec<Arc<ConnCtrl>>>,
 }
@@ -75,6 +97,22 @@ impl ImpairInner {
 
     fn loss_p(&self) -> f64 {
         self.loss_ppm.load(Ordering::Relaxed) as f64 / 1_000_000.0
+    }
+
+    /// Emulated per-connection cwnd cap in packets. Without a rate limit the
+    /// historical 64 × MSS; with one, enough for 2×BDP plus the whole queue so
+    /// the emulated TCP is not the bottleneck the link is meant to be.
+    pub(crate) fn max_cwnd(&self, mss: usize) -> u32 {
+        const BASE: u32 = 64;
+        let rate = self.rate_bps.load(Ordering::Relaxed);
+        if rate == 0 {
+            return BASE;
+        }
+        let rtt_us = self.rtt_us.load(Ordering::Relaxed).max(1);
+        let bdp_bytes = rate / 8 * rtt_us / 1_000_000;
+        let q = self.queue_bytes.load(Ordering::Relaxed);
+        let pkts = (2 * bdp_bytes + q) / mss as u64;
+        (pkts as u32).clamp(BASE, 16_384)
     }
 }
 
@@ -107,6 +145,10 @@ pub struct LinkStats {
     pub drops: u64,
     /// WAN-level retransmits (packet loss recovery).
     pub retrans: u64,
+    /// Bottleneck rate (bps); 0 = unlimited.
+    pub rate_bps: u64,
+    /// Tail-drops at the bottleneck queue.
+    pub queue_drops: u64,
 }
 
 impl LinkHandle {
@@ -123,7 +165,18 @@ impl LinkHandle {
             conns: self.inner.conns.load(Ordering::Relaxed),
             drops: self.inner.drops.load(Ordering::Relaxed),
             retrans: self.inner.retrans.load(Ordering::Relaxed),
+            rate_bps: self.inner.rate_bps.load(Ordering::Relaxed),
+            queue_drops: self.inner.queue_drops.load(Ordering::Relaxed),
         }
+    }
+
+    /// Change the bottleneck rate mid-run. `None` = unlimited.
+    pub fn set_rate(&self, rate_bps: Option<u64>) {
+        self.inner
+            .rate_bps
+            .store(rate_bps.unwrap_or(0), Ordering::Relaxed);
+        self.inner.wake.notify_waiters();
+        info!(link = %self.name, ?rate_bps, "rate");
     }
 
     pub fn set_rtt(&self, rtt: Duration) {
@@ -281,6 +334,11 @@ pub async fn spawn_link(
         retrans: AtomicU64::new(0),
         conns: AtomicU64::new(0),
         drops: AtomicU64::new(0),
+        rate_bps: AtomicU64::new(cfg.rate_bps.unwrap_or(0)),
+        queue_bytes: AtomicU64::new(cfg.queue_bytes.unwrap_or(0)),
+        queue_drops: AtomicU64::new(0),
+        q_fwd: Mutex::new(QueueState::default()),
+        q_rev: Mutex::new(QueueState::default()),
         kills: Mutex::new(Vec::new()),
         conns_ctrl: Mutex::new(Vec::new()),
     });
