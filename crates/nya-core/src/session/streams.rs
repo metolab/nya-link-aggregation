@@ -78,7 +78,7 @@ impl Session {
         let win = self.inner.cfg.tuning.initial_window;
         let (app, peer) = tokio::io::duplex(win as usize);
         let (inbound_tx, inbound_rx) = mpsc::channel(self.inner.cfg.tuning.chan);
-        let st = StreamState::new(id, inbound_tx, win);
+        let st = StreamState::new_in(id, inbound_tx, win, self.inner.recv_cap_extra.clone());
         {
             let mut streams = self.inner.streams.lock().unwrap();
             if streams.contains_key(&id) {
@@ -653,13 +653,6 @@ impl Session {
         if data.offset > st.recv_next.load(Ordering::Relaxed) {
             st.last_hole_arrival.store(data.offset, Ordering::Relaxed);
         }
-        // P3b: did this piece end on an edge we advertised (sender was
-        // window-limited)?
-        let rate = st.deliver_rate_ewma.load(Ordering::Relaxed);
-        let min_rtt = self.bdp_rtt(&st).unwrap_or(Duration::ZERO);
-        let tol = (nya_proto::MAX_STREAM_PAYLOAD as u64)
-            .max((rate as f64 * min_rtt.as_secs_f64() / 8.0) as u64);
-        st.note_arrival(data.offset + new_len, tol);
         self.drain_recv(&st, path_id);
     }
 
@@ -750,6 +743,7 @@ impl Session {
         let app_backlog = st.buffered_in.load(Ordering::Relaxed) + in_order_held;
         st.recv_hole_max.fetch_max(hole_bytes, Ordering::Relaxed);
         st.app_backlog_max.fetch_max(app_backlog, Ordering::Relaxed);
+        st.sample_hole_bytes(hole_bytes);
     }
 
     /// P1.4: `(hole_bytes, app_backlog)` — out-of-order bytes held behind
@@ -782,102 +776,76 @@ impl Session {
         }
     }
 
-    fn tune_recv_cap(&self, st: &StreamState) {
+    pub(super) fn tune_recv_cap(&self, st: &StreamState) {
         self.tune_recv_cap_sampled(st, false);
     }
 
-    /// Receiver window: the BDP formula (`2 · rate · rtt`) as the base, and
-    /// the P3b probe controller on top. The formula alone is a fixed point
-    /// at the floor whenever the ACK loop carries more than one RTT of
-    /// queueing (`W' = W · 2R/L`), and the kernel TCP under us builds that
-    /// queue on its own; so when the sender is provably window-limited
-    /// (DATA keeps ending on our advertised edge) and the app keeps up, the
-    /// cap is doubled for `4 · min_rtt`. The probe's own delivery rate is
-    /// then compared with the rate before it: it is kept unless delivery
-    /// got *worse* (≥ 10 % down) or the app fell behind — with per-path
-    /// send budgets (P2) bounding what is on the wire, a larger window
-    /// costs memory, not queue, and shrinking it under a sender that has
-    /// filled it collapses the advertised window to zero. A kept cap is
-    /// held while the rate stays within half of what earned it. `sampled`
-    /// = a new rate sample closed this call; decisions happen only then.
-    fn tune_recv_cap_sampled(&self, st: &StreamState, sampled: bool) {
-        let base = self.recv_cap_target(st);
+    /// P2 receiver window controller. The window is sized by the in-order
+    /// delivery *loop* — the arrival path's RTT plus the measured time a
+    /// byte waits in the reorder buffer — not by the RTT alone: under
+    /// recovery holes a `2 · rate · rtt` window is a fixed point at the
+    /// floor (`W' = W · 2R/L`; v0.1.6 P3b's probe tried to escape it and
+    /// reverted 78 % of the time). Properties:
+    ///
+    /// * monotone up while the application keeps up (`max(cur, target)`):
+    ///   with per-path send budgets bounding the wire, a larger window
+    ///   costs memory, not queue, and shrinking under a sender that has
+    ///   filled it collapses the advertised window to zero;
+    /// * shrinks toward `target` only when the application is behind
+    ///   (`app_backlog > cur / 2`), never above `cur`, never below what is
+    ///   held, so `advertised_window() ≥ 0`;
+    /// * the increase is bounded by the session's memory guard (P2.4),
+    ///   which never lowers an existing cap;
+    /// * idempotent: safe on every `drain_recv` sample and every
+    ///   `maintain` tick alike.
+    ///
+    /// `_sampled` is kept for the call sites; the rule does not depend on
+    /// whether this call closed a rate sample.
+    fn tune_recv_cap_sampled(&self, st: &StreamState, _sampled: bool) {
         let floor = st.initial_window;
         let ceil = floor.saturating_mul(self.inner.cfg.tuning.chan as u32);
         let cur = st.recv_cap.load(Ordering::Relaxed).clamp(floor, ceil);
-        let rate = st.deliver_rate_ewma.load(Ordering::Relaxed);
-        let app = st.buffered_in.load(Ordering::Relaxed) + st.recv_buffered.load(Ordering::Relaxed)
-            > u64::from(cur) / 2;
-        let mut c = st.win_ctl.lock().unwrap();
-        let held = |c: &crate::stream::WinCtl| {
-            if rate.saturating_mul(2) >= c.hold_rate && !app {
-                c.hold_cap
-            } else {
-                0
-            }
+        let target = self.recv_cap_target(st);
+        let held =
+            st.buffered_in.load(Ordering::Relaxed) + st.recv_buffered.load(Ordering::Relaxed);
+        let (_, app_backlog) = self.recv_evidence(st);
+        let app_behind = app_backlog > u64::from(cur) / 2;
+        let mut cap = if app_behind {
+            u64::from(cur).min(u64::from(target).max(held))
+        } else {
+            u64::from(cur.max(target))
         };
-        let mut cap = cur;
-        if sampled {
-            let now = Instant::now();
-            let min_rtt = self
-                .bdp_rtt(st)
-                .unwrap_or(Duration::from_micros(self.inner.cfg.tuning.unknown_rtt_us));
-            let wl = st.edge_hits.swap(0, Ordering::Relaxed) > 0;
-            if app {
-                c.hold_cap = 0;
-                c.hold_rate = 0;
-            }
-            match c.probing {
-                Some((cap0, rate0, since, next0)) => {
-                    let el = now.saturating_duration_since(since);
-                    if el >= min_rtt * 4 {
-                        let got = st.recv_next.load(Ordering::Relaxed).saturating_sub(next0);
-                        let probe_rate = (got as f64 / el.as_secs_f64()) as u64;
-                        let worse = probe_rate.saturating_mul(10) < rate0.saturating_mul(9);
-                        if worse || app {
-                            cap = cap0.max(base);
-                            self.inner
-                                .metrics
-                                .recv_cap_probe_reverted
-                                .fetch_add(1, Ordering::Relaxed);
-                        } else {
-                            c.hold_cap = cur;
-                            c.hold_rate = probe_rate.max(rate);
-                            self.inner
-                                .metrics
-                                .recv_cap_probe_kept
-                                .fetch_add(1, Ordering::Relaxed);
-                        }
-                        c.probing = None;
-                        c.last_probe_end = Some(now);
-                    }
-                }
-                None => {
-                    let cooled = c
-                        .last_probe_end
-                        .is_none_or(|t| now.saturating_duration_since(t) >= min_rtt * 8);
-                    if wl && !app && cooled && cur < ceil && rate > 0 {
-                        c.probing = Some((cur, rate, now, st.recv_next.load(Ordering::Relaxed)));
-                        cap = cur.saturating_mul(2).min(ceil);
-                        self.inner
-                            .metrics
-                            .recv_cap_probes
-                            .fetch_add(1, Ordering::Relaxed);
-                    } else {
-                        cap = base.max(held(&c));
-                    }
-                }
-            }
-        } else if c.probing.is_none() {
-            cap = base.max(held(&c));
+        // P2.4: bound the increase only.
+        let alive = self.path_list().iter().filter(|p| p.is_alive()).count() as u64;
+        let extra = st.recv_cap_extra.load(Ordering::Relaxed);
+        let session_room = alive.saturating_mul(u64::from(ceil)).saturating_sub(extra);
+        cap = cap.min(u64::from(cur).saturating_add(session_room));
+        let cap = (cap.min(u64::from(u32::MAX)) as u32).clamp(floor, ceil);
+        // CAS so concurrent tuners (every path-reader's drain, maintain)
+        // telescope exactly into the guard sum.
+        let old = st
+            .recv_cap
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |_| Some(cap))
+            .unwrap_or(cur)
+            .clamp(floor, ceil);
+        if cap > old {
+            st.recv_cap_extra
+                .fetch_add(u64::from(cap - old), Ordering::Relaxed);
+        } else if cap < old {
+            let d = u64::from(old - cap);
+            let _ = st
+                .recv_cap_extra
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                    Some(v.saturating_sub(d))
+                });
         }
-        drop(c);
-        let cap = cap.clamp(floor, ceil);
-        st.recv_cap.store(cap, Ordering::Relaxed);
         st.recv_cap_max.fetch_max(cap, Ordering::Relaxed);
     }
 
-    fn recv_cap_target(&self, st: &StreamState) -> u32 {
+    /// P2.2: `clamp(2 · deliver_rate · (rtt + hole), floor, ceil)`, where
+    /// `hole` is the receiver-visible extra loop time (see
+    /// `hole_for_window`). Unknown RTT or no rate yet ⇒ floor.
+    pub(super) fn recv_cap_target(&self, st: &StreamState) -> u32 {
         let floor = st.initial_window;
         let ceil = floor.saturating_mul(self.inner.cfg.tuning.chan as u32);
         let rate = st.deliver_rate_ewma.load(Ordering::Relaxed);
@@ -887,7 +855,8 @@ impl Session {
         if rate == 0 {
             return floor;
         }
-        let bdp = rate as f64 * rtt.as_secs_f64();
+        let hole = Duration::from_micros(self.hole_for_window(st));
+        let bdp = rate as f64 * (rtt + hole).as_secs_f64();
         if !bdp.is_finite() {
             return floor;
         }
@@ -898,6 +867,32 @@ impl Session {
             floor
         } else {
             twice as u32
+        }
+    }
+
+    /// P2.2: the receiver-visible extra loop time, µs — the byte-weighted
+    /// mean residency of a byte in the reorder buffer, `hole_bytes_ewma /
+    /// deliver_rate` (Little's law) — while it is fresh (a drain within
+    /// `8 · (rtt + hole)`), else 0. A per-hole time EWMA is event-weighted
+    /// and under-reads when many short reorder holes surround a few
+    /// RTO-long ones; the occupancy is what the window has to cover.
+    fn hole_for_window(&self, st: &StreamState) -> u64 {
+        let bytes = st.hole_bytes_ewma.load(Ordering::Relaxed);
+        let at = st.hole_bytes_at_us.load(Ordering::Relaxed);
+        let rate = st.deliver_rate_ewma.load(Ordering::Relaxed);
+        if bytes == 0 || at == 0 || rate == 0 {
+            return 0;
+        }
+        let hole = (bytes as f64 * 1e6 / rate as f64) as u64;
+        let rtt_us = self
+            .bdp_rtt(st)
+            .unwrap_or(Duration::from_micros(self.inner.cfg.tuning.unknown_rtt_us))
+            .as_micros() as u64;
+        let age = crate::metrics::mono_us().saturating_sub(at);
+        if age <= 8 * (rtt_us + hole) {
+            hole
+        } else {
+            0
         }
     }
 
@@ -920,7 +915,18 @@ impl Session {
             }
             if let Some(p) = self.get_path(id) {
                 if p.is_alive() && p.rtt_known() {
-                    return Some(p.rtt());
+                    // P2.2: the loaded EWMA, bounded to twice the windowed
+                    // min loop. The EWMA takes Pongs between budget rounds
+                    // and follows the queue the window itself builds
+                    // (`W' = W · 2R/L` with a loaded R is positive
+                    // feedback); the bound keeps the fixed point in the
+                    // design's `[2, 4] · BDP` envelope, and the reorder
+                    // part of the loop is the hole term, not this one.
+                    let rtt = p.rtt();
+                    return Some(match p.min_rtt() {
+                        Some(m) => rtt.min(m * 2),
+                        None => rtt,
+                    });
                 }
             }
         }
@@ -952,11 +958,6 @@ impl Session {
                     .fetch_add(1, Ordering::Relaxed);
             }
         }
-        // P3b: the sender may run up to exactly this edge.
-        let min_rtt = self
-            .bdp_rtt(st)
-            .unwrap_or(Duration::from_micros(self.inner.cfg.tuning.unknown_rtt_us));
-        st.note_ack_edge(ack.acked_offset + u64::from(ack.window), min_rtt);
         if self.store_ack(st, path_id, &ack) {
             return;
         }

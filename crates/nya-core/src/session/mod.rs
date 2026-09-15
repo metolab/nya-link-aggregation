@@ -111,6 +111,8 @@ pub(crate) struct Inner {
     correlated_since: Mutex<Option<Instant>>,
     /// P1.8b: open `quiet_set` episode (quiet ≥ alive − 1, all-N included).
     quiet_episode: Mutex<Option<steer::QuietEpisode>>,
+    /// P2.4: Σ over live streams of `recv_cap − floor` (memory guard).
+    recv_cap_extra: Arc<std::sync::atomic::AtomicU64>,
     metrics: Counters,
     process: Arc<ProcessCounters>,
     last_rtt_us: Mutex<HashMap<String, u64>>,
@@ -165,6 +167,7 @@ impl Session {
             all_down_since: Mutex::new(None),
             correlated_since: Mutex::new(None),
             quiet_episode: Mutex::new(None),
+            recv_cap_extra: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             metrics: Counters::default(),
             process,
             last_rtt_us: Mutex::new(HashMap::new()),
@@ -3440,6 +3443,220 @@ mod tests {
         );
         assert_eq!(st.recv_next.load(Ordering::Relaxed), 64_000);
         drop(tun);
+        client.shutdown();
+    }
+
+    /// P2.2: the target is `2 · rate · (rtt + hole)`. Behind recovery
+    /// holes `rate = cap / (rtt + hole)` ⇒ `target = 2 · cap`: the cap
+    /// keeps doubling instead of freezing at the floor. A hole that has not
+    /// closed for `8 · loop` is stale and drops out of the loop.
+    #[tokio::test]
+    async fn window_target_uses_rtt_plus_hole() {
+        let client = Session::new_client(SessionConfig::default());
+        let (p, _w, _u) = inject_live(&client, 1, "a#0", 10);
+        let tun = client
+            .open_stream(Target {
+                host: "t".into(),
+                port: 1,
+            })
+            .await
+            .unwrap();
+        let st = client.get_stream(tun.id).unwrap();
+        st.sticky.store(p.id, Ordering::Relaxed);
+        let floor = st.initial_window;
+        // rtt 10 ms; rate = floor / 30 ms; hole_bytes = rate × 20 ms ⇒
+        // Little's-law hole 20 ms ⇒ loop 30 ms ⇒ target = 2 · floor.
+        let rate = (f64::from(floor) / 0.030) as u64;
+        st.deliver_rate_ewma.store(rate, Ordering::Relaxed);
+        st.sample_hole_bytes((rate as f64 * 0.020) as u64);
+        client.debug_maintain();
+        let cap = st.recv_cap.load(Ordering::Relaxed);
+        assert!(
+            cap.abs_diff(2 * floor) <= floor / 50,
+            "target ≈ 2·cap under holes: {cap} vs {}",
+            2 * floor
+        );
+        // Same rate with the hole stale (no hole closed for 8 · loop =
+        // 240 ms): target = 2 · rate · rtt = 0.67 · floor ⇒ floor — and the
+        // cap does not shrink (monotone).
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            client.recv_cap_target(&st),
+            floor,
+            "stale hole: 2·rate·rtt < floor ⇒ floor"
+        );
+        client.debug_maintain();
+        assert_eq!(st.recv_cap.load(Ordering::Relaxed), cap, "no shrink");
+        drop(tun);
+        client.shutdown();
+    }
+
+    /// P2.3: only in-order bytes the app has not taken shrink the cap —
+    /// toward the target, never above `cur`, never below what is held, so
+    /// the advertised window stays ≥ 0. Out-of-order bytes behind a hole
+    /// neither shrink it nor block growth.
+    #[tokio::test]
+    async fn window_shrinks_only_when_app_behind() {
+        let client = Session::new_client(SessionConfig::default());
+        let (p, _w, _u) = inject_live(&client, 1, "a#0", 7);
+        let mut tun = client
+            .open_stream(Target {
+                host: "t".into(),
+                port: 1,
+            })
+            .await
+            .unwrap();
+        let st = client.get_stream(tun.id).unwrap();
+        st.sticky.store(p.id, Ordering::Relaxed);
+        let sid = tun.id;
+        let floor = st.initial_window;
+        st.deliver_rate_ewma.store(50_000_000, Ordering::Relaxed);
+        client.debug_maintain();
+        let grown = st.recv_cap.load(Ordering::Relaxed);
+        assert_eq!(grown, 700_000);
+        // Out-of-order bytes behind a hole: hole_bytes large, app_backlog 0.
+        client.on_data(p.id, data(sid, 400_000, 16_000));
+        client.on_data(p.id, data(sid, 500_000, 16_000));
+        st.deliver_rate_ewma.store(60_000_000, Ordering::Relaxed);
+        client.debug_maintain();
+        let grown2 = st.recv_cap.load(Ordering::Relaxed);
+        assert!(
+            grown2 >= 840_000,
+            "hole bytes do not block growth (they add to the loop): {grown2}"
+        );
+        // In-order bytes nobody reads: app backlog > cur/2 (the pump moves
+        // one duplex of 128 KiB out of `buffered_in`), held < cur.
+        for i in 0..36u64 {
+            client.on_data(p.id, data(sid, i * 16_000, 16_000));
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let (_, backlog) = client.recv_evidence(&st);
+        assert!(backlog > u64::from(grown2) / 2, "app behind: {backlog}");
+        st.deliver_rate_ewma.store(1, Ordering::Relaxed);
+        client.debug_maintain();
+        let cap = st.recv_cap.load(Ordering::Relaxed);
+        let held =
+            st.buffered_in.load(Ordering::Relaxed) + st.recv_buffered.load(Ordering::Relaxed);
+        assert!(
+            held < u64::from(grown2),
+            "held {held} must leave room to shrink"
+        );
+        assert!(cap < grown2, "shrinks when the app is behind: {cap}");
+        assert_eq!(u64::from(cap), held, "down to what is held, not below");
+        assert!(cap >= floor);
+        // advertised_window() = cap − held ≥ 0 by construction.
+        let _ = st.advertised_window();
+        // Drain the app: the rule grows again from the shrunken cap.
+        let mut buf = vec![0u8; 64 * 1024];
+        for _ in 0..8 {
+            let _ = tokio::time::timeout(Duration::from_millis(20), tun.read(&mut buf)).await;
+        }
+        drop(tun);
+        client.shutdown();
+    }
+
+    /// P2.4: Σ(recv_cap − floor) over the session's streams is bounded by
+    /// `alive_paths · ceil`; the guard bounds the increase only — a sibling
+    /// growing or all paths going down never lowers an existing cap. The
+    /// sum is exact under concurrent tuners and returns to 0 on drop.
+    #[tokio::test]
+    async fn window_growth_bounded_by_session_room() {
+        let client = Session::new_client(SessionConfig::default());
+        let (p, _w, _u) = inject_live(&client, 1, "a#0", 7);
+        let mut tuns = Vec::new();
+        let mut sts = Vec::new();
+        for _ in 0..3 {
+            let tun = client
+                .open_stream(Target {
+                    host: "t".into(),
+                    port: 1,
+                })
+                .await
+                .unwrap();
+            let st = client.get_stream(tun.id).unwrap();
+            st.sticky.store(p.id, Ordering::Relaxed);
+            st.deliver_rate_ewma.store(u64::MAX / 4, Ordering::Relaxed);
+            tuns.push(tun);
+            sts.push(st);
+        }
+        let floor = sts[0].initial_window;
+        let ceil = floor.saturating_mul(client.inner.cfg.tuning.chan as u32);
+        let room = u64::from(ceil); // one alive path
+        client.debug_maintain();
+        let extra = client.inner.recv_cap_extra.load(Ordering::Relaxed);
+        let sum: u64 = sts
+            .iter()
+            .map(|st| u64::from(st.recv_cap.load(Ordering::Relaxed) - floor))
+            .sum();
+        assert_eq!(extra, sum, "guard sum equals Σ(cap − floor)");
+        assert!(extra <= room, "Σ extra {extra} ≤ alive · ceil {room}");
+        assert!(
+            extra >= room - u64::from(3 * floor),
+            "room is used: {extra}"
+        );
+        let caps: Vec<u32> = sts
+            .iter()
+            .map(|st| st.recv_cap.load(Ordering::Relaxed))
+            .collect();
+        assert!(caps.iter().any(|c| *c > floor), "somebody grew: {caps:?}");
+        // A fourth stream wanting to grow, and every path going down, never
+        // lower an existing cap.
+        let tun4 = client
+            .open_stream(Target {
+                host: "t".into(),
+                port: 1,
+            })
+            .await
+            .unwrap();
+        let st4 = client.get_stream(tun4.id).unwrap();
+        st4.sticky.store(p.id, Ordering::Relaxed);
+        st4.deliver_rate_ewma.store(u64::MAX / 4, Ordering::Relaxed);
+        client.debug_maintain();
+        let caps2: Vec<u32> = sts
+            .iter()
+            .map(|st| st.recv_cap.load(Ordering::Relaxed))
+            .collect();
+        assert_eq!(caps, caps2, "sibling growth never lowers a cap");
+        p.state.store(crate::path::STATE_DOWN, Ordering::Relaxed);
+        client.debug_maintain();
+        let caps3: Vec<u32> = sts
+            .iter()
+            .map(|st| st.recv_cap.load(Ordering::Relaxed))
+            .collect();
+        assert_eq!(caps, caps3, "no alive path never lowers a cap");
+        p.state.store(crate::path::STATE_UP, Ordering::Relaxed);
+        // Concurrent tuners telescope exactly.
+        let c2 = client.clone();
+        let sts2 = sts.clone();
+        let t = tokio::task::spawn_blocking(move || {
+            for _ in 0..2000 {
+                for st in &sts2 {
+                    c2.tune_recv_cap(st);
+                }
+            }
+        });
+        for _ in 0..2000 {
+            for st in &sts {
+                client.tune_recv_cap(st);
+            }
+        }
+        t.await.unwrap();
+        let extra = client.inner.recv_cap_extra.load(Ordering::Relaxed);
+        let sum: u64 = sts
+            .iter()
+            .chain(std::iter::once(&st4))
+            .map(|st| u64::from(st.recv_cap.load(Ordering::Relaxed) - floor))
+            .sum();
+        assert_eq!(extra, sum, "exact after concurrent tuning");
+        // Release everything: sum back to 0.
+        drop(tuns);
+        drop(tun4);
+        for st in sts.iter().chain(std::iter::once(&st4)) {
+            client.remove_held_stream(st.id);
+        }
+        drop(sts);
+        drop(st4);
+        assert_eq!(client.inner.recv_cap_extra.load(Ordering::Relaxed), 0);
         client.shutdown();
     }
 
@@ -8009,13 +8226,20 @@ mod tests {
         assert!(cap > floor, "cap {cap} must grow above floor {floor}");
         assert!(cap <= ceil, "cap {cap} must not exceed ceil {ceil}");
         assert_eq!(cap, expect);
+        assert_eq!(
+            client.inner.recv_cap_extra.load(Ordering::Relaxed),
+            u64::from(cap - floor),
+            "P2.4 guard sum tracks the growth"
+        );
 
+        // P2.3: monotone while the app keeps up — a rate dip does not
+        // shrink a window the sender may have filled.
         st.deliver_rate_ewma.store(0, Ordering::Relaxed);
         client.debug_maintain();
         assert_eq!(
             st.recv_cap.load(Ordering::Relaxed),
-            floor,
-            "zero rate must not grow"
+            expect,
+            "zero rate must not shrink"
         );
 
         st.deliver_rate_ewma.store(50_000_000, Ordering::Relaxed);
@@ -8036,8 +8260,8 @@ mod tests {
         client.debug_maintain();
         assert_eq!(
             st.recv_cap.load(Ordering::Relaxed),
-            floor,
-            "no alive known RTT must not grow"
+            expect_pool,
+            "no alive path: no growth, and never a shrink"
         );
 
         p.state.store(crate::path::STATE_UP, Ordering::Relaxed);
@@ -8049,8 +8273,20 @@ mod tests {
             ceil,
             "huge rate must clamp to initial_window * chan"
         );
+        assert_eq!(
+            client.inner.recv_cap_extra.load(Ordering::Relaxed),
+            u64::from(ceil - floor)
+        );
 
+        // P2.4: the share is released with the last Arc.
         drop(tun);
+        client.remove_held_stream(st.id);
+        drop(st);
+        assert_eq!(
+            client.inner.recv_cap_extra.load(Ordering::Relaxed),
+            0,
+            "Drop must give the guard sum back"
+        );
         client.shutdown();
     }
 
@@ -8123,6 +8359,16 @@ mod tests {
         let floor = st.initial_window;
         let ceil = floor.saturating_mul(client.inner.cfg.tuning.chan as u32);
         let sid = tun.id;
+        // P2.3 grows only while the application keeps up: drain it.
+        let (mut rd, wr) = tokio::io::split(tun);
+        let reader = tokio::spawn(async move {
+            let mut buf = vec![0u8; 64 * 1024];
+            while let Ok(n) = rd.read(&mut buf).await {
+                if n == 0 {
+                    break;
+                }
+            }
+        });
         client.on_data(
             p.id,
             StreamData {
@@ -8164,20 +8410,24 @@ mod tests {
                 data: vec![0xef; (TOTAL - already) as usize],
             },
         );
-        let cap = st.recv_cap.load(Ordering::Relaxed);
         let dt = start.elapsed();
         let expect = {
             let rate = TOTAL as f64 / dt.as_secs_f64();
             let twice = 2.0 * rate * rtt.as_secs_f64();
             (twice as u32).clamp(floor, ceil)
         };
+        // Let the app drain, then the idempotent rule re-runs on the tick.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        client.debug_maintain();
+        let cap = st.recv_cap.load(Ordering::Relaxed);
         assert!(cap > floor, "cap {cap} must grow after one RTT of 50 MB/s");
         assert!(cap < ceil, "cap {cap} must not be decode-speed ceil");
         assert!(
             cap.abs_diff(expect) < 2_000,
             "cap {cap} expect {expect} (2·{TOTAL}/{dt:?}·7ms), ~700 KiB class"
         );
-        drop(tun);
+        drop(wr);
+        reader.abort();
         client.shutdown();
     }
 

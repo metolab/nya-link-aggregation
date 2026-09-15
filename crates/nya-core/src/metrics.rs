@@ -204,9 +204,6 @@ pub struct Counters {
     /// ACKs sent for duplicates after recv_fin / past close_off (P5).
     pub ack_after_fin: AtomicU64,
     /// P3b receiver window probes started / kept / reverted.
-    pub recv_cap_probes: AtomicU64,
-    pub recv_cap_probe_kept: AtomicU64,
-    pub recv_cap_probe_reverted: AtomicU64,
     /// Pieces re-sent because the frame never reached a writer queue (P4).
     pub data_dropped_resend: AtomicU64,
     /// Pieces released by a SACK range (delivered behind a hole).
@@ -299,9 +296,6 @@ impl Default for Counters {
             send_window_limited_with_room: AtomicU64::new(0),
             data_dup_rx_bytes: AtomicU64::new(0),
             ack_after_fin: AtomicU64::new(0),
-            recv_cap_probes: AtomicU64::new(0),
-            recv_cap_probe_kept: AtomicU64::new(0),
-            recv_cap_probe_reverted: AtomicU64::new(0),
             data_dropped_resend: AtomicU64::new(0),
             data_sacked: AtomicU64::new(0),
             picks_unknown_rtt: AtomicU64::new(0),
@@ -528,9 +522,6 @@ pub struct Snapshot {
     pub send_window_limited_with_room: u64,
     pub data_dup_rx_bytes: u64,
     pub ack_after_fin: u64,
-    pub recv_cap_probes: u64,
-    pub recv_cap_probe_kept: u64,
-    pub recv_cap_probe_reverted: u64,
     pub data_dropped_resend: u64,
     pub data_sacked: u64,
     pub picks_unknown_rtt: u64,
@@ -640,9 +631,6 @@ impl Snapshot {
         self.send_window_limited_with_room += other.send_window_limited_with_room;
         self.data_dup_rx_bytes += other.data_dup_rx_bytes;
         self.ack_after_fin += other.ack_after_fin;
-        self.recv_cap_probes += other.recv_cap_probes;
-        self.recv_cap_probe_kept += other.recv_cap_probe_kept;
-        self.recv_cap_probe_reverted += other.recv_cap_probe_reverted;
         self.data_dropped_resend += other.data_dropped_resend;
         self.data_sacked += other.data_sacked;
         self.picks_unknown_rtt += other.picks_unknown_rtt;
@@ -727,9 +715,6 @@ impl Counters {
                 .load(Ordering::Relaxed),
             data_dup_rx_bytes: self.data_dup_rx_bytes.load(Ordering::Relaxed),
             ack_after_fin: self.ack_after_fin.load(Ordering::Relaxed),
-            recv_cap_probes: self.recv_cap_probes.load(Ordering::Relaxed),
-            recv_cap_probe_kept: self.recv_cap_probe_kept.load(Ordering::Relaxed),
-            recv_cap_probe_reverted: self.recv_cap_probe_reverted.load(Ordering::Relaxed),
             data_dropped_resend: self.data_dropped_resend.load(Ordering::Relaxed),
             data_sacked: self.data_sacked.load(Ordering::Relaxed),
             picks_unknown_rtt: self.picks_unknown_rtt.load(Ordering::Relaxed),

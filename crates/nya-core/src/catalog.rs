@@ -229,21 +229,6 @@ pub fn visit_metrics(ps: &ProcessSnapshot, sink: &mut impl MetricSink) {
         s.ack_after_fin,
     );
     sink.counter(
-        "nya_recv_cap_probes_total",
-        "P3b receiver window probes started (cap doubled for 4 min_rtt)",
-        s.recv_cap_probes,
-    );
-    sink.counter(
-        "nya_recv_cap_probe_kept_total",
-        "P3b probes kept: delivery rate rose >= 25 %",
-        s.recv_cap_probe_kept,
-    );
-    sink.counter(
-        "nya_recv_cap_probe_reverted_total",
-        "P3b probes reverted: no rate gain, cap fell back",
-        s.recv_cap_probe_reverted,
-    );
-    sink.counter(
         "nya_data_dropped_resend_total",
         "pieces re-sent after the frame never reached a writer queue",
         s.data_dropped_resend,

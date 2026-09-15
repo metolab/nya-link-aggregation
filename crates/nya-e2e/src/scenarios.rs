@@ -1921,14 +1921,12 @@ fn bulk_tracer(h: &Harness) {
                 })
                 .collect();
             eprintln!(
-                "TRACE t={:.1}s paths=[{}] streams=[{}] wan=[{}] probes={}/{}/{}",
+                "TRACE t={:.1}s paths=[{}] streams=[{}] wan=[{}] cap_extra={}k",
                 t0.elapsed().as_secs_f64(),
                 paths.join(" "),
                 streams.join(" "),
                 ls.join(" "),
-                s.recv_cap_probes,
-                s.recv_cap_probe_kept,
-                s.recv_cap_probe_reverted
+                s.recv_cap_extra_bytes / 1024
             );
         }
     });
@@ -1980,6 +1978,86 @@ async fn run_bulk(h: &Harness, nbytes: usize, watchdog: Duration) -> BulkOutcome
             io_error: false,
         },
     }
+}
+
+/// A download: an origin that writes `nbytes` as fast as the socket takes
+/// them, read through SOCKS. Server→client is the only loaded direction,
+/// which is what the production complaint is about; the echo's full-duplex
+/// copy hides receiver-window effects behind the slower of two directions.
+/// Returns the outcome and the time to the first byte.
+async fn run_download(
+    h: &Harness,
+    nbytes: usize,
+    watchdog: Duration,
+) -> (BulkOutcome, Option<Duration>) {
+    let fail = |io_error: bool, timed_out: bool| BulkOutcome {
+        nbytes,
+        elapsed: None,
+        intact: false,
+        timed_out,
+        io_error,
+    };
+    let Ok((origin_l, origin)) = crate::harness::bind_local().await else {
+        return (fail(true, false), None);
+    };
+    let origin_task = tokio::spawn(async move {
+        let Ok((mut tcp, _)) = origin_l.accept().await else {
+            return;
+        };
+        let _ = tcp.set_nodelay(true);
+        let mut chunk = vec![0u8; 64 * 1024];
+        let mut off = 0usize;
+        while off < nbytes {
+            let n = (nbytes - off).min(chunk.len());
+            for (i, b) in chunk[..n].iter_mut().enumerate() {
+                *b = ((off + i) % 251) as u8;
+            }
+            if tcp.write_all(&chunk[..n]).await.is_err() {
+                return;
+            }
+            off += n;
+        }
+        let _ = tcp.shutdown().await;
+    });
+    let t0 = Instant::now();
+    let Ok(mut tcp) = h.connect_socks(origin).await else {
+        origin_task.abort();
+        return (fail(true, false), None);
+    };
+    let mut got = 0usize;
+    let mut intact = true;
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut first_rx: Option<Duration> = None;
+    let outcome = tokio::time::timeout(watchdog, async {
+        loop {
+            let n = tcp.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            first_rx.get_or_insert_with(|| t0.elapsed());
+            for (i, b) in buf[..n].iter().enumerate() {
+                if *b != ((got + i) % 251) as u8 {
+                    intact = false;
+                }
+            }
+            got += n;
+        }
+        Ok::<(), std::io::Error>(())
+    })
+    .await;
+    let elapsed = t0.elapsed();
+    drop(tcp);
+    let _ = origin_task.await;
+    (
+        BulkOutcome {
+            nbytes,
+            elapsed: Some(elapsed),
+            intact: matches!(outcome, Ok(Ok(()))) && got == nbytes && intact,
+            timed_out: outcome.is_err(),
+            io_error: matches!(outcome, Ok(Err(_))),
+        },
+        first_rx,
+    )
 }
 
 /// Report: one sample per copy (rtt = elapsed), gate is a p99 on elapsed.
@@ -2229,6 +2307,119 @@ pub async fn bulk_fanout_three_paths() -> Result<ScenarioReport> {
         .collect();
     r.notes
         .push(format!("bulk=paths_delivered={}", used.join(",")));
+    Ok(r)
+}
+
+/// P2/P3 door: four 50 Mbit/s paths, one with 2 % packet loss (RACK/TLP
+/// recover most of it; tail losses sit out the 200 ms RTO floor), three
+/// clean, one 64 MiB download. Pieces on the lossy path arrive late and
+/// open holes at the receiver: a window sized by `2 · rate · rtt` freezes at
+/// the floor (`W' = W · 2R/L`) and the whole pool runs at the floor's pace.
+/// Doors: goodput ≥ 0.8 × two links (the fan-out gate); the receiver's
+/// window grew ≥ 4 × floor; the hole EWMA is non-zero (the loop was
+/// measured, not guessed); duplicates ≤ 2 %; stall p99 ≤ 2 × the RTO hold.
+pub async fn bulk_bottleneck_lossy_sibling() -> Result<ScenarioReport> {
+    const RATE: u64 = 50 * MBIT;
+    let mut spec = bottleneck_spec(
+        &[
+            ("a", 10, RATE, 128 * 1024),
+            ("b", 10, RATE, 128 * 1024),
+            ("c", 10, RATE, 128 * 1024),
+            ("d", 10, RATE, 128 * 1024),
+        ],
+        1,
+    );
+    spec.link_cfgs[3].1.loss = 0.02;
+    let h = start(spec).await?;
+    let snap0 = h.session.snapshot();
+    let _ = h.session.process().take_interval_tail();
+    bulk_tracer(&h);
+    const N: usize = 64 * 1024 * 1024;
+    let (o, first_rx) = run_download(&h, N, Duration::from_secs(90)).await;
+    let mut r = bulk_report(
+        "bulk_bottleneck_lossy_sibling",
+        &h,
+        &[o],
+        rate_gate(N, 2 * RATE, 0.8),
+        &snap0,
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let hop = h.session.process().take_interval_tail();
+    let st = hop.as_ref().and_then(|hs| hs.stream.as_ref());
+    let floor = nya_core::Tuning::STANDARD.initial_window;
+    let recv_cap_max = st.map(|s| s.recv_cap_max).unwrap_or(0);
+    let hole_us = st.map(|s| s.hole_us).unwrap_or(0);
+    let recv_hole_max = st.map(|s| s.recv_hole_max).unwrap_or(0);
+    let limiter = hop
+        .as_ref()
+        .and_then(|hs| hs.limiter())
+        .unwrap_or("none-recorded");
+    let app_rx = N as u64;
+    let ov_rx = r.snap.bytes_data_rx.saturating_sub(snap0.bytes_data_rx);
+    let dup = ov_rx.saturating_sub(app_rx) as f64 / app_rx as f64;
+    let stall_p99 = nya_core::percentile(&r.snap.stall_ms, nya_core::STALL_MS_BOUNDS, 99.0);
+    // The sender is the in-process server: its budgets and blocks say
+    // what limited the copy from the other end.
+    let srv = h.server_table.aggregate_snapshot().session;
+    let srv_paths: Vec<String> = srv
+        .paths
+        .iter()
+        .filter(|p| p.delivered > 0)
+        .map(|p| {
+            format!(
+                "{}:{}MiB bud={}k bw={}k/s loop={}ms",
+                p.name,
+                p.delivered / (1024 * 1024),
+                p.budget_bytes / 1024,
+                p.bw_bytes_s / 1024,
+                p.ack_rtt_us / 1000
+            )
+        })
+        .collect();
+    r.notes.push(format!(
+        "bulk=lossy_sibling first_rx={:?} limiter={limiter} recv_cap_max={}k floor={}k hole_ewma={}ms recv_hole_max={}k dup={:.2}% stall_p99={stall_p99:?} cap_extra={}k",
+        first_rx.unwrap_or_default(),
+        recv_cap_max / 1024,
+        floor / 1024,
+        hole_us / 1000,
+        recv_hole_max / 1024,
+        dup * 100.0,
+        r.snap.recv_cap_extra_bytes / 1024,
+    ));
+    r.notes.push(format!(
+        "bulk=sender window_blocks={} budget_blocks={} diverts={} hedge={} rtx={} resend_silence={} mig_loop_unfit={} paths=[{}]",
+        srv.window_blocks,
+        srv.send_budget_blocks,
+        srv.send_budget_diverts,
+        srv.data_hedge,
+        srv.data_retransmit,
+        srv.data_resend_silence,
+        srv.migrates_loop_unfit,
+        srv_paths.join(" ")
+    ));
+    let mut fail = Vec::new();
+    if u64::from(recv_cap_max) < 4 * u64::from(floor) {
+        fail.push(format!(
+            "FAIL recv_cap_max {}k < 4 × floor {}k: window locked",
+            recv_cap_max / 1024,
+            floor / 1024
+        ));
+    }
+    if hole_us == 0 {
+        fail.push("FAIL hole_ewma = 0: the loop was never measured".into());
+    }
+    if dup > 0.02 {
+        fail.push(format!("FAIL dup_rx {:.2}% > 2%", dup * 100.0));
+    }
+    if let Some(p99) = stall_p99 {
+        if p99 > 400 {
+            fail.push(format!("FAIL stall p99 {p99}ms > 2 × 200ms RTO hold"));
+        }
+    }
+    if !fail.is_empty() {
+        r.notes.extend(fail);
+        r.sla.min_success = 2.0;
+    }
     Ok(r)
 }
 
@@ -2777,6 +2968,10 @@ pub fn catalog() -> Vec<Scenario> {
         sc_excl!("bulk_bottleneck_single", bulk_bottleneck_single()),
         sc_excl!("bulk_shared_two_streams", bulk_shared_two_streams()),
         sc_excl!("bulk_fanout_three_paths", bulk_fanout_three_paths()),
+        sc_excl!(
+            "bulk_bottleneck_lossy_sibling",
+            bulk_bottleneck_lossy_sibling()
+        ),
         sc_excl!("ping_under_bulk_bounded", ping_under_bulk_bounded()),
         sc_excl!("hedge_only_on_silence", hedge_only_on_silence()),
         sc_excl!(

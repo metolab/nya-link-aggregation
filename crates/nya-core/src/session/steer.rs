@@ -304,6 +304,10 @@ impl Session {
 
         self.reap_closed_streams();
         self.tune_recv_windows();
+        self.inner.metrics.recv_cap_extra_bytes.store(
+            self.inner.recv_cap_extra.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
         let streams: Vec<_> = self
             .inner
             .streams

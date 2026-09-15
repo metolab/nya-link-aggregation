@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 use std::io;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -174,19 +174,23 @@ pub struct StreamState {
     pub initial_window: u32,
     /// `drain_recv` bytes/s EWMA (α = 1/8). 0 until a sample spanning ≥ one RTT.
     pub deliver_rate_ewma: AtomicU64,
-    /// P3b: `(acked_offset + window, t)` edges we advertised, newest last.
-    /// A window-limited sender's DATA ends exactly on one of them.
-    pub(crate) edge_ring: Mutex<VecDeque<(u64, Instant)>>,
-    /// P3b: DATA arrivals that landed on an advertised edge since the last
-    /// rate sample.
-    pub edge_hits: AtomicU64,
-    /// P3b receiver window controller.
-    pub(crate) win_ctl: Mutex<WinCtl>,
+    /// P2.4: the session's Σ over live streams of `recv_cap − floor`. This
+    /// stream's share is added by `tune_recv_cap` and released in `Drop`.
+    pub(crate) recv_cap_extra: Arc<AtomicU64>,
     /// P2.1 hole: the missing offset in-order delivery is waiting for and
     /// since when. Only taken inside `drain_recv` under the `recv_buf` lock.
     pub(crate) hole: Mutex<Option<(u64, Instant)>>,
     /// `mono_us` of the last hole sample. 0 = never.
     pub hole_sampled_at_us: AtomicU64,
+    /// P2.2: bytes waiting behind a hole (`recv_buffered − in_order_held`),
+    /// EWMA (α = 1/8) sampled at every drain. By Little's law
+    /// `hole_bytes / deliver_rate` is the byte-weighted extra time a byte
+    /// spends in the reorder buffer — the part of the in-order loop the
+    /// receiver can see. A per-hole time EWMA (`hole_us`) is event-weighted
+    /// and under-reads when many short holes surround a few RTO-long ones.
+    pub hole_bytes_ewma: AtomicU64,
+    /// `mono_us` of the last `hole_bytes_ewma` sample. 0 = never.
+    pub hole_bytes_at_us: AtomicU64,
     /// Bytes since the last rate sample. Coalesced so FramedRead gaps are not a rate.
     pending_deliver: AtomicU64,
     last_deliver: Mutex<Option<Instant>>,
@@ -307,7 +311,18 @@ impl StreamStats {
 }
 
 impl StreamState {
+    #[cfg(test)]
     pub fn new(id: u32, inbound_tx: mpsc::Sender<Inbound>, initial_window: u32) -> Arc<Self> {
+        Self::new_in(id, inbound_tx, initial_window, Arc::new(AtomicU64::new(0)))
+    }
+
+    /// `recv_cap_extra` is the owning session's P2.4 memory-guard sum.
+    pub fn new_in(
+        id: u32,
+        inbound_tx: mpsc::Sender<Inbound>,
+        initial_window: u32,
+        recv_cap_extra: Arc<AtomicU64>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             id,
             counters: StreamCounters::new(initial_window),
@@ -335,11 +350,11 @@ impl StreamState {
             buffered_in: AtomicU64::new(0),
             initial_window,
             deliver_rate_ewma: AtomicU64::new(0),
-            edge_ring: Mutex::new(VecDeque::new()),
-            edge_hits: AtomicU64::new(0),
-            win_ctl: Mutex::new(WinCtl::default()),
+            recv_cap_extra,
             hole: Mutex::new(None),
             hole_sampled_at_us: AtomicU64::new(0),
+            hole_bytes_ewma: AtomicU64::new(0),
+            hole_bytes_at_us: AtomicU64::new(0),
             pending_deliver: AtomicU64::new(0),
             last_deliver: Mutex::new(None),
             last_stick_change: Mutex::new(Instant::now()),
@@ -455,6 +470,21 @@ impl StreamState {
             .store(crate::metrics::mono_us().max(1), Ordering::Relaxed);
     }
 
+    /// P2.2: fold one drain's `hole_bytes` into the occupancy EWMA.
+    pub(crate) fn sample_hole_bytes(&self, hole_bytes: u64) {
+        let _ = self
+            .hole_bytes_ewma
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                Some(if cur == 0 {
+                    hole_bytes
+                } else {
+                    (cur * 7 + hole_bytes) / 8
+                })
+            });
+        self.hole_bytes_at_us
+            .store(crate::metrics::mono_us().max(1), Ordering::Relaxed);
+    }
+
     /// Coalesce until `dt >= min_dt` (one RTT, or maintain_interval). First
     /// bytes are kept; a collapsed-but-nonzero Instant is not a rate.
     /// Returns `true` when a new rate sample was recorded.
@@ -492,57 +522,30 @@ impl StreamState {
         true
     }
 
-    /// P3b: remember an advertised edge, at most one per `min_rtt / 8`.
-    pub(crate) fn note_ack_edge(&self, edge: u64, min_rtt: Duration) {
-        let now = Instant::now();
-        let mut ring = self.edge_ring.lock().unwrap();
-        if let Some((last_edge, t)) = ring.back() {
-            if *last_edge == edge || now.saturating_duration_since(*t) < min_rtt / 8 {
-                return;
-            }
-        }
-        if ring.len() >= EDGE_RING {
-            ring.pop_front();
-        }
-        ring.push_back((edge, now));
-    }
-
-    /// P3b: DATA ending at `arr` landed on an advertised edge (± `tol`)?
-    pub(crate) fn note_arrival(&self, arr: u64, tol: u64) -> bool {
-        let hit = self
-            .edge_ring
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|(edge, _)| edge.abs_diff(arr) <= tol);
-        if hit {
-            self.edge_hits.fetch_add(1, Ordering::Relaxed);
-        }
-        hit
-    }
-
     #[cfg(test)]
     pub(crate) fn debug_set_deliver_clock(&self, start: Instant) {
         *self.last_deliver.lock().unwrap() = Some(start);
     }
 }
 
-/// P3b edge ring depth.
-pub const EDGE_RING: usize = 64;
-
-/// P3b receiver window controller state (see `Session::tune_recv_cap`).
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct WinCtl {
-    /// `Some((cap0, rate0, since, recv_next0))` while a probe (cap doubled)
-    /// is running: the cap and EWMA rate before it, when it began, and the
-    /// in-order offset then, so the probe's own delivery rate is measured
-    /// directly instead of through the α = 1/8 EWMA.
-    pub probing: Option<(u32, u64, Instant, u64)>,
-    /// Cap and rate of the last successful probe; kept while the rate stays
-    /// ≥ half of `hold_rate` and the app keeps up.
-    pub hold_cap: u32,
-    pub hold_rate: u64,
-    pub last_probe_end: Option<Instant>,
+/// P2.4: a stream's share of the session's window memory is released
+/// with its last `Arc`, whoever drops it — a `tune_recv_cap` racing the
+/// map removal is accounted by the same Drop that runs after it.
+impl Drop for StreamState {
+    fn drop(&mut self) {
+        let extra = u64::from(
+            self.recv_cap
+                .load(Ordering::Relaxed)
+                .saturating_sub(self.initial_window),
+        );
+        if extra > 0 {
+            let _ = self
+                .recv_cap_extra
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                    Some(v.saturating_sub(extra))
+                });
+        }
+    }
 }
 
 pub struct TunnelStream {

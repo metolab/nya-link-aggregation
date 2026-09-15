@@ -873,7 +873,6 @@ TYPE 行必写。counter 名加 `_total`；gauge 不加；histogram 用 raw→cu
 | `data_dup_rx_bytes` | `nya_data_dup_rx_bytes_total` | bytes（重复到达，含 FIN 后） |
 | `ack_after_fin` | `nya_ack_after_fin_total` | frames（`recv_fin` / `close_off` 外的重复 DATA 回的 ACK） |
 | `data_dropped_resend` | `nya_data_dropped_resend_total` | frames（writer 队列丢掉后按 `dropped` 立刻换路） |
-| `recv_cap_probes` / `recv_cap_probe_kept` / `recv_cap_probe_reverted` | `nya_recv_cap_probes_total` 等 | events（接收窗口探测） |
 | `zero_window_hole` / `zero_window_app` | `nya_zero_window_total{cause="hole"\|"app"}` | ACKs（广告窗口为 0：乱序空洞占主 / 应用未读占主，P1.4） |
 | `stall_enter_send` / `_send_zero_window` / `_recv_hole` / `_both` | `nya_stall_enter_total{kind}` | stall 进入次数，按类型（P1.7）：发送未 ACK / 发送且对端窗口 0 / 接收空洞 / 两者同时 |
 | `data_resend_{silence,belt,down,gone,dropped,age,allquiet}` | `nya_data_resend_total{why}` | frames（每次 DATA 换路重发的原因，P1.7） |
