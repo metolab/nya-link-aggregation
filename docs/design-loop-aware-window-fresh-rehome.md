@@ -648,3 +648,18 @@ Confirmatory pass on the revised design. No blocker; the two majors are leaks in
 | A2-N6 | Gate (ii) is a cross-role join. | **Amended**: tool capability is a PR 1 precondition. |
 
 **Stop decision.** Five detail rounds (blockers 5 → 0, majors trending 5, 7, 6, 4, 4 with each round's majors confined to the previous round's rewrites) plus two architecture rounds with no blocker (0/7/7, then 0/2/6 on the revision, both majors leaks in the amendments rather than new design). The remaining architecture-level concerns are either accepted limits with doors (A-M2), deferred behind PR 1's data (A-M4, KD9), or refactors sequenced into the PRs (A-M7). Further detail review would be scrubbing prose that the implementation and its tests will re-derive; the review loop closes here. What PR 1 must answer before anything else ships is listed in Rollout step 2.
+
+### Implementation log (2026-09-15) — PR 1 … PR 5 landed; three amendments made from measurement
+
+All five PRs landed in the planned order (`P1`, `P6+P7+reduced P5`, `P4`, `P2`, `P3`). Three places where the e2e numbers contradicted the design text, and what was changed:
+
+| # | What the design said | What measurement showed | Amendment |
+| --- | --- | --- | --- |
+| I-1 | P2.1: `hole` = EWMA of per-hole open→drain time. | `bulk_bottleneck_lossy_sibling`: `hole_ewma` 8–20 ms while pieces behind RTO holes waited 200 ms+; the window grew to ~2 × floor and goodput stayed at 7–15 s / 64 MiB. Event-weighting under-reads when many short reorder holes surround a few RTO-long ones. | `hole_for_window = hole_bytes_ewma / deliver_rate` (Little's law: mean residency of a byte in the reorder buffer, byte-weighted). The per-hole time EWMA stays as `nya.hole_us`. Result 3.5–4.3 s / 64 MiB, `recv_cap_max` 1.7–8 MiB. |
+| I-2 | P2.2: `rtt = p.rtt()` "the pre-transfer quiet value". | The EWMA is fed by Pongs between budget rounds and read 15–22 ms on 10 ms links under bulk; with monotone growth `W' = W·2R/L` is positive feedback (fanout 2.1 → 2.8–4.7 s, Reno tail drops at the budget's edge). Using `min_rtt` alone locked the window at the floor (fanout 4.1–4.4 s, `window_blocks` 400+). | `rtt = min(rtt(), 2 × min_rtt())` — the design's own `[2, 4] × BDP` envelope, made explicit. Clean-path numbers: single 2.1–2.6 s (was 2.1; the accepted trade for the removed probe), fanout 2.4–2.9 s. |
+| I-3 | P4 marks the *sticky* limited on divert. | With fit-or-wait the clean siblings carried 16 MiB each at a 64 k budget (`budget_blocks` 2200, siblings never marked); goodput 14–15 MB/s vs 25 MB/s of links. | `has_room_or_mark`: a bulk piece skipped for a sibling's budget marks that sibling's round limited. Siblings grow to ~210 k; 19 MB/s. |
+
+Also found while implementing: `loaded(p)` with bytes outstanding but no fresh sample must be floored at the path's own RTT, not read `last_rx_ago` alone — a just-fed path at 1 ms silence made every loaded sibling a backup (fanout read `unfit_n = 8` between equal siblings). Fixed before the door was added.
+
+Remaining known limit (not a P1–P7 item): the budget controller grows to `3 × BDP`, which on the e2e Reno emulation with a 64 KiB tail-drop queue sits exactly at the drop point; the window used to mask this by being the limiter. Real kernels run BBR under us. Watch `nya_path_tcp_retrans_total` per GB against v0.1.6 after rollout; if it rises on clean links, the budget cap gain is the knob, not the window.
+

@@ -877,8 +877,8 @@ TYPE 行必写。counter 名加 `_total`；gauge 不加；histogram 用 raw→cu
 | `stall_enter_send` / `_send_zero_window` / `_recv_hole` / `_both` | `nya_stall_enter_total{kind}` | stall 进入次数，按类型（P1.7）：发送未 ACK / 发送且对端窗口 0 / 接收空洞 / 两者同时 |
 | `data_resend_{silence,belt,down,gone,dropped,age,allquiet}` | `nya_data_resend_total{why}` | frames（每次 DATA 换路重发的原因，P1.7） |
 | `data_resend_skipped_{no_fresh_alt,allquiet_wait,queue_full,write_stalled,all_tried,no_alt}` | `nya_data_resend_skipped_total{reason}` | ticks（到期未重发的原因，P1.7） |
-| `send_budget_diverts` | `nya_send_budget_diverts_total` | pieces（sticky 预算满、分流到兄弟路径，P4；PR 3 前为 0） |
-| `migrates_loop_unfit` | `nya_migrates_loop_unfit_total` | events（sticky 因 loop-unfit 换路，P3；PR 5 前为 0） |
+| `send_budget_diverts` | `nya_send_budget_diverts_total` | pieces（sticky 预算满、分流到兄弟路径，P4） |
+| `migrates_loop_unfit` | `nya_migrates_loop_unfit_total` | events（sticky 的 loaded loop 相对池成 backup 后换路，P3.3；不计入 `hol_rebalances`） |
 | process handshake/inbound/outbound/reconnect/sessions_created/dead | `nya_handshake_create_ok_total` 等，与字段名 `nya_{field}_total` | |
 
 **Gauges**
@@ -892,8 +892,8 @@ TYPE 行必写。counter 名加 `_total`；gauge 不加；histogram 用 raw→cu
 | `PathSnap.budget_bytes` / `bw_bytes_s` / `ack_rtt_us` | `nya_path_budget_bytes` / `nya_path_bw_bytes_s` / `nya_path_ack_rtt_us` | `path`, `link` | overlay 每路径发送预算、ACK-clock 送达率、bulk ACK 往返 |
 | `PathSnap.delivered` | `nya_path_delivered_bytes_total`（counter） | `path`, `link` | 这条路被 ACK 的 DATA 字节 |
 | `PathSnap.tcp` | `nya_path_tcp_known` / `_cwnd_bytes` / `_unacked_bytes` / `_notsent_bytes` / `_rtt_us` / `_min_rtt_us` / `_delivery_rate_bytes_s` / `_busy_us` / `_rwnd_limited_us` / `_sndbuf_limited_us` / `nya_path_tcp_retrans_total` / `nya_path_tcp_bytes_retrans_total`（counter） | `path`, `link` | Linux `TCP_INFO`；非 Linux 或无 fd 时 `known=0`、其余为 0；`busy`/`rwnd_limited`/`sndbuf_limited`/`bytes_retrans` 旧内核为 0 |
-| `PathSnap.min_rtt_us` / `loop_fit` / `loop_unfit_total` | `nya_path_min_rtt_us` / `nya_path_loop_fit` / `nya_path_loop_unfit_total`（counter） | `path`, `link` | overlay 10 s 窗 min RTT；P3 loop-fit 判定（PR 5 前恒为 1 / 0） |
-| `recv_cap_extra_bytes` | `nya_recv_cap_extra_bytes` | 无 | Σ(recv_cap − floor)（P2；PR 4 前为 0） |
+| `PathSnap.min_rtt_us` / `loop_fit` / `loop_unfit_total` | `nya_path_min_rtt_us` / `nya_path_loop_fit` / `nya_path_loop_unfit_total`（counter） | `path`, `link` | overlay 10 s 窗 min RTT；P3 loop-fit 判定（相对 `pool_ref`，每 `maintain` tick 采样；`loop_unfit_total` 数 fit→unfit 翻转） |
+| `recv_cap_extra_bytes` | `nya_recv_cap_extra_bytes` | 无 | Σ(recv_cap − floor)，P2.4 内存护栏；上限 alive_paths × ceil |
 | `LinkSnap.*` | `nya_link_*` | `link` | 连接数 / RTT / sticky / 队列 / rx |
 
 路径 `path`/`link` 与线路 `link`：单会话是 `a#0` / `a`；多会话服务端两边都带 4-hex，例如 `a1b2:a#0`、`a1b2:a`，禁止跨租户合并。`streams=` 只进 snapshot 日志，不进 Prometheus。
