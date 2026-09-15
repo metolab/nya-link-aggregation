@@ -87,7 +87,7 @@ impl Session {
             streams.insert(id, st.clone());
         }
         self.spawn_pump(id, peer, inbound_rx);
-        Some((TunnelStream::from_duplex(id, app), st))
+        Some((TunnelStream::from_duplex(id, app, st.counters.clone()), st))
     }
 
     pub(super) fn accept_remote_stream(&self, path_id: u32, open: StreamOpen) {
@@ -599,6 +599,10 @@ impl Session {
         }
         let new_len = len;
         if let Some(old) = buf.insert(data.offset, data.data) {
+            // A re-sent piece landing on an offset already buffered: the
+            // first arrival is what opened/closed holes and drove the
+            // drain; this one only replaces bytes. Account and ACK, no
+            // drain (P2.1: only first arrivals reach the hole logic).
             let old_len = old.len() as u64;
             self.inner
                 .metrics
@@ -610,6 +614,10 @@ impl Session {
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                     Some(v.saturating_sub(old_len))
                 });
+            st.recv_buffered.fetch_add(new_len, Ordering::Relaxed);
+            drop(buf);
+            self.send_ack(&st, path_id);
+            return;
         }
         st.recv_buffered.fetch_add(new_len, Ordering::Relaxed);
         drop(buf);
@@ -637,6 +645,7 @@ impl Session {
         let mut delivered = 0u64;
         {
             let mut buf = st.recv_buf.lock().unwrap();
+            let mut full = false;
             loop {
                 let next = st.recv_next.load(Ordering::Relaxed);
                 let Some(chunk) = buf.remove(&next) else {
@@ -651,6 +660,7 @@ impl Session {
                             _ => unreachable!("drain_recv only sends Data"),
                         };
                         buf.insert(next, chunk);
+                        full = true;
                         break;
                     }
                 }
@@ -665,6 +675,7 @@ impl Session {
                 st.last_recv_ms
                     .store(crate::metrics::mono_ms().max(1), Ordering::Relaxed);
             }
+            self.track_hole(st, &buf, full);
         }
         if delivered > 0 {
             let sampled = st.note_deliver(delivered, self.deliver_min_dt(st));
@@ -672,6 +683,60 @@ impl Session {
         }
         self.send_ack(st, ack_path);
         self.try_finish_recv_close(st);
+    }
+
+    /// P2.1 hole state machine, derived from buffer contents under the
+    /// `recv_buf` lock (never from one piece's landing offset: several
+    /// path-reader tasks insert concurrently). A hole opens when the head
+    /// is missing while later pieces are buffered; it closes when the
+    /// missing piece is present — drained past, or sitting at the head of
+    /// a full channel. A head that is present but undeliverable (`full`)
+    /// is the application waiting, not the network: it neither opens nor
+    /// prolongs a hole. Also refreshes the P1.4 receiver evidence.
+    fn track_hole(
+        &self,
+        st: &StreamState,
+        buf: &std::collections::BTreeMap<u64, Vec<u8>>,
+        full: bool,
+    ) {
+        let now = Instant::now();
+        let recv_next = st.recv_next.load(Ordering::Relaxed);
+        let head_missing = !full && !buf.is_empty() && !buf.contains_key(&recv_next);
+        {
+            let mut hole = st.hole.lock().unwrap();
+            match *hole {
+                Some((off, t)) if off < recv_next || buf.contains_key(&off) => {
+                    st.sample_hole(now.saturating_duration_since(t));
+                    *hole = head_missing.then_some((recv_next, now));
+                }
+                None if head_missing => *hole = Some((recv_next, now)),
+                _ => {}
+            }
+        }
+        let in_order_held = st.in_order_held_locked(buf);
+        let hole_bytes = st
+            .recv_buffered
+            .load(Ordering::Relaxed)
+            .saturating_sub(in_order_held);
+        let app_backlog = st.buffered_in.load(Ordering::Relaxed) + in_order_held;
+        st.recv_hole_max.fetch_max(hole_bytes, Ordering::Relaxed);
+        st.app_backlog_max.fetch_max(app_backlog, Ordering::Relaxed);
+    }
+
+    /// P1.4: `(hole_bytes, app_backlog)` — out-of-order bytes held behind
+    /// a hole vs in-order bytes the app has not taken.
+    pub(super) fn recv_evidence(&self, st: &StreamState) -> (u64, u64) {
+        let buf = st.recv_buf.lock().unwrap();
+        let in_order_held = st.in_order_held_locked(&buf);
+        drop(buf);
+        let hole_bytes = st
+            .recv_buffered
+            .load(Ordering::Relaxed)
+            .saturating_sub(in_order_held);
+        (
+            hole_bytes,
+            st.buffered_in.load(Ordering::Relaxed) + in_order_held,
+        )
     }
 
     pub(crate) fn tune_recv_windows(&self) {
@@ -840,6 +905,24 @@ impl Session {
             window: st.advertised_window(),
             sack: st.sack_ranges(),
         };
+        if ack.window == 0 {
+            // P1.4: who closed the window — bytes stuck behind a hole, or
+            // in-order bytes the application has not read.
+            let (hole_bytes, app_backlog) = self.recv_evidence(st);
+            if hole_bytes >= app_backlog {
+                st.zero_win_hole.fetch_add(1, Ordering::Relaxed);
+                self.inner
+                    .metrics
+                    .zero_window_hole
+                    .fetch_add(1, Ordering::Relaxed);
+            } else {
+                st.zero_win_app.fetch_add(1, Ordering::Relaxed);
+                self.inner
+                    .metrics
+                    .zero_window_app
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
         // P3b: the sender may run up to exactly this edge.
         let min_rtt = self
             .bdp_rtt(st)

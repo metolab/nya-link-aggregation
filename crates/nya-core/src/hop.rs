@@ -150,6 +150,10 @@ impl<T> HopProbe<T> {
     pub fn clock(&self) -> &Arc<HopClock> {
         &self.clock
     }
+
+    pub fn inner(&self) -> &T {
+        &self.inner
+    }
 }
 
 impl<T: AsyncRead + Unpin> AsyncRead for HopProbe<T> {
@@ -280,12 +284,274 @@ pub struct HopSample {
     pub rx_bytes: Option<u64>,
     pub tx_bytes: Option<u64>,
     pub copy_err: Option<String>,
-    /// Per-stream limiter summary taken at copy end, before the tunnel
-    /// half is dropped (P6). `None` for open/dial failures.
+    /// Per-stream limiter summary taken at copy end (P6/P1.1). `None`
+    /// for open/dial failures.
     pub stream: Option<crate::stream::StreamStats>,
+    /// Where the copy task waited, per direction (P1.2). `None` when the
+    /// copy did not run.
+    pub waits: Option<HopWaits>,
+    /// Kernel `TCP_INFO` of the origin socket at copy end (server, Linux).
+    pub origin_tcp: Option<crate::net::TcpInfo>,
+}
+
+/// Copy-task wait times, µs (P1.2). `local` is the origin socket on the
+/// server and the application socket on the client; `overlay` the tunnel.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HopWaits {
+    pub local_read_us: u64,
+    pub local_write_us: u64,
+    pub overlay_read_us: u64,
+    pub overlay_write_us: u64,
+}
+
+impl HopWaits {
+    /// From the copier outcome where `a` was the local socket and `b` the
+    /// overlay: `a_to_b` reads local / writes overlay, `b_to_a` the mirror.
+    pub fn from_outcome(o: &CopyOutcome) -> Self {
+        Self {
+            local_read_us: o.a_to_b.read_wait_us,
+            overlay_write_us: o.a_to_b.write_wait_us,
+            overlay_read_us: o.b_to_a.read_wait_us,
+            local_write_us: o.b_to_a.write_wait_us,
+        }
+    }
+}
+
+/// One direction of [`copy_bidirectional_timed`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DirCopy {
+    pub bytes: u64,
+    /// Wall time spent with `poll_read` Pending.
+    pub read_wait_us: u64,
+    /// Wall time spent with `poll_write` Pending.
+    pub write_wait_us: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CopyOutcome {
+    pub a_to_b: DirCopy,
+    pub b_to_a: DirCopy,
+}
+
+/// Buffer per direction. Pinned to tokio's `copy_bidirectional` size: the
+/// copier's write size shapes overlay piece sizes and `becoming_bulk`
+/// timing, which the production baseline was read against (P1.2).
+pub const COPY_BUF: usize = 8 * 1024;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WaitOn {
+    Read,
+    Write,
+}
+
+struct DirState {
+    buf: Box<[u8]>,
+    pos: usize,
+    cap: usize,
+    read_done: bool,
+    need_flush: bool,
+    shutting_down: bool,
+    done: bool,
+    out: DirCopy,
+    wait: Option<(Instant, WaitOn)>,
+}
+
+impl DirState {
+    fn new() -> Self {
+        Self {
+            buf: vec![0u8; COPY_BUF].into_boxed_slice(),
+            pos: 0,
+            cap: 0,
+            read_done: false,
+            need_flush: false,
+            shutting_down: false,
+            done: false,
+            out: DirCopy::default(),
+            wait: None,
+        }
+    }
+
+    fn pending(&mut self, on: WaitOn) {
+        if self.wait.is_none() {
+            self.wait = Some((Instant::now(), on));
+        }
+    }
+
+    fn ready(&mut self) {
+        if let Some((t, on)) = self.wait.take() {
+            let us = t.elapsed().as_micros() as u64;
+            match on {
+                WaitOn::Read => self.out.read_wait_us += us,
+                WaitOn::Write => self.out.write_wait_us += us,
+            }
+        }
+    }
+
+    /// One direction: a plain read-then-write state machine. Exactly one
+    /// of `poll_read` / `poll_write` can be outstanding, so every Pending
+    /// interval is billed to one side by construction. `flush` and
+    /// `shutdown` waits are not counted.
+    fn poll<R: AsyncRead + Unpin + ?Sized, W: AsyncWrite + Unpin + ?Sized>(
+        &mut self,
+        cx: &mut Context<'_>,
+        r: &mut R,
+        w: &mut W,
+    ) -> Poll<io::Result<()>> {
+        loop {
+            if self.done {
+                return Poll::Ready(Ok(()));
+            }
+            if self.shutting_down {
+                match Pin::new(&mut *w).poll_shutdown(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Ready(Ok(())) => {
+                        self.done = true;
+                        continue;
+                    }
+                }
+            }
+            if self.pos == self.cap && !self.read_done {
+                let mut rb = ReadBuf::new(&mut self.buf[..]);
+                match Pin::new(&mut *r).poll_read(cx, &mut rb) {
+                    Poll::Pending => {
+                        // As tokio: flush what was written so a reader that
+                        // depends on our writer's buffer cannot deadlock.
+                        if self.need_flush {
+                            match Pin::new(&mut *w).poll_flush(cx) {
+                                Poll::Pending => return Poll::Pending,
+                                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                                Poll::Ready(Ok(())) => self.need_flush = false,
+                            }
+                        }
+                        self.pending(WaitOn::Read);
+                        return Poll::Pending;
+                    }
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Ready(Ok(())) => {
+                        let n = rb.filled().len();
+                        self.ready();
+                        if n == 0 {
+                            self.read_done = true;
+                        } else {
+                            self.pos = 0;
+                            self.cap = n;
+                        }
+                    }
+                }
+            }
+            while self.pos < self.cap {
+                match Pin::new(&mut *w).poll_write(cx, &self.buf[self.pos..self.cap]) {
+                    Poll::Pending => {
+                        self.pending(WaitOn::Write);
+                        return Poll::Pending;
+                    }
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Ready(Ok(0)) => {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::WriteZero,
+                            "write zero byte into writer",
+                        )));
+                    }
+                    Poll::Ready(Ok(n)) => {
+                        self.ready();
+                        self.pos += n;
+                        self.out.bytes += n as u64;
+                        self.need_flush = true;
+                    }
+                }
+            }
+            if self.pos == self.cap && self.read_done {
+                match Pin::new(&mut *w).poll_flush(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Ready(Ok(())) => {
+                        self.need_flush = false;
+                        self.shutting_down = true;
+                    }
+                }
+            }
+        }
+    }
+}
+
+struct CopyTimed<'a, A: ?Sized, B: ?Sized> {
+    a: &'a mut A,
+    b: &'a mut B,
+    ab: DirState,
+    ba: DirState,
+}
+
+impl<A, B> Future for CopyTimed<'_, A, B>
+where
+    A: AsyncRead + AsyncWrite + Unpin + ?Sized,
+    B: AsyncRead + AsyncWrite + Unpin + ?Sized,
+{
+    type Output = io::Result<CopyOutcome>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let me = self.get_mut();
+        let ab = me.ab.poll(cx, &mut *me.a, &mut *me.b)?;
+        let ba = me.ba.poll(cx, &mut *me.b, &mut *me.a)?;
+        match (ab, ba) {
+            (Poll::Ready(()), Poll::Ready(())) => Poll::Ready(Ok(CopyOutcome {
+                a_to_b: me.ab.out,
+                b_to_a: me.ba.out,
+            })),
+            _ => Poll::Pending,
+        }
+    }
+}
+
+/// `tokio::io::copy_bidirectional` with per-direction wait accounting
+/// (P1.2). Same close semantics: EOF on one side flushes and shuts down
+/// the other side's writer; an error on either side ends the copy with
+/// that error. Returns byte counts and the time each direction spent
+/// waiting on its reader vs its writer.
+pub async fn copy_bidirectional_timed<A, B>(a: &mut A, b: &mut B) -> io::Result<CopyOutcome>
+where
+    A: AsyncRead + AsyncWrite + Unpin + ?Sized,
+    B: AsyncRead + AsyncWrite + Unpin + ?Sized,
+{
+    CopyTimed {
+        a,
+        b,
+        ab: DirState::new(),
+        ba: DirState::new(),
+    }
+    .await
 }
 
 impl HopSample {
+    /// `nya.limiter` (P1.3): by wait time when the copier measured it,
+    /// else the counter-only form. `None` without stream stats.
+    pub fn limiter(&self) -> Option<&'static str> {
+        let st = self.stream.as_ref()?;
+        let Some(w) = self.waits else {
+            return Some(st.limiter());
+        };
+        let rx = self.rx_bytes.unwrap_or(0);
+        let tx = self.tx_bytes.unwrap_or(0);
+        // server: rx_bytes = origin → us (download) ⇒ we send on the overlay.
+        // client: rx_bytes = overlay → us (download) ⇒ we receive on it.
+        let overlay_sender = (self.role == HopRole::Server) == (rx >= tx);
+        let (far, near) = if overlay_sender {
+            (w.local_read_us, w.overlay_write_us)
+        } else {
+            (w.overlay_read_us, w.local_write_us)
+        };
+        Some(st.limiter_by_time(crate::stream::LimiterWaits {
+            far_us: far,
+            near_us: near,
+            copy_us: self.copy_us.unwrap_or(0),
+            overlay_sender,
+            local: match self.role {
+                HopRole::Server => "origin",
+                HopRole::Client => "app",
+            },
+        }))
+    }
+
     pub fn rank_us(&self) -> u64 {
         [
             self.copy_us,
@@ -340,15 +606,37 @@ impl HopSample {
         }
         if let Some(ref st) = self.stream {
             parts.push(format!(
-                "limiter={} wblk={} bblk={} wroom={} cap_max={} hedges={} dup_rx={} paths={}",
-                st.limiter(),
+                "limiter={} wblk={} bblk={} wroom={} cap_max={} hedges={} dup_rx={} paths={} hole_us={} hole_max={} backlog_max={} zw_hole={} zw_app={} diverts={}",
+                self.limiter().unwrap_or("none"),
                 st.window_blocks,
                 st.budget_blocks,
                 st.window_limited_with_room,
                 st.recv_cap_max,
                 st.hedges,
                 st.dup_rx_bytes,
-                st.paths_used
+                st.paths_used,
+                st.hole_us,
+                st.recv_hole_max,
+                st.app_backlog_max,
+                st.zero_win_hole,
+                st.zero_win_app,
+                st.budget_diverts,
+            ));
+        }
+        if let Some(w) = self.waits {
+            let (lr, lw) = match self.role {
+                HopRole::Server => ("origin_read_wait_us", "origin_write_wait_us"),
+                HopRole::Client => ("app_read_wait_us", "app_write_wait_us"),
+            };
+            parts.push(format!(
+                "{lr}={} {lw}={} overlay_read_wait_us={} overlay_write_wait_us={}",
+                w.local_read_us, w.local_write_us, w.overlay_read_us, w.overlay_write_us
+            ));
+        }
+        if let Some(t) = self.origin_tcp {
+            parts.push(format!(
+                "origin_tcp_rtt_us={} origin_tcp_retrans={} origin_tcp_bytes_retrans={} origin_tcp_rwnd_limited_us={} origin_tcp_rcv_ooopack={}",
+                t.rtt_us, t.total_retrans, t.bytes_retrans, t.rwnd_limited_us, t.rcv_ooopack
             ));
         }
         parts.join(" ")
@@ -392,6 +680,28 @@ impl HopSample {
             nya.hedges = tracing::field::Empty,
             nya.dup_rx_bytes = tracing::field::Empty,
             nya.paths_used = tracing::field::Empty,
+            nya.hole_us = tracing::field::Empty,
+            nya.recv_hole_max = tracing::field::Empty,
+            nya.app_backlog_max = tracing::field::Empty,
+            nya.zero_win_hole = tracing::field::Empty,
+            nya.zero_win_app = tracing::field::Empty,
+            nya.budget_diverts = tracing::field::Empty,
+            nya.origin_read_wait_us = tracing::field::Empty,
+            nya.origin_write_wait_us = tracing::field::Empty,
+            nya.app_read_wait_us = tracing::field::Empty,
+            nya.app_write_wait_us = tracing::field::Empty,
+            nya.overlay_read_wait_us = tracing::field::Empty,
+            nya.overlay_write_wait_us = tracing::field::Empty,
+            nya.origin_tcp_rtt_us = tracing::field::Empty,
+            nya.origin_tcp_min_rtt_us = tracing::field::Empty,
+            nya.origin_tcp_retrans = tracing::field::Empty,
+            nya.origin_tcp_bytes_retrans = tracing::field::Empty,
+            nya.origin_tcp_delivery_rate = tracing::field::Empty,
+            nya.origin_tcp_busy_us = tracing::field::Empty,
+            nya.origin_tcp_rwnd_limited_us = tracing::field::Empty,
+            nya.origin_tcp_sndbuf_limited_us = tracing::field::Empty,
+            nya.origin_tcp_rcv_space = tracing::field::Empty,
+            nya.origin_tcp_rcv_ooopack = tracing::field::Empty,
         );
         fn rec(span: &tracing::Span, name: &'static str, v: Option<u64>) {
             if let Some(v) = v {
@@ -421,7 +731,7 @@ impl HopSample {
             span.record("nya.copy_err", e.as_str());
         }
         if let Some(ref st) = self.stream {
-            span.record("nya.limiter", st.limiter());
+            span.record("nya.limiter", self.limiter().unwrap_or("none"));
             span.record("nya.window_blocks", st.window_blocks);
             span.record("nya.budget_blocks", st.budget_blocks);
             span.record("nya.window_limited_with_room", st.window_limited_with_room);
@@ -429,6 +739,38 @@ impl HopSample {
             span.record("nya.hedges", st.hedges);
             span.record("nya.dup_rx_bytes", st.dup_rx_bytes);
             span.record("nya.paths_used", u64::from(st.paths_used));
+            span.record("nya.hole_us", st.hole_us);
+            span.record("nya.recv_hole_max", st.recv_hole_max);
+            span.record("nya.app_backlog_max", st.app_backlog_max);
+            span.record("nya.zero_win_hole", st.zero_win_hole);
+            span.record("nya.zero_win_app", st.zero_win_app);
+            span.record("nya.budget_diverts", st.budget_diverts);
+        }
+        if let Some(w) = self.waits {
+            match self.role {
+                HopRole::Server => {
+                    span.record("nya.origin_read_wait_us", w.local_read_us);
+                    span.record("nya.origin_write_wait_us", w.local_write_us);
+                }
+                HopRole::Client => {
+                    span.record("nya.app_read_wait_us", w.local_read_us);
+                    span.record("nya.app_write_wait_us", w.local_write_us);
+                }
+            }
+            span.record("nya.overlay_read_wait_us", w.overlay_read_us);
+            span.record("nya.overlay_write_wait_us", w.overlay_write_us);
+        }
+        if let Some(t) = self.origin_tcp {
+            span.record("nya.origin_tcp_rtt_us", u64::from(t.rtt_us));
+            span.record("nya.origin_tcp_min_rtt_us", u64::from(t.min_rtt_us));
+            span.record("nya.origin_tcp_retrans", u64::from(t.total_retrans));
+            span.record("nya.origin_tcp_bytes_retrans", t.bytes_retrans);
+            span.record("nya.origin_tcp_delivery_rate", t.delivery_rate_bytes_s);
+            span.record("nya.origin_tcp_busy_us", t.busy_time_us);
+            span.record("nya.origin_tcp_rwnd_limited_us", t.rwnd_limited_us);
+            span.record("nya.origin_tcp_sndbuf_limited_us", t.sndbuf_limited_us);
+            span.record("nya.origin_tcp_rcv_space", u64::from(t.rcv_space));
+            span.record("nya.origin_tcp_rcv_ooopack", u64::from(t.rcv_ooopack));
         }
         let _g = span.entered();
     }
@@ -1648,5 +1990,234 @@ mod tests {
             1,
             "same addr from seed and lookup must connect once"
         );
+    }
+
+    /// P1.2: a direction whose writer blocks accrues `write_wait` only; the
+    /// mirror accrues `read_wait` only; the two directions are independent.
+    #[tokio::test]
+    async fn timed_copier_bills_one_side() {
+        // a <-> b copied; `a_far` / `b_far` are the outer ends.
+        let (mut a_far, mut a) = tokio::io::duplex(4096);
+        let (mut b_far, mut b) = tokio::io::duplex(4096);
+        let copier = tokio::spawn(async move {
+            let r = copy_bidirectional_timed(&mut a, &mut b).await;
+            (r, a, b)
+        });
+        // a→b: 16 KiB offered, b_far reads it only after 100 ms ⇒ the a→b
+        // direction waits on its *writer* (b full at 4 KiB). The far write
+        // itself blocks (duplex + copier buffers < 16 KiB), so run it aside.
+        let feeder = tokio::spawn(async move {
+            a_far.write_all(&vec![7u8; 16 * 1024]).await.unwrap();
+            a_far
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut sink = vec![0u8; 16 * 1024];
+        b_far.read_exact(&mut sink).await.unwrap();
+        let mut a_far = feeder.await.unwrap();
+        // b→a: nothing is ever written until now ⇒ that direction waited
+        // on its *reader* the whole time.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        b_far.write_all(&[1, 2, 3]).await.unwrap();
+        let mut small = [0u8; 3];
+        a_far.read_exact(&mut small).await.unwrap();
+        drop(a_far);
+        drop(b_far);
+        let (r, _a, _b) = copier.await.unwrap();
+        let o = r.unwrap();
+        assert_eq!(o.a_to_b.bytes, 16 * 1024);
+        assert_eq!(o.b_to_a.bytes, 3);
+        assert!(
+            o.a_to_b.write_wait_us >= 80_000,
+            "a→b write wait {}",
+            o.a_to_b.write_wait_us
+        );
+        assert!(
+            o.a_to_b.read_wait_us < o.a_to_b.write_wait_us,
+            "a→b read wait {} vs write {}",
+            o.a_to_b.read_wait_us,
+            o.a_to_b.write_wait_us
+        );
+        assert!(
+            o.b_to_a.read_wait_us >= 140_000,
+            "b→a read wait {}",
+            o.b_to_a.read_wait_us
+        );
+        assert!(o.b_to_a.write_wait_us < 10_000);
+    }
+
+    /// EOF on one side shuts the other side's writer; the far ends see
+    /// EOF exactly as with `tokio::io::copy_bidirectional`; byte counts
+    /// and piece sizes match tokio's on the same input.
+    #[tokio::test]
+    async fn timed_copier_close_semantics() {
+        async fn run(timed: bool) -> (u64, u64, Vec<u8>, Vec<u8>) {
+            let (mut a_far, mut a) = tokio::io::duplex(1024);
+            let (mut b_far, mut b) = tokio::io::duplex(1024);
+            let copier = tokio::spawn(async move {
+                if timed {
+                    let o = copy_bidirectional_timed(&mut a, &mut b).await.unwrap();
+                    (o.a_to_b.bytes, o.b_to_a.bytes)
+                } else {
+                    tokio::io::copy_bidirectional(&mut a, &mut b).await.unwrap()
+                }
+            });
+            let payload: Vec<u8> = (0..20_000u32).map(|i| (i % 251) as u8).collect();
+            let p2 = payload.clone();
+            let writer = tokio::spawn(async move {
+                a_far.write_all(&p2).await.unwrap();
+                a_far.shutdown().await.unwrap();
+                let mut back = Vec::new();
+                a_far.read_to_end(&mut back).await.unwrap();
+                back
+            });
+            let mut got = Vec::new();
+            b_far.read_to_end(&mut got).await.unwrap();
+            b_far.write_all(b"reply").await.unwrap();
+            b_far.shutdown().await.unwrap();
+            let back = writer.await.unwrap();
+            let (ab, ba) = copier.await.unwrap();
+            (ab, ba, got, back)
+        }
+        let (ab_t, ba_t, got_t, back_t) = run(true).await;
+        let (ab_r, ba_r, got_r, back_r) = run(false).await;
+        assert_eq!((ab_t, ba_t), (ab_r, ba_r));
+        assert_eq!(got_t, got_r);
+        assert_eq!(back_t, back_r);
+        assert_eq!(back_t, b"reply");
+        assert_eq!(got_t.len(), 20_000);
+    }
+
+    /// Error on either side ends the copy with that error and partial counts.
+    #[tokio::test]
+    async fn timed_copier_propagates_error() {
+        struct Broken;
+        impl AsyncRead for Broken {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                _buf: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                Poll::Ready(Err(io::Error::new(io::ErrorKind::ConnectionReset, "rst")))
+            }
+        }
+        impl AsyncWrite for Broken {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                _buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                Poll::Ready(Err(io::Error::new(io::ErrorKind::ConnectionReset, "rst")))
+            }
+            fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+        let (_far, mut ok) = tokio::io::duplex(64);
+        let mut broken = Broken;
+        let e = copy_bidirectional_timed(&mut ok, &mut broken)
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::ConnectionReset);
+    }
+
+    fn sample(
+        role: HopRole,
+        rx: u64,
+        tx: u64,
+        w: HopWaits,
+        st: crate::stream::StreamStats,
+    ) -> HopSample {
+        HopSample {
+            role,
+            rx_bytes: Some(rx),
+            tx_bytes: Some(tx),
+            copy_us: Some(1_000_000),
+            waits: Some(w),
+            stream: Some(st),
+            ..Default::default()
+        }
+    }
+
+    /// P1.3 table, one case per row × {far, near dominant} plus `none`.
+    #[test]
+    fn limiter_by_time_table() {
+        use crate::stream::StreamStats;
+        let win = StreamStats {
+            window_blocks: 10,
+            window_limited_with_room: 9,
+            ..Default::default()
+        };
+        let bud = StreamStats {
+            budget_blocks: 5,
+            window_blocks: 1,
+            ..Default::default()
+        };
+        let path = StreamStats {
+            window_blocks: 10,
+            window_limited_with_room: 1,
+            ..Default::default()
+        };
+        let far = |lr, lw, orr, ow| HopWaits {
+            local_read_us: lr,
+            local_write_us: lw,
+            overlay_read_us: orr,
+            overlay_write_us: ow,
+        };
+        // server download (rx dominant): overlay sender.
+        assert_eq!(
+            sample(HopRole::Server, 100, 1, far(600_000, 0, 0, 100_000), win).limiter(),
+            Some("origin")
+        );
+        assert_eq!(
+            sample(HopRole::Server, 100, 1, far(100_000, 0, 0, 600_000), win).limiter(),
+            Some("window")
+        );
+        assert_eq!(
+            sample(HopRole::Server, 100, 1, far(100_000, 0, 0, 600_000), bud).limiter(),
+            Some("budget")
+        );
+        assert_eq!(
+            sample(HopRole::Server, 100, 1, far(100_000, 0, 0, 600_000), path).limiter(),
+            Some("path")
+        );
+        // server upload (tx dominant): overlay receiver.
+        assert_eq!(
+            sample(HopRole::Server, 1, 100, far(0, 100_000, 600_000, 0), win).limiter(),
+            Some("overlay")
+        );
+        assert_eq!(
+            sample(HopRole::Server, 1, 100, far(0, 600_000, 100_000, 0), win).limiter(),
+            Some("origin")
+        );
+        // client download (rx dominant): overlay receiver.
+        assert_eq!(
+            sample(HopRole::Client, 100, 1, far(0, 100_000, 600_000, 0), win).limiter(),
+            Some("overlay")
+        );
+        assert_eq!(
+            sample(HopRole::Client, 100, 1, far(0, 600_000, 100_000, 0), win).limiter(),
+            Some("app")
+        );
+        // client upload (tx dominant): overlay sender.
+        assert_eq!(
+            sample(HopRole::Client, 1, 100, far(600_000, 0, 0, 100_000), win).limiter(),
+            Some("app")
+        );
+        assert_eq!(
+            sample(HopRole::Client, 1, 100, far(100_000, 0, 0, 600_000), win).limiter(),
+            Some("window")
+        );
+        // waited < 10 % of copy_us anywhere: none.
+        assert_eq!(
+            sample(HopRole::Server, 100, 1, far(50_000, 0, 0, 40_000), win).limiter(),
+            Some("none")
+        );
+        // no waits measured: counter-only form.
+        let mut s = sample(HopRole::Server, 100, 1, far(0, 0, 0, 0), win);
+        s.waits = None;
+        assert_eq!(s.limiter(), Some("window"));
     }
 }

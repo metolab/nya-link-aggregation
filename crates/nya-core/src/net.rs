@@ -70,6 +70,14 @@ pub struct TcpInfo {
     pub min_rtt_us: u32,
     pub delivery_rate_bytes_s: u64,
     pub pacing_rate_bytes_s: u64,
+    /// P1.5 additions (0 on kernels that do not return them).
+    pub rcv_rtt_us: u32,
+    pub rcv_space: u32,
+    pub busy_time_us: u64,
+    pub rwnd_limited_us: u64,
+    pub sndbuf_limited_us: u64,
+    pub bytes_retrans: u64,
+    pub rcv_ooopack: u32,
 }
 
 /// Owned duplicate of a socket fd for `TCP_INFO` reads that outlive the
@@ -127,7 +135,26 @@ pub fn parse_tcp_info(buf: &[u8]) -> TcpInfo {
         notsent_bytes: u32_at(buf, 144),
         min_rtt_us: u32_at(buf, 148),
         delivery_rate_bytes_s: u64_at(buf, 160),
+        rcv_rtt_us: u32_at(buf, 92),
+        rcv_space: u32_at(buf, 96),
+        busy_time_us: u64_at(buf, 168),
+        rwnd_limited_us: u64_at(buf, 176),
+        sndbuf_limited_us: u64_at(buf, 184),
+        bytes_retrans: u64_at(buf, 208),
+        rcv_ooopack: u32_at(buf, 224),
     }
+}
+
+/// `TCP_INFO` of any socket we can borrow (P1.5: the origin `TcpStream`
+/// the hop still owns at copy end). `None` off Linux or on error.
+#[cfg(unix)]
+pub fn tcp_info_of(fd: &impl std::os::fd::AsFd) -> Option<TcpInfo> {
+    imp::tcp_info_borrowed(fd.as_fd())
+}
+
+#[cfg(not(unix))]
+pub fn tcp_info_of<T>(_fd: &T) -> Option<TcpInfo> {
+    None
 }
 
 #[cfg(unix)]
@@ -176,9 +203,13 @@ mod imp {
 
     /// The single `unsafe` in `nya-core`: `getsockopt(TCP_INFO)` into a
     /// byte buffer. No safe wrapper exists in the dependency tree.
+    pub fn tcp_info(fd: &OwnedFd) -> Option<TcpInfo> {
+        tcp_info_borrowed(fd.as_fd())
+    }
+
     #[cfg(target_os = "linux")]
     #[allow(unsafe_code)]
-    pub fn tcp_info(fd: &OwnedFd) -> Option<TcpInfo> {
+    pub fn tcp_info_borrowed(fd: std::os::fd::BorrowedFd<'_>) -> Option<TcpInfo> {
         use std::os::fd::AsRawFd;
         let mut buf = [0u8; 256];
         let mut len = buf.len() as libc::socklen_t;
@@ -202,7 +233,7 @@ mod imp {
     }
 
     #[cfg(not(target_os = "linux"))]
-    pub fn tcp_info(_fd: &OwnedFd) -> Option<TcpInfo> {
+    pub fn tcp_info_borrowed(_fd: std::os::fd::BorrowedFd<'_>) -> Option<TcpInfo> {
         None
     }
 }
@@ -232,6 +263,32 @@ mod imp {
 mod tests {
     use super::*;
 
+    /// P1.5: `tcp_info_of` reads a live socket through `AsFd` — the hop
+    /// carries `nya.origin_tcp_*` when the origin is a real Linux socket.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn origin_tcp_info_on_hop() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let (mut a, (mut b, _)) =
+            tokio::join!(async { TcpStream::connect(addr).await.unwrap() }, async {
+                l.accept().await.unwrap()
+            });
+        a.write_all(&[7u8; 4096]).await.unwrap();
+        let mut buf = [0u8; 4096];
+        b.read_exact(&mut buf).await.unwrap();
+        let t = tcp_info_of(&a).expect("live socket yields TCP_INFO");
+        assert!(t.snd_mss > 0, "{t:?}");
+        assert!(t.rtt_us > 0, "{t:?}");
+        assert!(t.min_rtt_us > 0, "{t:?}");
+        assert_eq!(t.total_retrans, 0);
+        assert_eq!(t.bytes_retrans, 0);
+        // receiver side reads too (P1.5 fields are parsed only when the
+        // kernel returns them; a short struct leaves them 0, never garbage).
+        assert!(tcp_info_of(&b).is_some());
+    }
+
     #[test]
     fn parse_short_buffer_is_zero() {
         let t = parse_tcp_info(&[0u8; 20]);
@@ -250,7 +307,13 @@ mod tests {
         b[100..104].copy_from_slice(&7u32.to_ne_bytes());
         b[144..148].copy_from_slice(&65_536u32.to_ne_bytes());
         b[160..168].copy_from_slice(&6_250_000u64.to_ne_bytes());
+        b[176..184].copy_from_slice(&123_456u64.to_ne_bytes());
+        b[208..216].copy_from_slice(&9_999u64.to_ne_bytes());
+        b[224..228].copy_from_slice(&3u32.to_ne_bytes());
         let t = parse_tcp_info(&b);
+        assert_eq!(t.rwnd_limited_us, 123_456);
+        assert_eq!(t.bytes_retrans, 9_999);
+        assert_eq!(t.rcv_ooopack, 3);
         assert_eq!(t.snd_mss, 1448);
         assert_eq!(t.unacked_bytes, 14_480);
         assert_eq!(t.rtt_us, 10_500);

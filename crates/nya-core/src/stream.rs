@@ -42,16 +42,101 @@ pub struct Unacked {
     pub first_tx_at_send_us: u64,
 }
 
+/// The atomics `StreamStats` reads, split out of `StreamState` so a
+/// `TunnelStream` can read them after the session has reaped the stream
+/// (KD13). Holds no channel, buffer or `Notify`: sharing it cannot keep
+/// the pump alive. `StreamState` derefs to it.
+pub struct StreamCounters {
+    pub send_next: AtomicU64,
+    pub send_window: AtomicU32,
+    pub recv_next: AtomicU64,
+    /// BDP advertise cap. Floor = `initial_window`; ceil = floor * chan.
+    pub recv_cap: AtomicU32,
+    /// Per-stream limiter evidence, read at stream end for the hop span (P6).
+    pub window_blocks: AtomicU64,
+    pub budget_blocks: AtomicU64,
+    pub window_limited_with_room: AtomicU64,
+    /// Max `recv_cap` ever advertised (receiver side).
+    pub recv_cap_max: AtomicU32,
+    /// Bulk/interactive pieces re-sent on another path for this stream.
+    pub hedges: AtomicU64,
+    /// Duplicate payload bytes received on this stream.
+    pub dup_rx_bytes: AtomicU64,
+    /// Distinct dests this stream sent DATA on (bounded set).
+    pub paths_used: Mutex<Vec<u32>>,
+    /// Receiver evidence (P1.4): max out-of-order bytes held behind a
+    /// hole, max in-order bytes the app had not taken, zero-window ACKs
+    /// by cause, the hole EWMA (µs), and sticky-full diverts (P4).
+    pub recv_hole_max: AtomicU64,
+    pub app_backlog_max: AtomicU64,
+    pub zero_win_hole: AtomicU64,
+    pub zero_win_app: AtomicU64,
+    pub hole_us: AtomicU64,
+    pub budget_diverts: AtomicU64,
+}
+
+impl StreamCounters {
+    fn new(initial_window: u32) -> Arc<Self> {
+        Arc::new(Self {
+            send_next: AtomicU64::new(0),
+            send_window: AtomicU32::new(initial_window),
+            recv_next: AtomicU64::new(0),
+            recv_cap: AtomicU32::new(initial_window),
+            window_blocks: AtomicU64::new(0),
+            budget_blocks: AtomicU64::new(0),
+            window_limited_with_room: AtomicU64::new(0),
+            recv_cap_max: AtomicU32::new(initial_window),
+            hedges: AtomicU64::new(0),
+            dup_rx_bytes: AtomicU64::new(0),
+            paths_used: Mutex::new(Vec::new()),
+            recv_hole_max: AtomicU64::new(0),
+            app_backlog_max: AtomicU64::new(0),
+            zero_win_hole: AtomicU64::new(0),
+            zero_win_app: AtomicU64::new(0),
+            hole_us: AtomicU64::new(0),
+            budget_diverts: AtomicU64::new(0),
+        })
+    }
+
+    /// Remember a dest this stream sent DATA on (first 16 distinct).
+    pub fn note_path_used(&self, path_id: u32) {
+        let mut g = self.paths_used.lock().unwrap();
+        if !g.contains(&path_id) && g.len() < 16 {
+            g.push(path_id);
+        }
+    }
+
+    pub fn stats(&self) -> StreamStats {
+        StreamStats {
+            recv_cap: self.recv_cap.load(Ordering::Relaxed),
+            send_window: self.send_window.load(Ordering::Relaxed),
+            window_blocks: self.window_blocks.load(Ordering::Relaxed),
+            budget_blocks: self.budget_blocks.load(Ordering::Relaxed),
+            window_limited_with_room: self.window_limited_with_room.load(Ordering::Relaxed),
+            recv_cap_max: self.recv_cap_max.load(Ordering::Relaxed),
+            hedges: self.hedges.load(Ordering::Relaxed),
+            dup_rx_bytes: self.dup_rx_bytes.load(Ordering::Relaxed),
+            paths_used: self.paths_used.lock().unwrap().len() as u32,
+            sent: self.send_next.load(Ordering::Relaxed),
+            received: self.recv_next.load(Ordering::Relaxed),
+            recv_hole_max: self.recv_hole_max.load(Ordering::Relaxed),
+            app_backlog_max: self.app_backlog_max.load(Ordering::Relaxed),
+            zero_win_hole: self.zero_win_hole.load(Ordering::Relaxed),
+            zero_win_app: self.zero_win_app.load(Ordering::Relaxed),
+            hole_us: self.hole_us.load(Ordering::Relaxed),
+            budget_diverts: self.budget_diverts.load(Ordering::Relaxed),
+        }
+    }
+}
+
 pub struct StreamState {
     pub id: u32,
+    pub counters: Arc<StreamCounters>,
     pub sticky: AtomicU32,
-    pub send_next: AtomicU64,
     pub send_acked: AtomicU64,
-    pub send_window: AtomicU32,
     pub unacked: Mutex<BTreeMap<u64, Unacked>>,
     pub send_wait: Notify,
     pub inbound_tx: mpsc::Sender<Inbound>,
-    pub recv_next: AtomicU64,
     pub recv_buf: Mutex<BTreeMap<u64, Vec<u8>>>,
     /// Bytes currently in `recv_buf`.
     pub recv_buffered: AtomicU64,
@@ -80,8 +165,6 @@ pub struct StreamState {
     pub bulk: AtomicBool,
     pub buffered_in: AtomicU64,
     pub initial_window: u32,
-    /// BDP advertise cap. Floor = `initial_window`; ceil = floor * chan.
-    pub recv_cap: AtomicU32,
     /// `drain_recv` bytes/s EWMA (α = 1/8). 0 until a sample spanning ≥ one RTT.
     pub deliver_rate_ewma: AtomicU64,
     /// P3b: `(acked_offset + window, t)` edges we advertised, newest last.
@@ -92,6 +175,11 @@ pub struct StreamState {
     pub edge_hits: AtomicU64,
     /// P3b receiver window controller.
     pub(crate) win_ctl: Mutex<WinCtl>,
+    /// P2.1 hole: the missing offset in-order delivery is waiting for and
+    /// since when. Only taken inside `drain_recv` under the `recv_buf` lock.
+    pub(crate) hole: Mutex<Option<(u64, Instant)>>,
+    /// `mono_us` of the last hole sample. 0 = never.
+    pub hole_sampled_at_us: AtomicU64,
     /// Bytes since the last rate sample. Coalesced so FramedRead gaps are not a rate.
     pending_deliver: AtomicU64,
     last_deliver: Mutex<Option<Instant>>,
@@ -111,18 +199,14 @@ pub struct StreamState {
     pub counted_close: AtomicBool,
     /// 0 = not closing. First FIN (local or peer) stamps `mono_ms`.
     pub close_started_ms: AtomicU64,
-    /// Per-stream limiter evidence, read at stream end for the hop span (P6).
-    pub window_blocks: AtomicU64,
-    pub budget_blocks: AtomicU64,
-    pub window_limited_with_room: AtomicU64,
-    /// Max `recv_cap` ever advertised (receiver side).
-    pub recv_cap_max: AtomicU32,
-    /// Bulk/interactive pieces re-sent on another path for this stream.
-    pub hedges: AtomicU64,
-    /// Duplicate payload bytes received on this stream.
-    pub dup_rx_bytes: AtomicU64,
-    /// Distinct dests this stream sent DATA on (bounded set).
-    pub paths_used: Mutex<Vec<u32>>,
+}
+
+impl std::ops::Deref for StreamState {
+    type Target = StreamCounters;
+
+    fn deref(&self) -> &StreamCounters {
+        &self.counters
+    }
 }
 
 /// Per-stream limiter summary for `nya.hop` spans (P6).
@@ -142,16 +226,45 @@ pub struct StreamStats {
     pub sent: u64,
     /// Bytes delivered in order to the application (`recv_next`).
     pub received: u64,
+    /// Receiver evidence (P1.4).
+    pub recv_hole_max: u64,
+    pub app_backlog_max: u64,
+    pub zero_win_hole: u64,
+    pub zero_win_app: u64,
+    /// Receiver hole EWMA, µs (P2.1). 0 = no hole ever closed.
+    pub hole_us: u64,
+    /// Bulk pieces diverted or parked because the sticky lacked room (P4).
+    pub budget_diverts: u64,
+}
+
+/// Where the copy task waited, per transfer direction (P1.2), µs.
+/// `far` = waited for the side that produces the bytes of the dominant
+/// direction; `near` = waited for the side that consumes them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LimiterWaits {
+    pub far_us: u64,
+    pub near_us: u64,
+    pub copy_us: u64,
+    /// This side is the overlay *sender* for the dominant direction.
+    pub overlay_sender: bool,
+    /// Name of the local far/near side: `"origin"` on the server, `"app"`
+    /// on the client.
+    pub local: &'static str,
 }
 
 impl StreamStats {
-    /// Which side of the loop waited most: `window` (peer's advertised
-    /// window with path room available), `budget` (own path budget),
-    /// `path` (window with no room anywhere), or `none`.
+    /// Which side of the loop waited most (counter-only form, kept for
+    /// callers without wait times): `window` (peer's advertised window
+    /// with path room available), `budget` (own path budget), `path`
+    /// (window with no room anywhere), or `none`.
     pub fn limiter(&self) -> &'static str {
         if self.window_blocks == 0 && self.budget_blocks == 0 {
             return "none";
         }
+        self.sender_limiter()
+    }
+
+    fn sender_limiter(&self) -> &'static str {
         if self.budget_blocks >= self.window_blocks {
             return "budget";
         }
@@ -161,20 +274,41 @@ impl StreamStats {
             "path"
         }
     }
+
+    /// P1.3: limiter by *time*. An overlay sender that waited for its
+    /// local producer was paced by it (`origin` / `app`); one that waited
+    /// for the tunnel is refined by the counters. An overlay receiver that
+    /// waited for the tunnel says `overlay` (read the peer's span); one
+    /// that waited for its local consumer names it. A hop that waited less
+    /// than a tenth of its life anywhere is `none`.
+    pub fn limiter_by_time(&self, w: LimiterWaits) -> &'static str {
+        if w.far_us.saturating_add(w.near_us) < w.copy_us / 10 {
+            return "none";
+        }
+        if w.overlay_sender {
+            if w.far_us >= w.near_us {
+                w.local
+            } else {
+                self.sender_limiter()
+            }
+        } else if w.far_us >= w.near_us {
+            "overlay"
+        } else {
+            w.local
+        }
+    }
 }
 
 impl StreamState {
     pub fn new(id: u32, inbound_tx: mpsc::Sender<Inbound>, initial_window: u32) -> Arc<Self> {
         Arc::new(Self {
             id,
+            counters: StreamCounters::new(initial_window),
             sticky: AtomicU32::new(0),
-            send_next: AtomicU64::new(0),
             send_acked: AtomicU64::new(0),
-            send_window: AtomicU32::new(initial_window),
             unacked: Mutex::new(BTreeMap::new()),
             send_wait: Notify::new(),
             inbound_tx,
-            recv_next: AtomicU64::new(0),
             recv_buf: Mutex::new(BTreeMap::new()),
             recv_buffered: AtomicU64::new(0),
             last_recv_path: AtomicU32::new(0),
@@ -192,11 +326,12 @@ impl StreamState {
             bulk: AtomicBool::new(false),
             buffered_in: AtomicU64::new(0),
             initial_window,
-            recv_cap: AtomicU32::new(initial_window),
             deliver_rate_ewma: AtomicU64::new(0),
             edge_ring: Mutex::new(VecDeque::new()),
             edge_hits: AtomicU64::new(0),
             win_ctl: Mutex::new(WinCtl::default()),
+            hole: Mutex::new(None),
+            hole_sampled_at_us: AtomicU64::new(0),
             pending_deliver: AtomicU64::new(0),
             last_deliver: Mutex::new(None),
             last_stick_change: Mutex::new(Instant::now()),
@@ -208,17 +343,9 @@ impl StreamState {
             opened_ms: AtomicU64::new(mono_ms().max(1)),
             counted_close: AtomicBool::new(false),
             close_started_ms: AtomicU64::new(0),
-            window_blocks: AtomicU64::new(0),
-            budget_blocks: AtomicU64::new(0),
-            window_limited_with_room: AtomicU64::new(0),
-            recv_cap_max: AtomicU32::new(initial_window),
-            hedges: AtomicU64::new(0),
-            dup_rx_bytes: AtomicU64::new(0),
-            paths_used: Mutex::new(Vec::new()),
         })
     }
 
-    /// Remember a dest this stream sent DATA on (first 16 distinct).
     /// SACK ranges for the next ACK: coalesced runs of `recv_buf`, the run
     /// holding the newest arrival first, then the highest runs. Bounded.
     pub fn sack_ranges(&self) -> Vec<(u64, u64)> {
@@ -249,29 +376,6 @@ impl StreamState {
             }
         }
         out
-    }
-
-    pub fn note_path_used(&self, path_id: u32) {
-        let mut g = self.paths_used.lock().unwrap();
-        if !g.contains(&path_id) && g.len() < 16 {
-            g.push(path_id);
-        }
-    }
-
-    pub fn stats(&self) -> StreamStats {
-        StreamStats {
-            recv_cap: self.recv_cap.load(Ordering::Relaxed),
-            send_window: self.send_window.load(Ordering::Relaxed),
-            window_blocks: self.window_blocks.load(Ordering::Relaxed),
-            budget_blocks: self.budget_blocks.load(Ordering::Relaxed),
-            window_limited_with_room: self.window_limited_with_room.load(Ordering::Relaxed),
-            recv_cap_max: self.recv_cap_max.load(Ordering::Relaxed),
-            hedges: self.hedges.load(Ordering::Relaxed),
-            dup_rx_bytes: self.dup_rx_bytes.load(Ordering::Relaxed),
-            paths_used: self.paths_used.lock().unwrap().len() as u32,
-            sent: self.send_next.load(Ordering::Relaxed),
-            received: self.recv_next.load(Ordering::Relaxed),
-        }
     }
 
     pub fn is_steerable(&self) -> bool {
@@ -312,6 +416,35 @@ impl StreamState {
         cap.saturating_sub(self.buffered_in.load(Ordering::Relaxed))
             .saturating_sub(self.recv_buffered.load(Ordering::Relaxed))
             .min(u32::MAX as u64) as u32
+    }
+
+    /// P1.4: bytes of the contiguous run starting at `recv_next` still in
+    /// `recv_buf` (non-zero only when `drain_recv` re-inserted the head
+    /// because the inbound channel was full). Caller holds the lock.
+    pub(crate) fn in_order_held_locked(&self, buf: &BTreeMap<u64, Vec<u8>>) -> u64 {
+        let mut next = self.recv_next.load(Ordering::Relaxed);
+        let mut held = 0u64;
+        for (off, chunk) in buf.range(next..) {
+            if *off != next {
+                break;
+            }
+            held += chunk.len() as u64;
+            next += chunk.len() as u64;
+        }
+        held
+    }
+
+    /// P2.1: fold one closed hole's wait into the EWMA (α = 1/8; first
+    /// sample seeds) and stamp the sample clock.
+    pub(crate) fn sample_hole(&self, d: Duration) {
+        let s = (d.as_micros() as u64).max(1);
+        let _ = self
+            .hole_us
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                Some(if cur == 0 { s } else { (cur * 7 + s) / 8 })
+            });
+        self.hole_sampled_at_us
+            .store(crate::metrics::mono_us().max(1), Ordering::Relaxed);
     }
 
     /// Coalesce until `dt >= min_dt` (one RTT, or maintain_interval). First
@@ -407,11 +540,25 @@ pub(crate) struct WinCtl {
 pub struct TunnelStream {
     pub id: u32,
     inner: DuplexStream,
+    counters: Arc<StreamCounters>,
 }
 
 impl TunnelStream {
-    pub fn from_duplex(id: u32, inner: DuplexStream) -> Self {
-        Self { id, inner }
+    pub fn from_duplex(id: u32, inner: DuplexStream, counters: Arc<StreamCounters>) -> Self {
+        Self {
+            id,
+            inner,
+            counters,
+        }
+    }
+
+    /// Limiter summary of this stream, valid after the session reaped it.
+    pub fn stats(&self) -> StreamStats {
+        self.counters.stats()
+    }
+
+    pub fn counters(&self) -> &Arc<StreamCounters> {
+        &self.counters
     }
 }
 

@@ -120,7 +120,13 @@ impl HistSnap {
 
     /// Length mismatch or empty buckets: no-op.
     pub fn merge_add(&mut self, other: &HistSnap) {
-        if self.buckets.is_empty() || other.buckets.is_empty() {
+        if other.buckets.is_empty() {
+            return;
+        }
+        if self.buckets.is_empty() {
+            // KD12: an accumulator seeded with `Default` adopts the first
+            // real snapshot instead of silently dropping every merge.
+            *self = other.clone();
             return;
         }
         if self.buckets.len() != other.buckets.len() {
@@ -229,6 +235,36 @@ pub struct Counters {
     pub session_all_down_resets: AtomicU64,
     /// Gauge: number of streams currently stalled (store, not add).
     pub streams_stalled: AtomicU64,
+    /// ACKs sent with window 0 while out-of-order bytes dominated (P1.4).
+    pub zero_window_hole: AtomicU64,
+    /// ACKs sent with window 0 while in-order bytes the app had not taken dominated.
+    pub zero_window_app: AtomicU64,
+    /// Stall entries by kind (P1.7).
+    pub stall_enter_send: AtomicU64,
+    pub stall_enter_send_zero_window: AtomicU64,
+    pub stall_enter_recv_hole: AtomicU64,
+    pub stall_enter_both: AtomicU64,
+    /// Pieces re-sent by `why` (P1.7).
+    pub data_resend_silence: AtomicU64,
+    pub data_resend_belt: AtomicU64,
+    pub data_resend_down: AtomicU64,
+    pub data_resend_gone: AtomicU64,
+    pub data_resend_dropped: AtomicU64,
+    pub data_resend_age: AtomicU64,
+    pub data_resend_allquiet: AtomicU64,
+    /// Re-sends skipped by reason (P1.7 / P5).
+    pub data_resend_skipped_no_fresh_alt: AtomicU64,
+    pub data_resend_skipped_allquiet_wait: AtomicU64,
+    pub data_resend_skipped_queue_full: AtomicU64,
+    pub data_resend_skipped_write_stalled: AtomicU64,
+    pub data_resend_skipped_all_tried: AtomicU64,
+    pub data_resend_skipped_no_alt: AtomicU64,
+    /// Bulk pieces diverted or parked because the sticky lacked room (P4).
+    pub send_budget_diverts: AtomicU64,
+    /// Bulk re-sticks off a loop-unfit sticky (P3).
+    pub migrates_loop_unfit: AtomicU64,
+    /// Gauge: Σ over live streams of `recv_cap − floor` (P2.4; store).
+    pub recv_cap_extra_bytes: AtomicU64,
     pub failover_ms: Histogram,
     pub stall_ms: Histogram,
     pub stream_lifetime_ms: Histogram,
@@ -291,6 +327,28 @@ impl Default for Counters {
             frame_send_drop: AtomicU64::new(0),
             session_all_down_resets: AtomicU64::new(0),
             streams_stalled: AtomicU64::new(0),
+            zero_window_hole: AtomicU64::new(0),
+            zero_window_app: AtomicU64::new(0),
+            stall_enter_send: AtomicU64::new(0),
+            stall_enter_send_zero_window: AtomicU64::new(0),
+            stall_enter_recv_hole: AtomicU64::new(0),
+            stall_enter_both: AtomicU64::new(0),
+            data_resend_silence: AtomicU64::new(0),
+            data_resend_belt: AtomicU64::new(0),
+            data_resend_down: AtomicU64::new(0),
+            data_resend_gone: AtomicU64::new(0),
+            data_resend_dropped: AtomicU64::new(0),
+            data_resend_age: AtomicU64::new(0),
+            data_resend_allquiet: AtomicU64::new(0),
+            data_resend_skipped_no_fresh_alt: AtomicU64::new(0),
+            data_resend_skipped_allquiet_wait: AtomicU64::new(0),
+            data_resend_skipped_queue_full: AtomicU64::new(0),
+            data_resend_skipped_write_stalled: AtomicU64::new(0),
+            data_resend_skipped_all_tried: AtomicU64::new(0),
+            data_resend_skipped_no_alt: AtomicU64::new(0),
+            send_budget_diverts: AtomicU64::new(0),
+            migrates_loop_unfit: AtomicU64::new(0),
+            recv_cap_extra_bytes: AtomicU64::new(0),
             failover_ms: Histogram::new(FAILOVER_MS_BOUNDS),
             stall_ms: Histogram::new(STALL_MS_BOUNDS),
             stream_lifetime_ms: Histogram::new(LIFETIME_MS_BOUNDS),
@@ -333,6 +391,12 @@ pub struct PathSnap {
     pub ack_rtt_us: u64,
     /// Bytes ACKed on this path, cumulative.
     pub delivered: u64,
+    /// Windowed min loop RTT, µs (0 = unknown) (P3.4).
+    pub min_rtt_us: u64,
+    /// P3 loop-fit verdict at snapshot time.
+    pub loop_fit: bool,
+    /// fit → unfit transitions (P3.4).
+    pub loop_unfit_total: u64,
 }
 
 /// Named WAN link (`a` / `b`), rolled up from its TCP connections (`a#0`, `a#1`).
@@ -495,6 +559,28 @@ pub struct Snapshot {
     pub streams_live: u64,
     /// HashMap occupancy, including graceful-closed entries not yet reaped.
     pub streams_held: u64,
+    pub zero_window_hole: u64,
+    pub zero_window_app: u64,
+    pub stall_enter_send: u64,
+    pub stall_enter_send_zero_window: u64,
+    pub stall_enter_recv_hole: u64,
+    pub stall_enter_both: u64,
+    pub data_resend_silence: u64,
+    pub data_resend_belt: u64,
+    pub data_resend_down: u64,
+    pub data_resend_gone: u64,
+    pub data_resend_dropped: u64,
+    pub data_resend_age: u64,
+    pub data_resend_allquiet: u64,
+    pub data_resend_skipped_no_fresh_alt: u64,
+    pub data_resend_skipped_allquiet_wait: u64,
+    pub data_resend_skipped_queue_full: u64,
+    pub data_resend_skipped_write_stalled: u64,
+    pub data_resend_skipped_all_tried: u64,
+    pub data_resend_skipped_no_alt: u64,
+    pub send_budget_diverts: u64,
+    pub migrates_loop_unfit: u64,
+    pub recv_cap_extra_bytes: u64,
     pub failover_ms: HistSnap,
     pub stall_ms: HistSnap,
     pub stream_lifetime_ms: HistSnap,
@@ -507,6 +593,28 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
+    /// Every histogram field, in one place (P1.6): the aggregate seeds and
+    /// the catalog descriptors are derived from this list.
+    pub fn hist_fields_mut(&mut self) -> [(&mut HistSnap, &'static [u64]); 6] {
+        [
+            (&mut self.failover_ms, FAILOVER_MS_BOUNDS),
+            (&mut self.stall_ms, STALL_MS_BOUNDS),
+            (&mut self.stream_lifetime_ms, LIFETIME_MS_BOUNDS),
+            (&mut self.ack_flush_us, ACK_FLUSH_US_BOUNDS),
+            (&mut self.ack_loop_ms, STALL_MS_BOUNDS),
+            (&mut self.recv_cap_max_bytes, RECV_CAP_BYTES_BOUNDS),
+        ]
+    }
+
+    /// A snapshot whose every histogram is zero-seeded and mergeable.
+    pub fn zeroed_hists() -> Self {
+        let mut s = Self::default();
+        for (h, bounds) in s.hist_fields_mut() {
+            *h = HistSnap::zeroed(bounds);
+        }
+        s
+    }
+
     /// Add counters and histograms. Does **not** touch `paths`.
     pub fn add_counters(&mut self, other: &Snapshot) {
         self.path_added += other.path_added;
@@ -562,6 +670,28 @@ impl Snapshot {
         self.streams_stalled += other.streams_stalled;
         self.streams_live += other.streams_live;
         self.streams_held += other.streams_held;
+        self.zero_window_hole += other.zero_window_hole;
+        self.zero_window_app += other.zero_window_app;
+        self.stall_enter_send += other.stall_enter_send;
+        self.stall_enter_send_zero_window += other.stall_enter_send_zero_window;
+        self.stall_enter_recv_hole += other.stall_enter_recv_hole;
+        self.stall_enter_both += other.stall_enter_both;
+        self.data_resend_silence += other.data_resend_silence;
+        self.data_resend_belt += other.data_resend_belt;
+        self.data_resend_down += other.data_resend_down;
+        self.data_resend_gone += other.data_resend_gone;
+        self.data_resend_dropped += other.data_resend_dropped;
+        self.data_resend_age += other.data_resend_age;
+        self.data_resend_allquiet += other.data_resend_allquiet;
+        self.data_resend_skipped_no_fresh_alt += other.data_resend_skipped_no_fresh_alt;
+        self.data_resend_skipped_allquiet_wait += other.data_resend_skipped_allquiet_wait;
+        self.data_resend_skipped_queue_full += other.data_resend_skipped_queue_full;
+        self.data_resend_skipped_write_stalled += other.data_resend_skipped_write_stalled;
+        self.data_resend_skipped_all_tried += other.data_resend_skipped_all_tried;
+        self.data_resend_skipped_no_alt += other.data_resend_skipped_no_alt;
+        self.send_budget_diverts += other.send_budget_diverts;
+        self.migrates_loop_unfit += other.migrates_loop_unfit;
+        self.recv_cap_extra_bytes += other.recv_cap_extra_bytes;
         self.failover_ms.merge_add(&other.failover_ms);
         self.stall_ms.merge_add(&other.stall_ms);
         self.stream_lifetime_ms.merge_add(&other.stream_lifetime_ms);
@@ -627,6 +757,38 @@ impl Counters {
             streams_stalled: self.streams_stalled.load(Ordering::Relaxed),
             streams_live: 0,
             streams_held: 0,
+            zero_window_hole: self.zero_window_hole.load(Ordering::Relaxed),
+            zero_window_app: self.zero_window_app.load(Ordering::Relaxed),
+            stall_enter_send: self.stall_enter_send.load(Ordering::Relaxed),
+            stall_enter_send_zero_window: self.stall_enter_send_zero_window.load(Ordering::Relaxed),
+            stall_enter_recv_hole: self.stall_enter_recv_hole.load(Ordering::Relaxed),
+            stall_enter_both: self.stall_enter_both.load(Ordering::Relaxed),
+            data_resend_silence: self.data_resend_silence.load(Ordering::Relaxed),
+            data_resend_belt: self.data_resend_belt.load(Ordering::Relaxed),
+            data_resend_down: self.data_resend_down.load(Ordering::Relaxed),
+            data_resend_gone: self.data_resend_gone.load(Ordering::Relaxed),
+            data_resend_dropped: self.data_resend_dropped.load(Ordering::Relaxed),
+            data_resend_age: self.data_resend_age.load(Ordering::Relaxed),
+            data_resend_allquiet: self.data_resend_allquiet.load(Ordering::Relaxed),
+            data_resend_skipped_no_fresh_alt: self
+                .data_resend_skipped_no_fresh_alt
+                .load(Ordering::Relaxed),
+            data_resend_skipped_allquiet_wait: self
+                .data_resend_skipped_allquiet_wait
+                .load(Ordering::Relaxed),
+            data_resend_skipped_queue_full: self
+                .data_resend_skipped_queue_full
+                .load(Ordering::Relaxed),
+            data_resend_skipped_write_stalled: self
+                .data_resend_skipped_write_stalled
+                .load(Ordering::Relaxed),
+            data_resend_skipped_all_tried: self
+                .data_resend_skipped_all_tried
+                .load(Ordering::Relaxed),
+            data_resend_skipped_no_alt: self.data_resend_skipped_no_alt.load(Ordering::Relaxed),
+            send_budget_diverts: self.send_budget_diverts.load(Ordering::Relaxed),
+            migrates_loop_unfit: self.migrates_loop_unfit.load(Ordering::Relaxed),
+            recv_cap_extra_bytes: self.recv_cap_extra_bytes.load(Ordering::Relaxed),
             failover_ms: self.failover_ms.snap(),
             stall_ms: self.stall_ms.snap(),
             stream_lifetime_ms: self.stream_lifetime_ms.snap(),
@@ -661,6 +823,9 @@ impl Counters {
                     bw_bytes_s: p.bw_bytes_s(),
                     ack_rtt_us: p.ack_rtt_us.load(Ordering::Relaxed),
                     delivered: p.delivered.load(Ordering::Relaxed),
+                    min_rtt_us: p.min_rtt().map(|d| d.as_micros() as u64).unwrap_or(0),
+                    loop_fit: p.loop_fit_last(),
+                    loop_unfit_total: p.loop_unfit_total.load(Ordering::Relaxed),
                 })
                 .collect(),
             links: Vec::new(),
@@ -920,14 +1085,31 @@ mod tests {
     }
 
     #[test]
-    fn default_merge_add_is_noop_not_spec() {
+    fn hist_merge_adopts_when_empty() {
+        // KD12: a `Default` accumulator adopts the first real snapshot
+        // instead of dropping every merge (the v0.1.6 dead-histogram bug).
         let h = Histogram::new(FAILOVER_MS_BOUNDS);
         h.observe(10);
         let real = h.snap();
         let mut d = HistSnap::default();
         d.merge_add(&real);
-        assert!(d.buckets.is_empty());
-        assert_eq!(d.count, 0);
+        assert_eq!(d, real);
+        d.merge_add(&real);
+        assert_eq!(d.count, 2);
+        assert_eq!(d.sum, 20);
+    }
+
+    #[test]
+    fn zeroed_hists_covers_every_field() {
+        let mut z = Snapshot::zeroed_hists();
+        for (h, bounds) in z.hist_fields_mut() {
+            assert_eq!(h.buckets.len(), bounds.len() + 1);
+        }
+        assert_eq!(z.ack_loop_ms.buckets.len(), STALL_MS_BOUNDS.len() + 1);
+        assert_eq!(
+            z.recv_cap_max_bytes.buckets.len(),
+            RECV_CAP_BYTES_BOUNDS.len() + 1
+        );
     }
 
     #[test]

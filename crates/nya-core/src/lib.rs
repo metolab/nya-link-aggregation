@@ -47,10 +47,10 @@ pub use handshake::{
     HandshakeResult,
 };
 pub use hop::{
-    connect_origin, connect_origin_meta, interleave_families, io_err_kind, race_origin_addrs,
-    race_origin_connects, race_origin_lookups, race_origin_lookups_seeded, session_fp_hex,
-    HopClock, HopOutcome, HopProbe, HopRole, HopSample, OriginDial, OriginDialMeta,
-    OriginPeerSlots,
+    connect_origin, connect_origin_meta, copy_bidirectional_timed, interleave_families,
+    io_err_kind, race_origin_addrs, race_origin_connects, race_origin_lookups,
+    race_origin_lookups_seeded, session_fp_hex, CopyOutcome, DirCopy, HopClock, HopOutcome,
+    HopProbe, HopRole, HopSample, HopWaits, OriginDial, OriginDialMeta, OriginPeerSlots,
 };
 pub use metrics::{
     percentile, rollup_links, HistSnap, Histogram, LinkSnap, PathSnap, ProcessCounters,
@@ -59,7 +59,7 @@ pub use metrics::{
 };
 pub use net::{parse_tcp_info, tune_path_socket, PathFd, SocketTuning, TcpInfo};
 pub use session::{IncomingStream, Session, SessionError, SessionTable};
-pub use stream::{StreamStats, TunnelStream};
+pub use stream::{LimiterWaits, StreamCounters, StreamStats, TunnelStream};
 pub use tls::{
     client_tls_config, connect_pinned, export_from_client, export_from_server,
     export_keying_material, install_crypto, load_server_config, parse_pin_hex, spki_sha256,

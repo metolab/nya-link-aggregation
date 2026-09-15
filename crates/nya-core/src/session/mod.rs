@@ -23,11 +23,7 @@ use nya_proto::{
 
 use crate::cfg::SessionConfig;
 use crate::health;
-use crate::metrics::HistSnap;
-use crate::metrics::{
-    flatten_paths, Counters, ProcessCounters, ProcessSnapshot, Snapshot, ACK_FLUSH_US_BOUNDS,
-    FAILOVER_MS_BOUNDS, LIFETIME_MS_BOUNDS, STALL_MS_BOUNDS,
-};
+use crate::metrics::{flatten_paths, Counters, ProcessCounters, ProcessSnapshot, Snapshot};
 use crate::path::{spawn_path_io, PathState, STATE_DOWN};
 use crate::scheduler::{pick_path_pref, pick_retry_path, PickPref};
 use crate::stream::{StreamState, Unacked};
@@ -113,6 +109,8 @@ pub(crate) struct Inner {
     dead_notify: Notify,
     all_down_since: Mutex<Option<Instant>>,
     correlated_since: Mutex<Option<Instant>>,
+    /// P1.8b: open `quiet_set` episode (quiet ≥ alive − 1, all-N included).
+    quiet_episode: Mutex<Option<steer::QuietEpisode>>,
     metrics: Counters,
     process: Arc<ProcessCounters>,
     last_rtt_us: Mutex<HashMap<String, u64>>,
@@ -166,6 +164,7 @@ impl Session {
             dead_notify: Notify::new(),
             all_down_since: Mutex::new(None),
             correlated_since: Mutex::new(None),
+            quiet_episode: Mutex::new(None),
             metrics: Counters::default(),
             process,
             last_rtt_us: Mutex::new(HashMap::new()),
@@ -891,6 +890,7 @@ impl Session {
         } in expired
         {
             if stalled_long && alive.iter().all(|id| tried.contains(id)) {
+                self.note_resend_skipped("all_tried");
                 continue;
             }
             let from_path = self.get_path(from);
@@ -899,13 +899,16 @@ impl Session {
                     .as_ref()
                     .is_some_and(|p| p.is_alive() && p.is_write_stalled())
             {
+                self.note_resend_skipped("write_stalled");
                 continue;
             }
             Self::push_tried(&mut tried, from);
             let Some(alt) = self.pick_retry_tried(&tried) else {
+                self.note_resend_skipped("no_alt");
                 continue;
             };
             if self.get_path(alt).is_some_and(|p| p.is_write_stalled()) {
+                self.note_resend_skipped("write_stalled");
                 continue;
             }
             // Belt re-send leaves a *fresh* path; a silent alternative
@@ -941,6 +944,7 @@ impl Session {
                 st.hedges.fetch_add(1, Ordering::Relaxed);
                 st.note_path_used(alt);
                 self.note_retry(from, alt);
+                self.note_resend_why(why);
                 tracing::debug!(
                     stream = st.id,
                     offset,
@@ -960,6 +964,37 @@ impl Session {
                 u.retry_not_before = Instant::now() + self.retry_after(from);
             }
         }
+    }
+
+    /// P1.7 `nya_data_resend_total{why}`.
+    pub(super) fn note_resend_why(&self, why: &str) {
+        let m = &self.inner.metrics;
+        let c = match why {
+            "silence" => &m.data_resend_silence,
+            "belt" => &m.data_resend_belt,
+            "down" => &m.data_resend_down,
+            "gone" => &m.data_resend_gone,
+            "dropped" => &m.data_resend_dropped,
+            "age" => &m.data_resend_age,
+            "allquiet" => &m.data_resend_allquiet,
+            _ => return,
+        };
+        c.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// P1.7 `nya_data_resend_skipped_total{reason}`.
+    pub(super) fn note_resend_skipped(&self, reason: &str) {
+        let m = &self.inner.metrics;
+        let c = match reason {
+            "no_fresh_alt" => &m.data_resend_skipped_no_fresh_alt,
+            "allquiet_wait" => &m.data_resend_skipped_allquiet_wait,
+            "queue_full" => &m.data_resend_skipped_queue_full,
+            "write_stalled" => &m.data_resend_skipped_write_stalled,
+            "all_tried" => &m.data_resend_skipped_all_tried,
+            "no_alt" => &m.data_resend_skipped_no_alt,
+            _ => return,
+        };
+        c.fetch_add(1, Ordering::Relaxed);
     }
 
     fn rehome_unacked_from(&self, dead: u32) {
@@ -1852,6 +1887,13 @@ impl Session {
             st.stalled.store(false, Ordering::Relaxed);
             st.stall_from_ms.store(0, Ordering::Relaxed);
         }
+        // P1.6: the receiver's max advertised cap, per stream that received.
+        if st.recv_next.load(Ordering::Relaxed) > 0 {
+            self.inner
+                .metrics
+                .recv_cap_max_bytes
+                .observe(u64::from(st.recv_cap_max.load(Ordering::Relaxed)));
+        }
         match reset_reason {
             None => {
                 self.inner
@@ -1967,6 +2009,7 @@ impl Session {
             "path_down" => &self.inner.metrics.migrates_path_down,
             "ensure_sticky" => &self.inner.metrics.migrates_ensure_sticky,
             "send_blocked" => &self.inner.metrics.migrates_send_blocked,
+            "loop_unfit" => &self.inner.metrics.migrates_loop_unfit,
             _ => return,
         };
         c.fetch_add(1, Ordering::Relaxed);
@@ -2149,13 +2192,8 @@ impl SessionTable {
         };
         let sessions: Vec<([u8; 16], Snapshot)> =
             handles.iter().map(|(id, s)| (*id, s.snapshot())).collect();
-        let mut acc = Snapshot {
-            failover_ms: HistSnap::zeroed(FAILOVER_MS_BOUNDS),
-            stall_ms: HistSnap::zeroed(STALL_MS_BOUNDS),
-            stream_lifetime_ms: HistSnap::zeroed(LIFETIME_MS_BOUNDS),
-            ack_flush_us: HistSnap::zeroed(ACK_FLUSH_US_BOUNDS),
-            ..Snapshot::default()
-        };
+        // P1.6: seed *every* histogram (a `Default` field never merged).
+        let mut acc = Snapshot::zeroed_hists();
         for (_, snap) in &sessions {
             acc.add_counters(snap);
         }
@@ -2838,6 +2876,419 @@ mod tests {
         assert_eq!(st.recv_next.load(Ordering::Relaxed), 4000);
         assert_eq!(st.sack_ranges(), vec![(5000, 6000)]);
         drop(tun);
+        client.shutdown();
+    }
+
+    fn data(sid: u32, offset: u64, len: usize) -> StreamData {
+        StreamData {
+            stream_id: sid,
+            offset,
+            data: vec![0xab; len],
+        }
+    }
+
+    /// P2.1 hole measurement (observability in PR 1): a missing head with
+    /// later bytes buffered opens a hole; the head landing closes it and
+    /// the wait becomes the `hole_us` sample. A duplicate of a buffered
+    /// piece changes nothing; a head re-inserted by a full channel neither
+    /// opens nor prolongs a hole.
+    #[tokio::test]
+    async fn hole_sample_open_close() {
+        let client = Session::new_client(SessionConfig::default());
+        let (p, _w, _u) = inject_live(&client, 1, "a#0", 7);
+        let tun = client
+            .open_stream(Target {
+                host: "t".into(),
+                port: 1,
+            })
+            .await
+            .unwrap();
+        let st = client.get_stream(tun.id).unwrap();
+        let sid = tun.id;
+        client.on_data(p.id, data(sid, 16 * 1024, 1000));
+        assert!(
+            st.hole.lock().unwrap().is_some(),
+            "missing head opens a hole"
+        );
+        assert_eq!(st.hole_us.load(Ordering::Relaxed), 0);
+        assert_eq!(st.recv_hole_max.load(Ordering::Relaxed), 1000);
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        // duplicate of the buffered piece: no sample, hole kept.
+        client.on_data(p.id, data(sid, 16 * 1024, 1000));
+        assert!(st.hole.lock().unwrap().is_some());
+        assert_eq!(st.hole_us.load(Ordering::Relaxed), 0);
+        assert_eq!(st.dup_rx_bytes.load(Ordering::Relaxed), 1000);
+        tokio::time::sleep(Duration::from_millis(90)).await;
+        client.on_data(p.id, data(sid, 0, 16 * 1024));
+        assert!(
+            st.hole.lock().unwrap().is_none(),
+            "head landed, hole closed"
+        );
+        let us = st.hole_us.load(Ordering::Relaxed);
+        assert!(
+            (140_000..400_000).contains(&us),
+            "first sample seeds the EWMA with the wait: {us}"
+        );
+        assert_eq!(st.recv_next.load(Ordering::Relaxed), 16 * 1024 + 1000);
+        assert_eq!(tun.stats().hole_us, us, "TunnelStream sees the counters");
+        drop(tun);
+        client.shutdown();
+    }
+
+    /// Two missing pieces: the first landing samples once and re-opens the
+    /// hole at the new head; the second landing samples again and clears.
+    #[tokio::test]
+    async fn hole_sample_second_hole_reopens() {
+        let client = Session::new_client(SessionConfig::default());
+        let (p, _w, _u) = inject_live(&client, 1, "a#0", 7);
+        let tun = client
+            .open_stream(Target {
+                host: "t".into(),
+                port: 1,
+            })
+            .await
+            .unwrap();
+        let st = client.get_stream(tun.id).unwrap();
+        let sid = tun.id;
+        // +16K and +48K present; 0 and +32K missing.
+        client.on_data(p.id, data(sid, 16_000, 16_000));
+        client.on_data(p.id, data(sid, 48_000, 16_000));
+        assert_eq!(st.hole.lock().unwrap().map(|(o, _)| o), Some(0));
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        client.on_data(p.id, data(sid, 0, 16_000));
+        let s1 = st.hole_us.load(Ordering::Relaxed);
+        assert!(s1 >= 25_000, "first sample {s1}");
+        assert_eq!(
+            st.hole.lock().unwrap().map(|(o, _)| o),
+            Some(32_000),
+            "re-opened at the new head"
+        );
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        client.on_data(p.id, data(sid, 32_000, 16_000));
+        assert!(st.hole.lock().unwrap().is_none());
+        let s2 = st.hole_us.load(Ordering::Relaxed);
+        assert!(
+            s2 >= 25_000 && s2 != s1,
+            "second sample folded: {s1} -> {s2}"
+        );
+        assert_eq!(st.recv_next.load(Ordering::Relaxed), 64_000);
+        drop(tun);
+        client.shutdown();
+    }
+
+    /// P1.4: `in_order_held` is the contiguous run at `recv_next` the full
+    /// channel could not take; `hole_bytes` is everything else buffered.
+    /// A head held by a full channel is app backlog, not a hole.
+    #[tokio::test]
+    async fn app_backlog_counts_in_order_run() {
+        let mut cfg = SessionConfig::default();
+        cfg.tuning.chan = 1;
+        let client = Session::new_client(cfg);
+        let (p, _w, _u) = inject_live(&client, 1, "a#0", 7);
+        let mut tun = client
+            .open_stream(Target {
+                host: "t".into(),
+                port: 1,
+            })
+            .await
+            .unwrap();
+        let st = client.get_stream(tun.id).unwrap();
+        let sid = tun.id;
+        for off in [0u64, 1000, 2000] {
+            client.on_data(p.id, data(sid, off, 1000));
+        }
+        // channel of 1 took the first; 1000..3000 sit in order at the head.
+        assert_eq!(st.recv_next.load(Ordering::Relaxed), 1000);
+        assert_eq!(client.recv_evidence(&st), (0, 1000 + 2000));
+        assert!(st.hole.lock().unwrap().is_none(), "held head is not a hole");
+        client.on_data(p.id, data(sid, 5000, 1000));
+        assert_eq!(client.recv_evidence(&st), (1000, 3000));
+        assert_eq!(st.recv_hole_max.load(Ordering::Relaxed), 1000);
+        assert_eq!(st.app_backlog_max.load(Ordering::Relaxed), 3000);
+        assert!(st.hole.lock().unwrap().is_none(), "still not a hole");
+        let mut buf = vec![0u8; 3000];
+        tun.read_exact(&mut buf).await.unwrap();
+        // Now the head (3000) is missing and 5000 is buffered: a real hole.
+        client.on_data(p.id, data(sid, 6000, 1000));
+        assert_eq!(st.hole.lock().unwrap().map(|(o, _)| o), Some(3000));
+        drop(tun);
+        client.shutdown();
+    }
+
+    /// P1.4: a zero window is attributed to the hole when out-of-order
+    /// bytes dominate, to the app when in-order bytes it has not read do.
+    #[tokio::test]
+    async fn zero_window_cause_split() {
+        let mut cfg = SessionConfig::default();
+        cfg.tuning.chan = 1;
+        cfg.tuning.initial_window = 4000;
+        let client = Session::new_client(cfg);
+        let (p, _w, _u) = inject_live(&client, 1, "a#0", 7);
+        let mut tun = client
+            .open_stream(Target {
+                host: "t".into(),
+                port: 1,
+            })
+            .await
+            .unwrap();
+        let st = client.get_stream(tun.id).unwrap();
+        let sid = tun.id;
+        assert_eq!(st.recv_cap.load(Ordering::Relaxed), 4000);
+        // hole: 1000..4000 buffered behind a missing head ⇒ window 0.
+        for off in [1000u64, 2000, 3000] {
+            client.on_data(p.id, data(sid, off, 1000));
+        }
+        assert_eq!(st.advertised_window(), 1000);
+        client.on_data(p.id, data(sid, 4000, 1000));
+        assert_eq!(st.advertised_window(), 0);
+        assert_eq!(st.zero_win_hole.load(Ordering::Relaxed), 1);
+        assert_eq!(st.zero_win_app.load(Ordering::Relaxed), 0);
+        // head lands: channel of 1 takes 1000, 1000..5000 held in order ⇒
+        // window 0 again, this time the app's.
+        client.on_data(p.id, data(sid, 0, 1000));
+        assert_eq!(st.advertised_window(), 0);
+        assert_eq!(st.zero_win_hole.load(Ordering::Relaxed), 1);
+        assert_eq!(st.zero_win_app.load(Ordering::Relaxed), 1);
+        let snap = client.snapshot();
+        assert_eq!((snap.zero_window_hole, snap.zero_window_app), (1, 1));
+        let mut buf = vec![0u8; 5000];
+        tun.read_exact(&mut buf).await.unwrap();
+        drop(tun);
+        client.shutdown();
+    }
+
+    /// P1.1: the counters outlive the `StreamState`. After the stream is
+    /// reaped, `TunnelStream::stats()` still returns its final numbers.
+    #[tokio::test]
+    async fn tunnel_stream_stats_survive_reap() {
+        let client = Session::new_client(SessionConfig::default());
+        let (p, _w, _u) = inject_live(&client, 1, "a#0", 7);
+        let tun = client
+            .open_stream(Target {
+                host: "t".into(),
+                port: 1,
+            })
+            .await
+            .unwrap();
+        let sid = tun.id;
+        client.on_data(p.id, data(sid, 2000, 1000));
+        client.on_data(p.id, data(sid, 0, 2000));
+        client.on_data(p.id, data(sid, 0, 2000));
+        let before = tun.stats();
+        assert_eq!(before.received, 3000);
+        assert_eq!(before.dup_rx_bytes, 2000);
+        client.on_peer_reset(sid, ResetReason::PeerReset);
+        client.debug_maintain();
+        assert!(client.get_stream(sid).is_none(), "reaped");
+        assert!(client.stream_stats(sid).is_none());
+        let after = tun.stats();
+        assert_eq!(after.received, 3000);
+        assert_eq!(after.dup_rx_bytes, 2000);
+        assert!(after.hole_us > 0);
+        client.shutdown();
+    }
+
+    /// P1.1: `TunnelStream` holds counters, not the `StreamState` — so it
+    /// does not keep `inbound_tx` alive. With the channel full and a Close
+    /// dropped by `try_send`, removing the table entry drops the last
+    /// `StreamState` while the `TunnelStream` is still alive and readable.
+    #[tokio::test]
+    async fn tunnel_stream_does_not_hold_inbound_tx() {
+        let mut cfg = SessionConfig::default();
+        cfg.tuning.chan = 1;
+        let client = Session::new_client(cfg);
+        let (p, _w, _u) = inject_live(&client, 1, "a#0", 7);
+        let mut tun = client
+            .open_stream(Target {
+                host: "t".into(),
+                port: 1,
+            })
+            .await
+            .unwrap();
+        let sid = tun.id;
+        let weak = Arc::downgrade(&client.get_stream(sid).unwrap());
+        client.on_data(p.id, data(sid, 0, 1000));
+        client.on_data(p.id, data(sid, 1000, 1000));
+        client.on_peer_close(nya_proto::StreamClose {
+            stream_id: sid,
+            final_offset: Some(2000),
+        });
+        client.remove_held_stream(sid);
+        tokio::task::yield_now().await;
+        assert!(
+            weak.upgrade().is_none(),
+            "TunnelStream must not keep StreamState (and inbound_tx) alive"
+        );
+        let mut buf = vec![0u8; 1000];
+        tun.read_exact(&mut buf).await.unwrap();
+        assert_eq!(tun.stats().received, 1000, "counters still readable");
+        client.shutdown();
+    }
+
+    /// P1.6: a stream that received observes its max advertised cap.
+    #[tokio::test]
+    async fn recv_cap_max_observed_at_stream_end() {
+        let client = Session::new_client(SessionConfig::default());
+        let (p, _w, _u) = inject_live(&client, 1, "a#0", 7);
+        let tun = client
+            .open_stream(Target {
+                host: "t".into(),
+                port: 1,
+            })
+            .await
+            .unwrap();
+        let idle = client
+            .open_stream(Target {
+                host: "t".into(),
+                port: 1,
+            })
+            .await
+            .unwrap();
+        let st = client.get_stream(tun.id).unwrap();
+        client.on_data(p.id, data(tun.id, 0, 1000));
+        st.recv_cap_max.fetch_max(3 << 20, Ordering::Relaxed);
+        client.on_peer_reset(tun.id, ResetReason::PeerReset);
+        client.on_peer_reset(idle.id, ResetReason::PeerReset);
+        let h = client.snapshot().recv_cap_max_bytes;
+        assert_eq!(h.count, 1, "only the stream that received");
+        assert_eq!(h.sum, 3 << 20);
+        drop(tun);
+        drop(idle);
+        client.shutdown();
+    }
+
+    /// P1.7: the stall kind at entry — receive hole alone, send alone,
+    /// send with a closed window.
+    #[tokio::test]
+    async fn stall_enter_kind_recorded() {
+        let mut cfg = SessionConfig::default();
+        cfg.tuning.loss_timeout_floor = Duration::from_millis(40);
+        let client = Session::new_client(cfg);
+        let (p, _w, _u) = inject_live(&client, 1, "a#0", 7);
+        let mut tun = client
+            .open_stream(Target {
+                host: "t".into(),
+                port: 1,
+            })
+            .await
+            .unwrap();
+        let st = client.get_stream(tun.id).unwrap();
+        // recv hole only.
+        client.on_data(p.id, data(tun.id, 5000, 1000));
+        client.debug_maintain();
+        assert!(!st.stalled.load(Ordering::Relaxed), "not yet past thresh");
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        client.debug_maintain();
+        assert!(st.stalled.load(Ordering::Relaxed));
+        let s = client.snapshot();
+        assert_eq!(
+            (
+                s.stall_enter_recv_hole,
+                s.stall_enter_send,
+                s.stall_enter_both
+            ),
+            (1, 0, 0)
+        );
+        client.on_data(p.id, data(tun.id, 0, 5000));
+        client.debug_maintain();
+        assert!(
+            !st.stalled.load(Ordering::Relaxed),
+            "hole filled, stall left"
+        );
+        assert_eq!(client.snapshot().stall_ms.count, 1);
+        // send only: bytes out, never ACKed.
+        tun.write_all(&[1u8; 4000]).await.unwrap();
+        let deadline = Instant::now() + Duration::from_millis(300);
+        while st.unacked.lock().unwrap().is_empty() {
+            assert!(Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        client.debug_maintain();
+        assert!(st.stalled.load(Ordering::Relaxed));
+        assert_eq!(client.snapshot().stall_enter_send, 1);
+        // leave, then re-enter with the peer window closed on us. The path
+        // went degraded for silence meanwhile; a fresh rx makes it
+        // schedulable again.
+        st.unacked.lock().unwrap().clear();
+        client.debug_maintain();
+        assert!(!st.stalled.load(Ordering::Relaxed));
+        p.touch_rx();
+        tun.write_all(&[2u8; 100]).await.unwrap();
+        let deadline = Instant::now() + Duration::from_millis(300);
+        while st.unacked.lock().unwrap().is_empty() {
+            assert!(Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        st.send_window.store(0, Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        client.debug_maintain();
+        assert!(st.stalled.load(Ordering::Relaxed));
+        let s = client.snapshot();
+        assert_eq!(
+            (s.stall_enter_send, s.stall_enter_send_zero_window),
+            (1, 1),
+            "a send stall with window 0 is send_zero_window"
+        );
+        drop(tun);
+        client.shutdown();
+    }
+
+    /// P1.7: every hedge/re-send path is counted by `why`; skipped ticks
+    /// by `reason`. Exercised through the note helpers plus the catalog.
+    #[tokio::test]
+    async fn resend_why_recorded() {
+        let client = Session::new_client(SessionConfig::default());
+        for w in [
+            "silence", "belt", "down", "gone", "dropped", "age", "allquiet",
+        ] {
+            client.note_resend_why(w);
+        }
+        client.note_resend_why("bogus");
+        for r in [
+            "no_fresh_alt",
+            "allquiet_wait",
+            "queue_full",
+            "write_stalled",
+            "all_tried",
+            "no_alt",
+        ] {
+            client.note_resend_skipped(r);
+        }
+        let s = client.snapshot();
+        assert_eq!(
+            [
+                s.data_resend_silence,
+                s.data_resend_belt,
+                s.data_resend_down,
+                s.data_resend_gone,
+                s.data_resend_dropped,
+                s.data_resend_age,
+                s.data_resend_allquiet,
+            ],
+            [1; 7]
+        );
+        assert_eq!(
+            [
+                s.data_resend_skipped_no_fresh_alt,
+                s.data_resend_skipped_allquiet_wait,
+                s.data_resend_skipped_queue_full,
+                s.data_resend_skipped_write_stalled,
+                s.data_resend_skipped_all_tried,
+                s.data_resend_skipped_no_alt,
+            ],
+            [1; 6]
+        );
+        let names =
+            crate::catalog::prometheus_metric_names(&crate::metrics::ProcessSnapshot::default());
+        for n in [
+            "nya_data_resend_total",
+            "nya_data_resend_skipped_total",
+            "nya_stall_enter_total",
+            "nya_zero_window_total",
+        ] {
+            assert!(names.iter().any(|x| x == n), "{n} missing from catalog");
+        }
         client.shutdown();
     }
 

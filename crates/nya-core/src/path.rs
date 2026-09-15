@@ -163,6 +163,11 @@ pub struct PathState {
     /// Previous round's average (0 = none), for the two-round min the
     /// ceiling filter is fed with.
     pub last_round_bw: AtomicU64,
+    /// `mono_us` of the last `record_ack_rtt` (KD7 expiry). 0 = never.
+    pub ack_rtt_at_us: AtomicU64,
+    /// Last loop-fit verdict sampled by `maintain` and fit→unfit count (P3.4).
+    pub loop_fit_last: AtomicBool,
+    pub loop_unfit_total: AtomicU64,
     /// Duplicated socket fd for `TCP_INFO` (P6). `None` off Linux, in unit
     /// tests over duplex pipes, and after path IO exit.
     pub tcp_fd: std::sync::Mutex<Option<crate::net::PathFd>>,
@@ -239,6 +244,9 @@ impl PathState {
                 (crate::tuning::Tuning::STANDARD.chan as u64)
                     .saturating_mul(nya_proto::MAX_STREAM_PAYLOAD as u64),
             ),
+            ack_rtt_at_us: AtomicU64::new(0),
+            loop_fit_last: AtomicBool::new(true),
+            loop_unfit_total: AtomicU64::new(0),
             tcp_fd: std::sync::Mutex::new(None),
         })
     }
@@ -255,9 +263,15 @@ impl PathState {
         }
     }
 
+    pub fn loop_fit_last(&self) -> bool {
+        self.loop_fit_last.load(Ordering::Relaxed)
+    }
+
     /// EWMA(1/8) update of the loaded ACK RTT.
     pub fn record_ack_rtt(&self, sample: Duration) {
         let s = (sample.as_micros() as u64).max(1);
+        self.ack_rtt_at_us
+            .store(crate::metrics::mono_us().max(1), Ordering::Relaxed);
         let _ = self
             .ack_rtt_us
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {

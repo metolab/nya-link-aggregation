@@ -39,6 +39,35 @@ fn correlated_hold(
     quiet + 1 == alive || (quiet >= 3 && quiet_links >= 2)
 }
 
+/// P1.8b: one open `quiet_set` episode — `quiet ≥ alive − 1`, all-N
+/// included (unlike `correlated_hold`). Carries the per-path kernel
+/// retransmit counters at entry so the exit event can print deltas: a
+/// network episode shows non-zero deltas on the quiet paths; a local or
+/// peer-side stall shows zero everywhere.
+pub(super) struct QuietEpisode {
+    since: Instant,
+    quiet: Vec<String>,
+    survivor: Vec<String>,
+    all_n: bool,
+    /// (path name, total_retrans, bytes_retrans) at entry.
+    retrans_at_entry: Vec<(String, u32, u64)>,
+}
+
+/// `quiet ≥ alive − 1` with at least one quiet path and ≥ 2 alive.
+fn quiet_set_holds(alive: usize, quiet: usize) -> bool {
+    alive >= 2 && quiet >= 1 && quiet + 1 >= alive
+}
+
+fn retrans_of(paths: &[&Arc<PathState>]) -> Vec<(String, u32, u64)> {
+    paths
+        .iter()
+        .map(|p| {
+            let t = p.tcp_info().unwrap_or_default();
+            (p.name.clone(), t.total_retrans, t.bytes_retrans)
+        })
+        .collect()
+}
+
 fn unique_link_count(paths: &[&Arc<PathState>]) -> usize {
     let mut links = std::collections::BTreeSet::new();
     for p in paths {
@@ -51,6 +80,78 @@ impl Session {
     #[cfg(test)]
     pub fn debug_maintain(&self) {
         self.maintain();
+    }
+
+    /// P1.8b correlated-silence discriminator. Logs `quiet_set` on entry
+    /// (quiet ≥ alive − 1, all-N included) and `quiet_set_end` on exit with
+    /// the episode length and per-path `TCP_INFO` retrans deltas. Both
+    /// roles log; joining the two hosts' events by `session_fp` + wall
+    /// clock tells network silence (peer sees the same subset, quiet paths
+    /// retransmit) from a local or peer-side stall (peer sees all-N or
+    /// nothing, deltas zero).
+    fn track_quiet_set(&self, alive: &[&Arc<PathState>], quiet: &[&Arc<PathState>]) {
+        let holds = quiet_set_holds(alive.len(), quiet.len());
+        let mut g = self.inner.quiet_episode.lock().unwrap();
+        match (&*g, holds) {
+            (None, true) => {
+                let quiet_names: Vec<String> = quiet.iter().map(|p| p.name.clone()).collect();
+                let survivor: Vec<String> = alive
+                    .iter()
+                    .filter(|p| !quiet.iter().any(|q| q.id == p.id))
+                    .map(|p| p.name.clone())
+                    .collect();
+                let all_n = quiet.len() == alive.len();
+                info!(
+                    session_fp = %self.session_fp().unwrap_or_default(),
+                    wall_ms = crate::path::now_ms(),
+                    alive = alive.len(),
+                    quiet = ?quiet_names,
+                    survivor = ?survivor,
+                    all_n,
+                    quiet_ago_ms = ?quiet
+                        .iter()
+                        .map(|p| p.last_rx_ago().as_millis() as u64)
+                        .collect::<Vec<_>>(),
+                    "quiet_set"
+                );
+                *g = Some(QuietEpisode {
+                    since: Instant::now(),
+                    quiet: quiet_names,
+                    survivor,
+                    all_n,
+                    retrans_at_entry: retrans_of(alive),
+                });
+            }
+            (Some(_), false) => {
+                let ep = g.take().unwrap();
+                let now = retrans_of(alive);
+                let deltas: Vec<String> = ep
+                    .retrans_at_entry
+                    .iter()
+                    .map(
+                        |(name, seg0, bytes0)| match now.iter().find(|(n, _, _)| n == name) {
+                            Some((_, seg1, bytes1)) => format!(
+                                "{name}:+{}seg/+{}B",
+                                seg1.saturating_sub(*seg0),
+                                bytes1.saturating_sub(*bytes0)
+                            ),
+                            None => format!("{name}:gone"),
+                        },
+                    )
+                    .collect();
+                info!(
+                    session_fp = %self.session_fp().unwrap_or_default(),
+                    wall_ms = crate::path::now_ms(),
+                    dur_ms = ep.since.elapsed().as_millis() as u64,
+                    quiet = ?ep.quiet,
+                    survivor = ?ep.survivor,
+                    all_n = ep.all_n,
+                    retrans_delta = ?deltas,
+                    "quiet_set_end"
+                );
+            }
+            _ => {}
+        }
     }
 
     pub(super) fn spawn_maintenance(&self) {
@@ -139,6 +240,7 @@ impl Session {
                 *g = None;
             }
         }
+        self.track_quiet_set(&alive, &quiet);
         let budget_elapsed = self
             .inner
             .correlated_since
@@ -640,6 +742,20 @@ impl Session {
             st.stall_from_ms
                 .store(origin.unwrap_or(now), Ordering::Relaxed);
             st.stalled.store(true, Ordering::Relaxed);
+            // P1.7: what kind of stall this is, at entry.
+            let m = &self.inner.metrics;
+            let kind = match (send_origin.is_some(), recv_origin.is_some()) {
+                (true, true) => &m.stall_enter_both,
+                (true, false) => {
+                    if st.send_window.load(Ordering::Relaxed) == 0 || !st.window_ok(1) {
+                        &m.stall_enter_send_zero_window
+                    } else {
+                        &m.stall_enter_send
+                    }
+                }
+                _ => &m.stall_enter_recv_hole,
+            };
+            kind.fetch_add(1, Ordering::Relaxed);
         } else if !predicate && was {
             let from = st.stall_from_ms.load(Ordering::Relaxed);
             if from != 0 {
@@ -762,5 +878,27 @@ impl Session {
             return self.inner.cfg.ping_interval_min;
         }
         health::probe_interval(&self.inner.cfg, health::probe_rtt(p.rtt(), p.stable_rtt()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// P1.8b: `quiet_set` includes all-N and exact N−1; `correlated_hold`
+    /// never holds on all-N. The two must differ exactly there.
+    #[test]
+    fn quiet_set_vs_correlated_hold() {
+        assert!(quiet_set_holds(4, 4), "all-N is a quiet_set");
+        assert!(quiet_set_holds(4, 3));
+        assert!(!quiet_set_holds(4, 2));
+        assert!(quiet_set_holds(2, 1));
+        assert!(!quiet_set_holds(1, 1), "a lone path cannot form a set");
+        assert!(!quiet_set_holds(3, 0));
+        assert!(
+            !correlated_hold(4, 4, 4, 4, 2),
+            "correlated_hold never all-N"
+        );
+        assert!(correlated_hold(4, 3, 1, 3, 2));
     }
 }

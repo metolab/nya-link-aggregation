@@ -7,8 +7,8 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn, Instrument};
 
 use nya_core::{
-    connect_origin_meta, io_err_kind, HopClock, HopOutcome, HopProbe, HopRole, HopSample,
-    IncomingStream, OriginDialMeta, OriginPeerSlots, Tuning,
+    connect_origin_meta, copy_bidirectional_timed, io_err_kind, HopClock, HopOutcome, HopProbe,
+    HopRole, HopSample, HopWaits, IncomingStream, OriginDialMeta, OriginPeerSlots, Tuning,
 };
 use nya_proto::ResetReason;
 
@@ -102,14 +102,15 @@ pub async fn handle_incoming(mut incoming: mpsc::Receiver<IncomingStream>) {
                     let slots = Arc::new(OriginPeerSlots::default());
                     let mut origin = HopProbe::wrap(tcp, origin_clock.clone())
                         .sample_peer_last_on_read(overlay_clock.clone(), slots.clone());
-                    let stats_src = inc.session_handle();
                     let mut overlay = HopProbe::wrap(inc.io, overlay_clock.clone());
                     let t_copy = Instant::now();
-                    let copy = tokio::io::copy_bidirectional(&mut origin, &mut overlay).await;
-                    let (outcome, copy_err) = match &copy {
-                        Ok(_) => (HopOutcome::Ok, None),
-                        Err(e) => (HopOutcome::CopyErr, Some(io_err_kind(e))),
+                    let copy = copy_bidirectional_timed(&mut origin, &mut overlay).await;
+                    let (outcome, copy_err, waits) = match &copy {
+                        Ok(o) => (HopOutcome::Ok, None, Some(HopWaits::from_outcome(o))),
+                        Err(e) => (HopOutcome::CopyErr, Some(io_err_kind(e)), None),
                     };
+                    // P1.5: the origin socket is still ours here.
+                    let origin_tcp = nya_core::net::tcp_info_of(origin.inner());
                     process.record_hop(HopSample {
                         role: HopRole::Server,
                         stream_id,
@@ -129,8 +130,10 @@ pub async fn handle_incoming(mut incoming: mpsc::Receiver<IncomingStream>) {
                         rx_bytes: Some(origin_clock.rx_bytes()),
                         tx_bytes: Some(origin_clock.tx_bytes()),
                         copy_err,
-                        // `overlay` still owns the tunnel half: stream is live.
-                        stream: stats_src.stream_stats(stream_id),
+                        // P1.1: counters live on the handle, past any reap.
+                        stream: Some(overlay.inner().stats()),
+                        waits,
+                        origin_tcp,
                         ..Default::default()
                     });
                 }

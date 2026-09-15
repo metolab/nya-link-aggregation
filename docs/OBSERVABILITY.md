@@ -874,6 +874,12 @@ TYPE 行必写。counter 名加 `_total`；gauge 不加；histogram 用 raw→cu
 | `ack_after_fin` | `nya_ack_after_fin_total` | frames（`recv_fin` / `close_off` 外的重复 DATA 回的 ACK） |
 | `data_dropped_resend` | `nya_data_dropped_resend_total` | frames（writer 队列丢掉后按 `dropped` 立刻换路） |
 | `recv_cap_probes` / `recv_cap_probe_kept` / `recv_cap_probe_reverted` | `nya_recv_cap_probes_total` 等 | events（接收窗口探测） |
+| `zero_window_hole` / `zero_window_app` | `nya_zero_window_total{cause="hole"\|"app"}` | ACKs（广告窗口为 0：乱序空洞占主 / 应用未读占主，P1.4） |
+| `stall_enter_send` / `_send_zero_window` / `_recv_hole` / `_both` | `nya_stall_enter_total{kind}` | stall 进入次数，按类型（P1.7）：发送未 ACK / 发送且对端窗口 0 / 接收空洞 / 两者同时 |
+| `data_resend_{silence,belt,down,gone,dropped,age,allquiet}` | `nya_data_resend_total{why}` | frames（每次 DATA 换路重发的原因，P1.7） |
+| `data_resend_skipped_{no_fresh_alt,allquiet_wait,queue_full,write_stalled,all_tried,no_alt}` | `nya_data_resend_skipped_total{reason}` | ticks（到期未重发的原因，P1.7） |
+| `send_budget_diverts` | `nya_send_budget_diverts_total` | pieces（sticky 预算满、分流到兄弟路径，P4；PR 3 前为 0） |
+| `migrates_loop_unfit` | `nya_migrates_loop_unfit_total` | events（sticky 因 loop-unfit 换路，P3；PR 5 前为 0） |
 | process handshake/inbound/outbound/reconnect/sessions_created/dead | `nya_handshake_create_ok_total` 等，与字段名 `nya_{field}_total` | |
 
 **Gauges**
@@ -886,12 +892,16 @@ TYPE 行必写。counter 名加 `_total`；gauge 不加；histogram 用 raw→cu
 | `PathSnap.rtt_us` 等 | `nya_path_*` | `path`, `link` | 见实现 |
 | `PathSnap.budget_bytes` / `bw_bytes_s` / `ack_rtt_us` | `nya_path_budget_bytes` / `nya_path_bw_bytes_s` / `nya_path_ack_rtt_us` | `path`, `link` | overlay 每路径发送预算、ACK-clock 送达率、bulk ACK 往返 |
 | `PathSnap.delivered` | `nya_path_delivered_bytes_total`（counter） | `path`, `link` | 这条路被 ACK 的 DATA 字节 |
-| `PathSnap.tcp` | `nya_path_tcp_known` / `_cwnd_bytes` / `_unacked_bytes` / `_notsent_bytes` / `_rtt_us` / `_min_rtt_us` / `_delivery_rate_bytes_s` / `nya_path_tcp_retrans_total`（counter） | `path`, `link` | Linux `TCP_INFO`；非 Linux 或无 fd 时 `known=0`、其余为 0 |
+| `PathSnap.tcp` | `nya_path_tcp_known` / `_cwnd_bytes` / `_unacked_bytes` / `_notsent_bytes` / `_rtt_us` / `_min_rtt_us` / `_delivery_rate_bytes_s` / `_busy_us` / `_rwnd_limited_us` / `_sndbuf_limited_us` / `nya_path_tcp_retrans_total` / `nya_path_tcp_bytes_retrans_total`（counter） | `path`, `link` | Linux `TCP_INFO`；非 Linux 或无 fd 时 `known=0`、其余为 0；`busy`/`rwnd_limited`/`sndbuf_limited`/`bytes_retrans` 旧内核为 0 |
+| `PathSnap.min_rtt_us` / `loop_fit` / `loop_unfit_total` | `nya_path_min_rtt_us` / `nya_path_loop_fit` / `nya_path_loop_unfit_total`（counter） | `path`, `link` | overlay 10 s 窗 min RTT；P3 loop-fit 判定（PR 5 前恒为 1 / 0） |
+| `recv_cap_extra_bytes` | `nya_recv_cap_extra_bytes` | 无 | Σ(recv_cap − floor)（P2；PR 4 前为 0） |
 | `LinkSnap.*` | `nya_link_*` | `link` | 连接数 / RTT / sticky / 队列 / rx |
 
 路径 `path`/`link` 与线路 `link`：单会话是 `a#0` / `a`；多会话服务端两边都带 4-hex，例如 `a1b2:a#0`、`a1b2:a`，禁止跨租户合并。`streams=` 只进 snapshot 日志，不进 Prometheus。
 
-限制器归因（「大文件为什么慢」）：`nya_path_tcp_cwnd_bytes ≈ nya_path_tcp_unacked_bytes` 且 `notsent` 小 ⇒ 内核 TCP 是限制器；`nya_path_budget_bytes ≈ inflight` 且 `nya_send_budget_blocks_total` 在涨 ⇒ overlay 预算；`nya_send_window_limited_with_room_total / nya_window_blocks_total ≥ 0.2` ⇒ 对端接收窗口；三者都不是则看 `nya_ack_loop_ms`（ACK 往返直方图，含对端排队）。
+限制器归因（「大文件为什么慢」）：`nya_path_tcp_cwnd_bytes ≈ nya_path_tcp_unacked_bytes` 且 `notsent` 小 ⇒ 内核 TCP 是限制器；`nya_path_budget_bytes ≈ inflight` 且 `nya_send_budget_blocks_total` 在涨 ⇒ overlay 预算；`nya_send_window_limited_with_room_total / nya_window_blocks_total ≥ 0.2` ⇒ 对端接收窗口；三者都不是则看 `nya_ack_loop_ms`（ACK 往返直方图，含对端排队）。单条流的归因看 hop span 的 `nya.limiter`（按**等待时间**，见下）：`origin` / `app` 表示瓶颈不在 overlay；`window` 配 `nya.hole_us ≈ 0` 表示窗口卡在顺序队列或 pump 而非乱序空洞（P2 的空结果）。
+
+`quiet_set` / `quiet_set_end`（`target=nya_core::session::steer`，info）：`quiet ≥ alive − 1`（**含 all-N**，与 `correlated_hold` 不同）时两端都记一条，带 `session_fp`、`wall_ms`、quiet 集合、survivor、all_n；结束时带 `dur_ms` 与每路径 `TCP_INFO` retrans 增量。按 `session_fp` + `wall_ms` 对齐两端：对端同一时刻记同一子集且 quiet 路径 retrans 增量非零 ⇒ 网络静默；对端记 all-N 或没有、增量为 0、survivor 随机 ⇒ 本地 / 对端进程停顿。
 
 **Histograms**（`nya_failover_ms` / `nya_stall_ms` / `nya_stream_lifetime_ms` / `nya_ack_loop_ms` / `nya_recv_cap_max_bytes`）
 
@@ -1233,7 +1243,7 @@ stderr 上 SDK `ExportError` 默认 `off`。`nya_obs` 对 BatchLog/BatchSpan 失
 | `nya.path.up` | path 注册瞬间（毫秒） | internal |
 | `nya.inbound.socks5` / `nya.inbound.forward` | 到 `open_stream` 返回；属性 `nya.open_us`。**不**包 `copy_bidirectional` | server |
 | `nya.outbound.dial` | `TcpStream::connect`；属性 `nya.dial_us`。**不**包 copy | client |
-| `nya.hop` | copy 结束（或 open/dial fail）的 **marker**；属性 `nya.copy_us` / `nya.first_rx_us` / `nya.origin_first_rx_us` / `nya.max_gap_us` 等；copy 结束还带这条流的限制器归因 `nya.limiter`（`window` / `budget` / `path` / `none`，按等待次数取 argmax）、`nya.window_blocks` / `nya.budget_blocks` / `nya.window_limited_with_room` / `nya.recv_cap_max` / `nya.hedges` / `nya.dup_rx_bytes` / `nya.paths_used`。**不**包 copy | client / server |
+| `nya.hop` | copy 结束（或 open/dial fail）的 **marker**；属性 `nya.copy_us` / `nya.first_rx_us` / `nya.origin_first_rx_us` / `nya.max_gap_us` 等；copy 结束还带这条流的限制器归因 `nya.limiter`（`origin` / `app` / `overlay` / `window` / `budget` / `path` / `none`，按 copier 记的**等待时间**：主方向上远端读等待占 copy ≥ 10 % 且 ≥ 近端写等待 ⇒ `origin`（server）/ `app`（client）；这端是 overlay 发送方且写等待占主 ⇒ 用计数归因 `window` / `budget` / `path`；这端是 overlay 接收方且读等待占主 ⇒ `overlay`；两边都 < 10 % ⇒ `none`；没有等待数据时退回按次数 argmax）、等待 `nya.origin_read_wait_us` / `nya.overlay_write_wait_us` / `nya.app_read_wait_us` / `nya.app_write_wait_us`（P1.2）、`nya.window_blocks` / `nya.budget_blocks` / `nya.window_limited_with_room` / `nya.recv_cap_max` / `nya.hedges` / `nya.dup_rx_bytes` / `nya.paths_used`、接收侧证据 `nya.recv_hole_max` / `nya.app_backlog_max` / `nya.zero_win_hole` / `nya.zero_win_app` / `nya.hole_us` / `nya.budget_diverts`（P1.4），server 还带 origin socket 的 `nya.origin_tcp_rtt_us` / `_min_rtt_us` / `_retrans` / `_bytes_retrans` / `_delivery_rate` / `_busy_us` / `_rwnd_limited_us` / `_sndbuf_limited_us` / `_rcv_space` / `_rcv_ooopack`（P1.5，Linux）。**不**包 copy（用自带的 `copy_bidirectional_timed`） | client / server |
 
 失败：`otel.status_code=ERROR`。无协议 `traceparent`。
 

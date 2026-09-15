@@ -91,13 +91,10 @@ pub fn metric_descriptors() -> Vec<MetricDesc> {
             });
         }
     }
-    let mut ps = ProcessSnapshot::default();
-    ps.session.failover_ms = HistSnap::zeroed(FAILOVER_MS_BOUNDS);
-    ps.session.stall_ms = HistSnap::zeroed(STALL_MS_BOUNDS);
-    ps.session.stream_lifetime_ms = HistSnap::zeroed(LIFETIME_MS_BOUNDS);
-    ps.session.ack_flush_us = HistSnap::zeroed(ACK_FLUSH_US_BOUNDS);
-    ps.session.ack_loop_ms = HistSnap::zeroed(STALL_MS_BOUNDS);
-    ps.session.recv_cap_max_bytes = HistSnap::zeroed(RECV_CAP_BYTES_BOUNDS);
+    let mut ps = ProcessSnapshot {
+        session: crate::metrics::Snapshot::zeroed_hists(),
+        ..Default::default()
+    };
     ps.session.links.push(crate::metrics::LinkSnap {
         name: "_".into(),
         ..Default::default()
@@ -358,6 +355,69 @@ pub fn visit_metrics(ps: &ProcessSnapshot, sink: &mut impl MetricSink) {
         "all-down session resets",
         s.session_all_down_resets,
     );
+    // P1.7 / P1.4 / P4 / P3 labelled and plain counters.
+    for (kind, v) in [
+        ("send", s.stall_enter_send),
+        ("send_zero_window", s.stall_enter_send_zero_window),
+        ("recv_hole", s.stall_enter_recv_hole),
+        ("both", s.stall_enter_both),
+    ] {
+        sink.counter_labeled(
+            "nya_stall_enter_total",
+            "stall entries by kind",
+            &[("kind", kind)],
+            v,
+        );
+    }
+    for (why, v) in [
+        ("silence", s.data_resend_silence),
+        ("belt", s.data_resend_belt),
+        ("down", s.data_resend_down),
+        ("gone", s.data_resend_gone),
+        ("dropped", s.data_resend_dropped),
+        ("age", s.data_resend_age),
+        ("allquiet", s.data_resend_allquiet),
+    ] {
+        sink.counter_labeled(
+            "nya_data_resend_total",
+            "pieces re-sent by reason",
+            &[("why", why)],
+            v,
+        );
+    }
+    for (reason, v) in [
+        ("no_fresh_alt", s.data_resend_skipped_no_fresh_alt),
+        ("allquiet_wait", s.data_resend_skipped_allquiet_wait),
+        ("queue_full", s.data_resend_skipped_queue_full),
+        ("write_stalled", s.data_resend_skipped_write_stalled),
+        ("all_tried", s.data_resend_skipped_all_tried),
+        ("no_alt", s.data_resend_skipped_no_alt),
+    ] {
+        sink.counter_labeled(
+            "nya_data_resend_skipped_total",
+            "due re-sends not performed, by reason",
+            &[("reason", reason)],
+            v,
+        );
+    }
+    for (cause, v) in [("hole", s.zero_window_hole), ("app", s.zero_window_app)] {
+        sink.counter_labeled(
+            "nya_zero_window_total",
+            "ACKs advertising window 0, by what holds the bytes",
+            &[("cause", cause)],
+            v,
+        );
+    }
+    sink.counter(
+        "nya_send_budget_diverts_total",
+        "bulk pieces diverted or parked because the sticky lacked budget room (P4)",
+        s.send_budget_diverts,
+    );
+    sink.counter(
+        "nya_migrates_loop_unfit_total",
+        "bulk re-sticks off a loop-unfit sticky (P3)",
+        s.migrates_loop_unfit,
+    );
     sink.counter(
         "nya_handshake_create_ok_total",
         "create-session ok",
@@ -444,6 +504,12 @@ pub fn visit_metrics(ps: &ProcessSnapshot, sink: &mut impl MetricSink) {
         s.streams_held,
     );
     sink.gauge("nya_sessions_live", "live sessions", &[], p.sessions_live);
+    sink.gauge(
+        "nya_recv_cap_extra_bytes",
+        "sum over live streams of recv_cap above the floor (P2.4)",
+        &[],
+        s.recv_cap_extra_bytes,
+    );
     sink.gauge(
         "nya_pick_rtt_us",
         "fast RTT of last open_stream pick",
@@ -692,6 +758,48 @@ pub fn visit_metrics(ps: &ProcessSnapshot, sink: &mut impl MetricSink) {
             &lab,
             t.total_retrans as u64,
         );
+        sink.counter_labeled(
+            "nya_path_tcp_bytes_retrans_total",
+            "kernel bytes_retrans of this socket",
+            &lab,
+            t.bytes_retrans,
+        );
+        sink.gauge(
+            "nya_path_tcp_busy_us",
+            "kernel busy_time (monotone)",
+            &lab,
+            t.busy_time_us,
+        );
+        sink.gauge(
+            "nya_path_tcp_rwnd_limited_us",
+            "kernel rwnd_limited (monotone)",
+            &lab,
+            t.rwnd_limited_us,
+        );
+        sink.gauge(
+            "nya_path_tcp_sndbuf_limited_us",
+            "kernel sndbuf_limited (monotone)",
+            &lab,
+            t.sndbuf_limited_us,
+        );
+        sink.gauge(
+            "nya_path_min_rtt_us",
+            "overlay windowed min loop RTT (P3 fit reference)",
+            &lab,
+            pth.min_rtt_us,
+        );
+        sink.gauge(
+            "nya_path_loop_fit",
+            "1 if bulk placement considers this path loop-fit (P3)",
+            &lab,
+            u64::from(pth.loop_fit),
+        );
+        sink.counter_labeled(
+            "nya_path_loop_unfit_total",
+            "fit to unfit transitions (P3)",
+            &lab,
+            pth.loop_unfit_total,
+        );
     }
 }
 
@@ -736,13 +844,10 @@ pub fn prometheus_metric_names(_ps: &ProcessSnapshot) -> BTreeSet<String> {
     }
     // Empty snapshot still emits unlabeled + hists; inject dummy path/link so
     // labeled names are part of the static set.
-    let mut ps = ProcessSnapshot::default();
-    ps.session.failover_ms = HistSnap::zeroed(FAILOVER_MS_BOUNDS);
-    ps.session.stall_ms = HistSnap::zeroed(STALL_MS_BOUNDS);
-    ps.session.stream_lifetime_ms = HistSnap::zeroed(LIFETIME_MS_BOUNDS);
-    ps.session.ack_flush_us = HistSnap::zeroed(ACK_FLUSH_US_BOUNDS);
-    ps.session.ack_loop_ms = HistSnap::zeroed(STALL_MS_BOUNDS);
-    ps.session.recv_cap_max_bytes = HistSnap::zeroed(RECV_CAP_BYTES_BOUNDS);
+    let mut ps = ProcessSnapshot {
+        session: crate::metrics::Snapshot::zeroed_hists(),
+        ..Default::default()
+    };
     ps.session.links.push(crate::metrics::LinkSnap {
         name: "_".into(),
         ..Default::default()
