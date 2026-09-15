@@ -991,7 +991,7 @@ dependencies = [
 
 [[package]]
 name = "nya-client"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "clap",
@@ -1007,7 +1007,7 @@ dependencies = [
 
 [[package]]
 name = "nya-core"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "bytes",
  "dns-lookup",
@@ -1036,7 +1036,7 @@ dependencies = [
 
 [[package]]
 name = "nya-e2e"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1054,7 +1054,7 @@ dependencies = [
 
 [[package]]
 name = "nya-obs"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "libc",
@@ -1072,7 +1072,7 @@ dependencies = [
 
 [[package]]
 name = "nya-proto"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "bytes",
  "thiserror 2.0.20",
@@ -1081,7 +1081,7 @@ dependencies = [
 
 [[package]]
 name = "nya-server"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "clap",
