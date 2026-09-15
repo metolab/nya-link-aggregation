@@ -25,6 +25,9 @@ pub struct Unacked {
     pub data: Vec<u8>,
     pub path_id: u32,
     pub last_sent: Instant,
+    /// When this piece first left the stream (never moved by a re-send):
+    /// the send-stall clock cannot start before this.
+    pub first_sent: Instant,
     pub tried: Vec<u32>,
     /// Rate-limit failed retry attempts without moving last_sent (ACK RTT).
     pub retry_not_before: Instant,
@@ -142,6 +145,10 @@ pub struct StreamState {
     pub recv_buffered: AtomicU64,
     /// Last STREAM_DATA arrival path. 0 = none.
     pub last_recv_path: AtomicU32,
+    /// The peer has shown it holds this stream (first DATA from it). Set
+    /// once; lets `deliver_data` stop the StreamOpen retry without a table
+    /// lookup per frame.
+    pub peer_seen: AtomicBool,
     /// Offset of the newest out-of-order piece buffered; its SACK range
     /// goes first (TCP's "most recent block" rule).
     pub last_hole_arrival: AtomicU64,
@@ -312,6 +319,7 @@ impl StreamState {
             recv_buf: Mutex::new(BTreeMap::new()),
             recv_buffered: AtomicU64::new(0),
             last_recv_path: AtomicU32::new(0),
+            peer_seen: AtomicBool::new(false),
             last_hole_arrival: AtomicU64::new(0),
             sacked: AtomicU64::new(0),
             last_sack_ms: AtomicU64::new(0),

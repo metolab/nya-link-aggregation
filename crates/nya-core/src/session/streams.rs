@@ -313,6 +313,7 @@ impl Session {
                         data: piece.clone(),
                         path_id,
                         last_sent: Instant::now(),
+                        first_sent: Instant::now(),
                         tried: vec![path_id],
                         retry_not_before: Instant::now(),
                         dropped: false,
@@ -586,6 +587,12 @@ impl Session {
             return;
         }
         st.last_recv_path.store(path_id, Ordering::Relaxed);
+        // DATA from the peer proves it holds the stream: a download whose
+        // client never writes (so no ACK ever comes back) must not re-send
+        // StreamOpen every retry_after for the whole transfer.
+        if !st.peer_seen.swap(true, Ordering::Relaxed) {
+            self.forget_open(data.stream_id);
+        }
         let mut buf = st.recv_buf.lock().unwrap();
         if data.offset < st.recv_next.load(Ordering::Relaxed) {
             drop(buf);

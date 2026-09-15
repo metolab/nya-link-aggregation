@@ -272,7 +272,7 @@ pub(crate) fn bulk_overflow_pick(
         .filter(|p| {
             p.id != sticky
                 && p.is_schedulable()
-                && is_loss_fresh(cfg, p)
+                && is_quiet_fresh(cfg, p)
                 && p.room_bytes() >= nya_proto::MAX_STREAM_PAYLOAD as u64
         })
         .collect();
@@ -309,9 +309,18 @@ pub(crate) fn path_loss_rtt(p: &PathState) -> Duration {
     p.rtt().min(p.class_rtt())
 }
 
-/// Receive-fresh vs the DATA/Open retry clock.
+/// Receive-fresh vs the DATA/Open retry clock (interactive).
 pub fn is_loss_fresh(cfg: &SessionConfig, p: &PathState) -> bool {
     p.last_rx_ago() < health::loss_timeout(cfg, path_loss_rtt(p))
+}
+
+/// P7: one definition of quiet for **bulk** destinations — the complement
+/// of `maintain`'s own quiet set and of the P6 silence bound
+/// (`degrade_timeout` = max(loss, probe + rtt, ping_interval_max)). An
+/// idle healthy sticky between Pongs stays fresh; a path the session would
+/// mark degraded loses bulk affinity the same instant.
+pub fn is_quiet_fresh(cfg: &SessionConfig, p: &PathState) -> bool {
+    p.last_rx_ago() < health::degrade_timeout(cfg, p.rtt_known(), p.stable_rtt())
 }
 
 fn loss_fresh_or_all<'a>(
@@ -433,13 +442,13 @@ pub fn format_candidates(
 }
 
 /// D2 bulk HOL dest: alive, not congested, schedulable *or* write-stalled
-/// (flushing), loss-fresh. Write-stalled dests are invisible to
+/// (flushing), quiet-fresh (P7). Write-stalled dests are invisible to
 /// [`fastest_class_set`] while any dest is still schedulable.
 pub(crate) fn hol_bulk_dest_ok(cfg: &SessionConfig, p: &PathState) -> bool {
     p.is_alive()
         && !p.is_congested()
         && (p.is_schedulable() || p.is_write_stalled())
-        && is_loss_fresh(cfg, p)
+        && is_quiet_fresh(cfg, p)
 }
 
 /// HOL bulk fallback after same-link sibling: D2 dests with `class_rtt <=
@@ -670,7 +679,7 @@ pub fn pick_retry_path(
     })
 }
 
-fn pick_min_rx(cands: &[&Arc<PathState>], cfg: &SessionConfig) -> Option<u32> {
+pub(crate) fn pick_min_rx(cands: &[&Arc<PathState>], cfg: &SessionConfig) -> Option<u32> {
     if cands.is_empty() {
         return None;
     }

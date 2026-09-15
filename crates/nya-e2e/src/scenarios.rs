@@ -2083,19 +2083,27 @@ fn bulk_report(
             )
         })
         .collect();
+    let d = |a: u64, b: u64| a.saturating_sub(b);
     r.notes.push(format!(
-        "bulk=copies=[{}] gate={:?} dup_rx={:.1}% hedge_d={} rtx_d={} window_blocks_d={} budget_blocks_d={} mig_d={} stall_p50={:?} links=[{}] paths=[{}]",
+        "bulk=copies=[{}] gate={:?} dup_rx={:.1}% hedge_d={} rtx_d={} window_blocks_d={} budget_blocks_d={} mig_d={} stall_p50={:?} stall_enter=send:{}/zero_win:{}/hole:{}/both:{} zero_win=hole:{}/app:{} links=[{}] paths=[{}]",
         lines.join(", "),
         gate,
         dup * 100.0,
-        r.snap.data_hedge.saturating_sub(snap0.data_hedge),
-        r.snap.data_retransmit.saturating_sub(snap0.data_retransmit),
-        r.snap.window_blocks.saturating_sub(snap0.window_blocks),
-        r.snap
-            .send_budget_blocks
-            .saturating_sub(snap0.send_budget_blocks),
-        r.snap.migrates.saturating_sub(snap0.migrates),
+        d(r.snap.data_hedge, snap0.data_hedge),
+        d(r.snap.data_retransmit, snap0.data_retransmit),
+        d(r.snap.window_blocks, snap0.window_blocks),
+        d(r.snap.send_budget_blocks, snap0.send_budget_blocks),
+        d(r.snap.migrates, snap0.migrates),
         nya_core::percentile(&r.snap.stall_ms, nya_core::STALL_MS_BOUNDS, 50.0),
+        d(r.snap.stall_enter_send, snap0.stall_enter_send),
+        d(
+            r.snap.stall_enter_send_zero_window,
+            snap0.stall_enter_send_zero_window
+        ),
+        d(r.snap.stall_enter_recv_hole, snap0.stall_enter_recv_hole),
+        d(r.snap.stall_enter_both, snap0.stall_enter_both),
+        d(r.snap.zero_window_hole, snap0.zero_window_hole),
+        d(r.snap.zero_window_app, snap0.zero_window_app),
         links.join(" "),
         paths.join(" "),
     ));
@@ -2319,6 +2327,282 @@ pub async fn hedge_only_on_silence() -> Result<ScenarioReport> {
     Ok(r)
 }
 
+/// Four 20 Mbps links, one TCP each. While a 16 MiB copy runs, three
+/// links go silent (blackhole, not down: `correlated_hold` keeps them)
+/// for 4 s and one survives. P5/P6/P7 door: the copy completes, pieces
+/// stranded on the silent paths are re-homed to the survivor within about
+/// one silence period (stall p99 bounded), every re-send names `silence`
+/// or `dropped`/`queue_full` — never a buried copy on a quiet sibling.
+pub async fn correlated_hold_one_survivor() -> Result<ScenarioReport> {
+    const RATE: u64 = 20 * MBIT;
+    let h = start(bottleneck_spec(
+        &[
+            ("a", 10, RATE, 64 * 1024),
+            ("b", 10, RATE, 64 * 1024),
+            ("c", 10, RATE, 64 * 1024),
+            ("d", 10, RATE, 64 * 1024),
+        ],
+        1,
+    ))
+    .await?;
+    let snap0 = h.session.snapshot();
+    bulk_tracer(&h);
+    const N: usize = 16 * 1024 * 1024;
+    const HOLD: Duration = Duration::from_secs(4);
+    let copy = {
+        let mut tcp = h.connect_socks_echo().await?;
+        tokio::spawn(async move { crate::workload::bulk_stream(&mut tcp, N).await })
+    };
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let before = h.session.snapshot();
+    // Survivor: the link with the least in flight; the other three go quiet.
+    let survivor = before
+        .links
+        .iter()
+        .min_by_key(|l| l.inflight)
+        .map(|l| l.name.clone())
+        .unwrap_or_else(|| "d".into());
+    let inflight_at_hold: u64 = before.links.iter().map(|l| l.inflight).sum();
+    let quiet: Vec<String> = before
+        .links
+        .iter()
+        .filter(|l| l.name != survivor)
+        .map(|l| l.name.clone())
+        .collect();
+    for q in &quiet {
+        h.link(q).set_blackhole(true);
+    }
+    tokio::time::sleep(HOLD).await;
+    for q in &quiet {
+        h.link(q).set_blackhole(false);
+    }
+    let o = match tokio::time::timeout(Duration::from_secs(60), copy).await {
+        Ok(Ok(Ok((d, intact)))) => BulkOutcome {
+            nbytes: N,
+            elapsed: Some(d),
+            intact,
+            timed_out: false,
+            io_error: false,
+        },
+        Ok(_) => BulkOutcome {
+            nbytes: N,
+            elapsed: None,
+            intact: false,
+            timed_out: false,
+            io_error: true,
+        },
+        Err(_) => BulkOutcome {
+            nbytes: N,
+            elapsed: None,
+            intact: false,
+            timed_out: true,
+            io_error: false,
+        },
+    };
+    // 16 MiB: ≥ 1.5 s on four links before the hold, 4 s on one link
+    // (≈ 2.4 MB/s ⇒ ~9.6 MB), the rest on four again; the gate is that
+    // schedule at 80 % plus a recovery second.
+    let gate = Duration::from_millis(1500)
+        + HOLD
+        + rate_gate(N / 3, 4 * RATE, 0.8)
+        + Duration::from_secs(2);
+    let mut r = bulk_report("correlated_hold_one_survivor", &h, &[o], gate, &snap0);
+    let s = &r.snap;
+    let d = |a: u64, b: u64| a.saturating_sub(b);
+    let silence = d(s.data_resend_silence, snap0.data_resend_silence);
+    let dropped = d(s.data_resend_dropped, snap0.data_resend_dropped);
+    let belt = d(s.data_resend_belt, snap0.data_resend_belt);
+    let down = d(s.data_resend_down, snap0.data_resend_down);
+    let allquiet = d(s.data_resend_allquiet, snap0.data_resend_allquiet);
+    let skipped_fresh = d(
+        s.data_resend_skipped_no_fresh_alt,
+        snap0.data_resend_skipped_no_fresh_alt,
+    );
+    let skipped_full = d(
+        s.data_resend_skipped_queue_full,
+        snap0.data_resend_skipped_queue_full,
+    );
+    let stall_p99 = nya_core::percentile(&s.stall_ms, nya_core::STALL_MS_BOUNDS, 99.0);
+    let pieces_in_flight = inflight_at_hold.div_ceil(nya_proto::MAX_STREAM_PAYLOAD as u64);
+    r.notes.push(format!(
+        "bulk=hold survivor={survivor} quiet={quiet:?} inflight_at_hold={inflight_at_hold} \
+         resend=silence:{silence} dropped:{dropped} belt:{belt} down:{down} allquiet:{allquiet} \
+         skipped=no_fresh_alt:{skipped_fresh} queue_full:{skipped_full} \
+         stall_p99={stall_p99:?} correlated_d={} path_down_d={}",
+        d(s.correlated_silence, snap0.correlated_silence),
+        d(s.path_down, snap0.path_down),
+    ));
+    // Door: a stranded piece leaves its silent source within one bulk
+    // silence period (≤ down timeout) plus the survivor's queue drain; the
+    // stall it caused must end within ~2 s, not the rungs' 0.3–5 s.
+    if let Some(p99) = stall_p99 {
+        if p99 > 2000 {
+            r.notes.push(format!(
+                "FAIL stall p99 {p99} ms > 2 s during a one-survivor hold"
+            ));
+            r.sla.min_success = 2.0;
+        }
+    }
+    if allquiet > 0 {
+        r.notes
+            .push("FAIL all-quiet tier fired (not shipped)".into());
+        r.sla.min_success = 2.0;
+    }
+    if silence > pieces_in_flight.saturating_mul(2).max(8) {
+        r.notes.push(format!(
+            "FAIL silence re-sends {silence} > 2 × pieces in flight at hold start ({pieces_in_flight})"
+        ));
+        r.sla.min_success = 2.0;
+    }
+    Ok(r)
+}
+
+/// Origin paced at 250 KB/s behind eight idle 10 ms paths. The stream is
+/// slow because the *origin* is slow: no hedge, no duplicate, one sticky
+/// path, and the server hop names `origin` as the limiter with ≥ 90 % of
+/// the copy spent waiting on the origin read.
+pub async fn slow_origin_no_hedge() -> Result<ScenarioReport> {
+    let h = start(HarnessSpec {
+        link_cfgs: (0..8)
+            .map(|i| {
+                (
+                    format!("l{i}"),
+                    ImpairConfig {
+                        rtt: Duration::from_millis(10),
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect(),
+        connections: 1,
+        psk: "e2e-psk".into(),
+    })
+    .await?;
+    let snap0 = h.session.snapshot();
+    // Drain any earlier hop tail (handshake-time streams).
+    let _ = h.server_table.process().take_interval_tail();
+    const N: usize = 2 * 1024 * 1024;
+    const CHUNK: usize = 16 * 1024;
+    const EVERY: Duration = Duration::from_millis(64); // 16 KiB / 64 ms = 256 KB/s
+    let (origin_l, origin) = crate::harness::bind_local().await?;
+    let origin_task = tokio::spawn(async move {
+        let Ok((mut tcp, _)) = origin_l.accept().await else {
+            return;
+        };
+        let _ = tcp.set_nodelay(true);
+        let chunk = vec![0x5au8; CHUNK];
+        let mut off = 0usize;
+        let mut tick = tokio::time::interval(EVERY);
+        while off < N {
+            tick.tick().await;
+            let n = (N - off).min(CHUNK);
+            if tcp.write_all(&chunk[..n]).await.is_err() {
+                return;
+            }
+            off += n;
+        }
+        let _ = tcp.shutdown().await;
+    });
+    let t0 = Instant::now();
+    let mut tcp = h.connect_socks(origin).await?;
+    let mut got = 0usize;
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut first_rx: Option<Duration> = None;
+    let outcome = tokio::time::timeout(Duration::from_secs(40), async {
+        loop {
+            let n = tcp.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            first_rx.get_or_insert_with(|| t0.elapsed());
+            got += n;
+        }
+        Ok::<(), std::io::Error>(())
+    })
+    .await;
+    let elapsed = t0.elapsed();
+    drop(tcp);
+    let _ = origin_task.await;
+    let o = BulkOutcome {
+        nbytes: N,
+        elapsed: Some(elapsed),
+        intact: matches!(outcome, Ok(Ok(()))) && got == N,
+        timed_out: outcome.is_err(),
+        io_error: matches!(outcome, Ok(Err(_))),
+    };
+    // Ideal 2 MiB at 256 KB/s ≈ 8.2 s; gate at +25 %.
+    let ideal = Duration::from_secs_f64(N as f64 / (CHUNK as f64 / EVERY.as_secs_f64()));
+    let mut r = bulk_report(
+        "slow_origin_no_hedge",
+        &h,
+        &[o],
+        ideal.mul_f64(1.25),
+        &snap0,
+    );
+    // Server-side hop attribution: the copy just finished is the tail.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let hop = h.server_table.process().take_interval_tail();
+    let (limiter, waits, paths_used, hedges, dup) = match &hop {
+        Some(hs) => (
+            hs.limiter().unwrap_or("?").to_string(),
+            hs.waits,
+            hs.stream.as_ref().map(|s| s.paths_used).unwrap_or(0),
+            hs.stream.as_ref().map(|s| s.hedges).unwrap_or(0),
+            hs.stream.as_ref().map(|s| s.dup_rx_bytes).unwrap_or(0),
+        ),
+        None => ("none-recorded".into(), None, 0, 0, 0),
+    };
+    let copy_us = hop.as_ref().and_then(|hs| hs.copy_us).unwrap_or(0);
+    let origin_wait_frac = waits
+        .map(|w| w.local_read_us as f64 / copy_us.max(1) as f64)
+        .unwrap_or(0.0);
+    let hedge_d = r.snap.data_hedge.saturating_sub(snap0.data_hedge)
+        + r.snap.data_retransmit.saturating_sub(snap0.data_retransmit);
+    r.notes.push(format!(
+        "bulk=slow_origin first_rx={:?} limiter={limiter} origin_read_wait={:.0}% paths_used={paths_used} \
+         stream_hedges={hedges} dup_rx={dup} hedge_d={hedge_d} dup_rx_d={}",
+        first_rx.unwrap_or_default(),
+        origin_wait_frac * 100.0,
+        r.snap.data_dup_rx_bytes.saturating_sub(snap0.data_dup_rx_bytes),
+    ));
+    let mut fail = Vec::new();
+    if hedge_d > 0 {
+        fail.push(format!("FAIL hedged {hedge_d} times on a slow origin"));
+    }
+    if r.snap
+        .data_dup_rx_bytes
+        .saturating_sub(snap0.data_dup_rx_bytes)
+        > 0
+    {
+        fail.push("FAIL duplicate bytes on a slow origin".into());
+    }
+    if paths_used > 1 {
+        fail.push(format!("FAIL paths_used {paths_used} > 1"));
+    }
+    if limiter != "origin" {
+        fail.push(format!("FAIL limiter {limiter} != origin"));
+    }
+    if origin_wait_frac < 0.9 {
+        fail.push(format!(
+            "FAIL origin read wait {:.0}% < 90% of copy",
+            origin_wait_frac * 100.0
+        ));
+    }
+    // A paced source is idle between bursts, not stalled: the stall clock
+    // must start at the oldest outstanding piece, not at the last progress.
+    let stalls = r.snap.stall_ms.count.saturating_sub(snap0.stall_ms.count);
+    if stalls > 0 {
+        fail.push(format!(
+            "FAIL {stalls} stalls on an idle-between-bursts origin"
+        ));
+    }
+    if !fail.is_empty() {
+        r.notes.extend(fail);
+        r.sla.min_success = 2.0;
+    }
+    Ok(r)
+}
+
 pub struct Scenario {
     pub name: &'static str,
     pub long: bool,
@@ -2473,6 +2757,11 @@ pub fn catalog() -> Vec<Scenario> {
         sc_excl!("bulk_fanout_three_paths", bulk_fanout_three_paths()),
         sc_excl!("ping_under_bulk_bounded", ping_under_bulk_bounded()),
         sc_excl!("hedge_only_on_silence", hedge_only_on_silence()),
+        sc_excl!(
+            "correlated_hold_one_survivor",
+            correlated_hold_one_survivor()
+        ),
+        sc_excl!("slow_origin_no_hedge", slow_origin_no_hedge()),
     ]
 }
 

@@ -675,59 +675,56 @@ impl Session {
         };
         let thresh_ms = thresh.as_millis() as u64;
 
+        // A stall is "something outstanding has not progressed for thresh".
+        // The clock starts at the later of the last progress and the moment
+        // the oldest outstanding item appeared; measuring from progress alone
+        // turns every burst of a paced source (slow origin, video) into a
+        // stall and drives speculative rehome/belt off idle gaps.
         let send_origin = {
             let unacked = st.unacked.lock().unwrap();
             if unacked.is_empty() {
                 None
             } else {
-                let last_ack = st.last_ack_ms.load(Ordering::Relaxed);
-                let origin = if last_ack != 0 {
-                    last_ack
-                } else {
-                    let oldest = unacked
-                        .values()
-                        .map(|u| u.last_sent)
-                        .min()
-                        .unwrap_or_else(std::time::Instant::now);
-                    now.saturating_sub(oldest.elapsed().as_millis() as u64)
-                        .max(1)
-                };
-                if now.saturating_sub(origin) >= thresh_ms {
-                    Some(origin)
-                } else {
-                    None
-                }
+                let oldest = unacked
+                    .values()
+                    .map(|u| u.first_sent)
+                    .min()
+                    .unwrap_or_else(Instant::now);
+                let oldest_ms = now
+                    .saturating_sub(oldest.elapsed().as_millis() as u64)
+                    .max(1);
+                let origin = st.last_ack_ms.load(Ordering::Relaxed).max(oldest_ms);
+                (now.saturating_sub(origin) >= thresh_ms).then_some(origin)
             }
         };
 
         let recv_origin = {
-            let buf = st.recv_buf.lock().unwrap();
-            let recv_next = st.recv_next.load(Ordering::Relaxed);
-            let hole = !buf.is_empty() && !buf.contains_key(&recv_next);
+            let hole = {
+                let buf = st.recv_buf.lock().unwrap();
+                let recv_next = st.recv_next.load(Ordering::Relaxed);
+                !buf.is_empty() && !buf.contains_key(&recv_next)
+            };
             if !hole {
-                drop(buf);
                 st.recv_hole_since_ms.store(0, Ordering::Relaxed);
                 None
             } else {
-                drop(buf);
-                let last_recv = st.last_recv_ms.load(Ordering::Relaxed);
-                let origin = if last_recv != 0 {
-                    last_recv
-                } else {
-                    let since = st.recv_hole_since_ms.load(Ordering::Relaxed);
-                    if since == 0 {
-                        let v = now.max(1);
-                        st.recv_hole_since_ms.store(v, Ordering::Relaxed);
-                        v
-                    } else {
-                        since
+                // Prefer the P1.4 hole tracker's open time; fall back to the
+                // first scan that saw the hole.
+                let opened_ms = match *st.hole.lock().unwrap() {
+                    Some((_, t)) => now.saturating_sub(t.elapsed().as_millis() as u64).max(1),
+                    None => {
+                        let since = st.recv_hole_since_ms.load(Ordering::Relaxed);
+                        if since == 0 {
+                            let v = now.max(1);
+                            st.recv_hole_since_ms.store(v, Ordering::Relaxed);
+                            v
+                        } else {
+                            since
+                        }
                     }
                 };
-                if now.saturating_sub(origin) >= thresh_ms {
-                    Some(origin)
-                } else {
-                    None
-                }
+                let origin = st.last_recv_ms.load(Ordering::Relaxed).max(opened_ms);
+                (now.saturating_sub(origin) >= thresh_ms).then_some(origin)
             }
         };
 
@@ -756,6 +753,25 @@ impl Session {
                 _ => &m.stall_enter_recv_hole,
             };
             kind.fetch_add(1, Ordering::Relaxed);
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                let (buf_len, buf_head) = {
+                    let buf = st.recv_buf.lock().unwrap();
+                    (buf.len(), buf.keys().next().copied())
+                };
+                debug!(
+                    stream = st.id,
+                    send = send_origin.is_some(),
+                    recv = recv_origin.is_some(),
+                    age_ms = now.saturating_sub(origin.unwrap_or(now)),
+                    thresh_ms,
+                    recv_next = st.recv_next.load(Ordering::Relaxed),
+                    buf_len,
+                    buf_head,
+                    unacked = st.unacked.lock().unwrap().len(),
+                    send_window = st.send_window.load(Ordering::Relaxed),
+                    "stall_enter"
+                );
+            }
         } else if !predicate && was {
             let from = st.stall_from_ms.load(Ordering::Relaxed);
             if from != 0 {
@@ -854,11 +870,17 @@ impl Session {
         );
     }
 
-    fn degrade_for(&self, p: &PathState) -> Duration {
+    pub(super) fn degrade_for(&self, p: &PathState) -> Duration {
         health::degrade_timeout(&self.inner.cfg, p.rtt_known(), p.stable_rtt())
     }
 
-    fn down_for(&self, p: &PathState) -> Duration {
+    /// P7: bulk-destination freshness; the complement of `maintain`'s
+    /// quiet set. See [`crate::scheduler::is_quiet_fresh`].
+    pub(super) fn is_quiet_fresh(&self, p: &PathState) -> bool {
+        crate::scheduler::is_quiet_fresh(&self.inner.cfg, p)
+    }
+
+    pub(super) fn down_for(&self, p: &PathState) -> Duration {
         // `assumed_rtt` is max(fast, stable) when known, so a spike can
         // already lift down. Do not also feed probe_interval_for
         // (min(fast, stable) / unknown ping_min) into this probe term —

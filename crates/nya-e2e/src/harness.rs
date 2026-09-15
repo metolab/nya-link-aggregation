@@ -11,7 +11,7 @@ use tracing::info;
 
 use nya_client::{serve_forward_listener, serve_socks5_listener, spawn_links, ClientConfig, Link};
 use nya_core::{install_crypto, parse_pin_hex, ObsOpts, Session, SessionConfig};
-use nya_server::{cert_paths, gen_cert, run_on_until, ServerConfig};
+use nya_server::{cert_paths, gen_cert, new_session_table, run_on_table, ServerConfig};
 
 use crate::impair::{spawn_link, ImpairConfig, LinkHandle};
 
@@ -22,6 +22,9 @@ pub struct Harness {
     pub socks: SocketAddr,
     pub links: Vec<LinkHandle>,
     pub session: Session,
+    /// The in-process server's table: `process()` carries the server-side
+    /// hop samples (`take_interval_tail`) a scenario can assert on.
+    pub server_table: std::sync::Arc<nya_core::SessionTable>,
     server_stop: watch::Sender<bool>,
     echo_abort: tokio::task::AbortHandle,
     _tmpdir: PathBuf,
@@ -121,11 +124,15 @@ pub async fn start(spec: HarnessSpec) -> Result<Harness> {
         },
     };
     let (server_stop, stop_rx) = watch::channel(false);
-    tokio::spawn(async move {
-        if let Err(e) = run_on_until(srv_l, srv_cfg, stop_rx).await {
-            tracing::error!(error = %e, "nya-server exited");
-        }
-    });
+    let server_table = new_session_table(&srv_cfg);
+    {
+        let table = server_table.clone();
+        tokio::spawn(async move {
+            if let Err(e) = run_on_table(srv_l, srv_cfg, stop_rx, table).await {
+                tracing::error!(error = %e, "nya-server exited");
+            }
+        });
+    }
 
     let max_rtt = spec
         .link_cfgs
@@ -189,6 +196,7 @@ pub async fn start(spec: HarnessSpec) -> Result<Harness> {
         socks,
         links,
         session,
+        server_table,
         server_stop,
         echo_abort,
         _tmpdir: tmpdir,

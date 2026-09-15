@@ -569,7 +569,9 @@ impl Session {
             return None;
         }
         if p.is_write_stalled() || p.is_schedulable() {
-            if crate::scheduler::is_loss_fresh(&self.inner.cfg, &p) {
+            // P7: quiet-fresh, not loss-fresh — an idle sticky between
+            // Pongs keeps the stream; a degraded one loses it.
+            if self.is_quiet_fresh(&p) {
                 Some(sticky)
             } else {
                 None
@@ -693,9 +695,12 @@ impl Session {
     }
 
     /// P4 bulk hedge clock: twice this path's loaded ACK RTT, never below
-    /// the pool loss clock and never above the path's down timeout.
+    /// the pool loss clock **or the path's own degrade clock** (P6: a
+    /// piece is hedged for silence only once the session itself would
+    /// call the path quiet — `degrade_for ≥ probe + rtt`, so an idle gap
+    /// between Pongs is never silence), and never above its down timeout.
     fn retry_after_bulk(&self, p: &PathState) -> Duration {
-        let lo = self.retry_after(p.id);
+        let lo = self.retry_after(p.id).max(self.degrade_for(p));
         let hi = health::down_timeout(&self.inner.cfg, p.stable_rtt(), self.probe_interval_for(p))
             .max(lo);
         match p.ack_rtt() {
@@ -879,6 +884,11 @@ impl Session {
                 })
                 .collect()
         };
+        let chan = self.inner.cfg.tuning.chan as u64;
+        let paths = self.path_list();
+        // P5/P7: a bulk destination is usable when the session itself would
+        // not call it quiet, and it can take a frame now.
+        let fresh = |p: &PathState| self.is_quiet_fresh(p) && p.is_schedulable();
         for Due {
             offset,
             from,
@@ -902,68 +912,171 @@ impl Session {
                 self.note_resend_skipped("write_stalled");
                 continue;
             }
-            Self::push_tried(&mut tried, from);
-            let Some(alt) = self.pick_retry_tried(&tried) else {
-                self.note_resend_skipped("no_alt");
-                continue;
-            };
-            if self.get_path(alt).is_some_and(|p| p.is_write_stalled()) {
-                self.note_resend_skipped("write_stalled");
-                continue;
-            }
-            // Belt re-send leaves a *fresh* path; a silent alternative
-            // (blackholed, not yet down) would only bury the copy. Wait for
-            // a fresh one or for the down-rehome.
-            if why == "belt"
-                && self
-                    .get_path(alt)
-                    .is_some_and(|p| !crate::scheduler::is_loss_fresh(&self.inner.cfg, &p))
-            {
-                continue;
-            }
-            if self.send_data_frame(st.id, offset, data, alt) {
-                let base = match (&from_path, bulk) {
-                    (Some(p), true) => self.retry_after_bulk(p),
-                    _ => Duration::ZERO,
+            if !bulk {
+                // Interactive `age` rehome: today's behaviour, unchanged
+                // (the product's TTFB door; P5 scope is bulk only).
+                Self::push_tried(&mut tried, from);
+                let Some(alt) = self.pick_retry_tried(&tried) else {
+                    self.note_resend_skipped("no_alt");
+                    continue;
                 };
+                if self.get_path(alt).is_some_and(|p| p.is_write_stalled()) {
+                    self.note_resend_skipped("write_stalled");
+                    continue;
+                }
+                if self.send_data_frame(st.id, offset, data, alt) {
+                    if let Some(u) = st.unacked.lock().unwrap().get_mut(&offset) {
+                        self.rehome_unacked(u, alt);
+                    }
+                    self.note_resent(st, offset, from, alt, why, false, dropped, &tried);
+                } else if let Some(u) = st.unacked.lock().unwrap().get_mut(&offset) {
+                    Self::push_tried(&mut u.tried, alt);
+                    u.dropped = true;
+                    u.retry_not_before = Instant::now() + self.retry_after(from);
+                }
+                continue;
+            }
+
+            // ---- bulk (P5, reduced: fresh-alt over candidates; no all-quiet tier) ----
+            let alt = if dropped {
+                // Nothing is on any wire for this piece: every alive,
+                // schedulable path is a candidate, tried ones included. A
+                // fresh source with queue room takes it back first.
+                let cands: Vec<&Arc<PathState>> = paths
+                    .iter()
+                    .filter(|p| p.is_alive() && p.is_schedulable())
+                    .collect();
+                let on_source = from_path
+                    .as_ref()
+                    .is_some_and(|p| fresh(p) && p.queued_bulk() < chan)
+                    && self.send_data_frame(st.id, offset, data.clone(), from);
+                if on_source {
+                    if let Some(u) = st.unacked.lock().unwrap().get_mut(&offset) {
+                        // `rehome_unacked` would xfer inflight from→from (no-op)
+                        // and push `from` again (no-op at the tail).
+                        self.rehome_unacked(u, from);
+                        u.retry_not_before = u.last_sent + self.retry_after_bulk_id(from);
+                    }
+                    self.note_resent(st, offset, from, from, why, true, dropped, &tried);
+                    continue;
+                }
+                let others: Vec<&Arc<PathState>> =
+                    cands.iter().copied().filter(|p| p.id != from).collect();
+                let Some(alt) = crate::scheduler::pick_min_rx(&others, &self.inner.cfg) else {
+                    self.note_resend_skipped("no_alt");
+                    continue;
+                };
+                if !self.get_path(alt).is_some_and(|p| fresh(&p)) {
+                    // `pick_min_rx` prefers the freshest rx, so a stale pick
+                    // means no candidate is fresh: wait (KD9 deferred).
+                    self.note_resend_skipped("no_fresh_alt");
+                    self.defer_piece(st, offset, self.retry_after(from));
+                    continue;
+                }
+                alt
+            } else {
+                Self::push_tried(&mut tried, from);
+                let Some(alt) = self.pick_retry_tried(&tried) else {
+                    self.note_resend_skipped("no_alt");
+                    continue;
+                };
+                if !self.get_path(alt).is_some_and(|p| fresh(&p)) {
+                    // A fresh candidate may exist while the picker's score
+                    // chose a stale one (re-check next tick, `alt` stays
+                    // untried); with none fresh the piece waits too — the
+                    // all-quiet tier (KD9) is deferred until PR 1's data
+                    // shows the survivor's ACK actually returning. For
+                    // `silence` TCP still delivers the original; nothing is
+                    // buried on a quiet sibling.
+                    self.note_resend_skipped("no_fresh_alt");
+                    self.defer_piece(st, offset, self.retry_after(from));
+                    continue;
+                }
+                alt
+            };
+            if self.send_data_frame(st.id, offset, data, alt) {
                 if let Some(u) = st.unacked.lock().unwrap().get_mut(&offset) {
                     self.rehome_unacked(u, alt);
-                    // Bulk backoff: base × 2^(rung−1), rung = paths tried.
-                    let shift = u.tried.len().clamp(1, 5) as u32 - 1;
-                    let backoff = base
-                        .saturating_mul(1u32 << shift)
-                        .min(self.inner.cfg.tuning.down_timeout_ceil);
-                    u.retry_not_before = u.last_sent + backoff;
+                    u.retry_not_before = if why == "belt" {
+                        // Belt rung: base × 2^(rung−1), rung = paths tried.
+                        let base = from_path
+                            .as_ref()
+                            .map(|p| self.retry_after_bulk(p))
+                            .unwrap_or(Duration::ZERO);
+                        let shift = u.tried.len().clamp(1, 5) as u32 - 1;
+                        u.last_sent
+                            + base
+                                .saturating_mul(1u32 << shift)
+                                .min(self.inner.cfg.tuning.down_timeout_ceil)
+                    } else {
+                        // KD8: the *alt's* silence clock, rung-independent.
+                        u.last_sent + self.retry_after_bulk_id(alt)
+                    };
                 }
-                if dropped {
-                    self.inner
-                        .metrics
-                        .data_dropped_resend
-                        .fetch_add(1, Ordering::Relaxed);
+                self.note_resent(st, offset, from, alt, why, true, dropped, &tried);
+            } else {
+                // 2b: survivor's bulk queue full. Keep it a candidate (do
+                // not push to `tried`); re-try it as soon as it drains.
+                self.note_resend_skipped("queue_full");
+                if let Some(u) = st.unacked.lock().unwrap().get_mut(&offset) {
+                    u.dropped = true;
+                    u.retry_not_before = Instant::now() + self.retry_after(alt);
                 }
-                st.hedges.fetch_add(1, Ordering::Relaxed);
-                st.note_path_used(alt);
-                self.note_retry(from, alt);
-                self.note_resend_why(why);
-                tracing::debug!(
-                    stream = st.id,
-                    offset,
-                    from,
-                    to = alt,
-                    why,
-                    bulk,
-                    tries = tried.len(),
-                    last_rx_ms = from_path
-                        .as_ref()
-                        .map(|p| p.last_rx_ago().as_millis() as u64),
-                    "data re-sent"
-                );
-            } else if let Some(u) = st.unacked.lock().unwrap().get_mut(&offset) {
-                Self::push_tried(&mut u.tried, alt);
-                u.dropped = true;
-                u.retry_not_before = Instant::now() + self.retry_after(from);
             }
         }
+    }
+
+    /// `retry_after_bulk` by id; the pool loss clock when the path is gone.
+    fn retry_after_bulk_id(&self, id: u32) -> Duration {
+        match self.get_path(id) {
+            Some(p) => self.retry_after_bulk(&p),
+            None => self.retry_after(id),
+        }
+    }
+
+    fn defer_piece(&self, st: &StreamState, offset: u64, by: Duration) {
+        if let Some(u) = st.unacked.lock().unwrap().get_mut(&offset) {
+            u.retry_not_before = Instant::now() + by;
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn note_resent(
+        &self,
+        st: &StreamState,
+        offset: u64,
+        from: u32,
+        to: u32,
+        why: &'static str,
+        bulk: bool,
+        dropped: bool,
+        tried: &[u32],
+    ) {
+        if dropped {
+            self.inner
+                .metrics
+                .data_dropped_resend
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        st.hedges.fetch_add(1, Ordering::Relaxed);
+        st.note_path_used(to);
+        // Same path (dropped piece back on its fresh source) is a same-link
+        // retransmit, as any same-link rehome.
+        self.note_retry(from, to);
+        self.note_resend_why(why);
+        tracing::debug!(
+            stream = st.id,
+            offset,
+            from,
+            to,
+            why,
+            bulk,
+            tries = tried.len(),
+            last_rx_ms = self
+                .get_path(from)
+                .map(|p| p.last_rx_ago().as_millis() as u64),
+            "data re-sent"
+        );
     }
 
     /// P1.7 `nya_data_resend_total{why}`.
@@ -2692,30 +2805,334 @@ mod tests {
         client.shutdown();
     }
 
-    /// P4: a piece that never reached a writer queue is re-sent at once,
-    /// even though its path looks fresh.
+    /// P4/P5: a piece that never reached a writer queue is re-sent at
+    /// once. Its source is fresh with queue room, so it goes back on the
+    /// source itself (nothing is on any wire; R32/M2), `tried` unchanged,
+    /// no skip counted.
     #[tokio::test]
-    async fn dropped_piece_is_resent_on_fresh_path() {
+    async fn dropped_piece_resends_on_fresh_source() {
         let client = Session::new_client(SessionConfig::default());
         let _a = inject_live(&client, 1, "akcdn#0", 7);
         let _b = inject_live(&client, 2, "soy#0", 7);
         let (tun, st) = one_bulk_piece(&client).await;
-        let (from, offset) = {
+        let (from, offset, tried0) = {
             let g = st.unacked.lock().unwrap();
             let (o, u) = g.iter().next().unwrap();
-            (u.path_id, *o)
+            (u.path_id, *o, u.tried.clone())
         };
         client.note_data_dropped(st.id, offset);
         let h0 = hedges(&client);
         let d0 = client.snapshot().data_dropped_resend;
         client.debug_maintain();
         assert_eq!(hedges(&client), h0 + 1);
-        assert_eq!(client.snapshot().data_dropped_resend, d0 + 1);
+        let s = client.snapshot();
+        assert_eq!(s.data_dropped_resend, d0 + 1);
+        assert_eq!(s.data_resend_dropped, 1);
+        assert_eq!(s.data_resend_skipped_no_fresh_alt, 0);
         let g = st.unacked.lock().unwrap();
         let u = g.values().next().unwrap();
-        assert_ne!(u.path_id, from);
+        assert_eq!(u.path_id, from, "fresh source takes it back");
+        assert_eq!(u.tried, tried0, "tried unchanged");
         assert!(!u.dropped, "successful enqueue clears the flag");
+        assert!(
+            u.retry_not_before > u.last_sent,
+            "re-armed on the source's silence clock"
+        );
         drop(g);
+        drop(tun);
+        client.shutdown();
+    }
+
+    /// P5: a dropped piece whose source is quiet goes to a fresh sibling
+    /// even if that sibling is in `tried` (nothing is on it either).
+    #[tokio::test]
+    async fn dropped_piece_resends_on_fresh_sibling_when_source_quiet() {
+        let client = Session::new_client(SessionConfig::default());
+        let (pa, _wa, _ua) = inject_live(&client, 1, "akcdn#0", 7);
+        let (pb, _wb, _ub) = inject_live(&client, 2, "soy#0", 7);
+        let (tun, st) = one_bulk_piece(&client).await;
+        let (from, offset) = {
+            let g = st.unacked.lock().unwrap();
+            let (o, u) = g.iter().next().unwrap();
+            (u.path_id, *o)
+        };
+        let (src, sib) = if from == 1 { (&pa, &pb) } else { (&pb, &pa) };
+        // Quiet past degrade_for (~50 ms) but short of down_for: a hedge
+        // question, not path_failed's rehome. A ping in flight keeps the
+        // path UP (schedulable) yet quiet — exactly the P7 distinction.
+        let _ = src.next_ping();
+        *src.last_rx.lock().unwrap() = Instant::now() - Duration::from_millis(200);
+        {
+            let mut g = st.unacked.lock().unwrap();
+            let u = g.get_mut(&offset).unwrap();
+            u.tried = vec![sib.id, from];
+        }
+        client.note_data_dropped(st.id, offset);
+        client.debug_maintain();
+        assert_eq!(client.snapshot().data_resend_dropped, 1);
+        {
+            let g = st.unacked.lock().unwrap();
+            let u = g.values().next().unwrap();
+            assert_eq!(u.path_id, sib.id, "fresh sibling, even though tried");
+            assert!(!u.dropped);
+        }
+        // Both quiet: the piece waits (`no_fresh_alt`), no all-quiet tier.
+        let _ = sib.next_ping();
+        *sib.last_rx.lock().unwrap() = Instant::now() - Duration::from_millis(200);
+        client.note_data_dropped(st.id, offset);
+        client.debug_maintain();
+        let s = client.snapshot();
+        assert_eq!(s.data_resend_dropped, 1, "no re-send onto a quiet path");
+        assert_eq!(s.data_resend_skipped_no_fresh_alt, 1);
+        let g = st.unacked.lock().unwrap();
+        let u = g.values().next().unwrap();
+        assert!(u.dropped, "still owed");
+        assert!(
+            u.retry_not_before > Instant::now(),
+            "re-check later, not spin"
+        );
+        drop(g);
+        drop(tun);
+        client.shutdown();
+    }
+
+    /// Make `p` quiet for `ago` while staying UP: a ping in flight blocks
+    /// `should_mark_degraded`, as a real path between Pongs.
+    fn quiet_up(p: &PathState, ago: Duration) {
+        let _ = p.next_ping();
+        *p.last_rx.lock().unwrap() = Instant::now() - ago;
+    }
+
+    /// P5: the source is silent, two siblings are quiet, one is fresh ⇒ the
+    /// silence re-send goes to the fresh one on the first due tick, even
+    /// though the picker's rungs would accept a quiet untried path.
+    #[tokio::test]
+    async fn rehome_waits_for_fresh_alt() {
+        let client = Session::new_client(SessionConfig::default());
+        let (pa, _wa, _ua) = inject_live(&client, 1, "a#0", 7);
+        let (pb, _wb, _ub) = inject_live(&client, 2, "b#0", 7);
+        let (pc, _wc, _uc) = inject_live(&client, 3, "c#0", 7);
+        let (pd, _wd, _ud) = inject_live(&client, 4, "d#0", 7);
+        let (tun, st) = one_bulk_piece(&client).await;
+        let from = st.unacked.lock().unwrap().values().next().unwrap().path_id;
+        let all = [&pa, &pb, &pc, &pd];
+        let src = all.iter().find(|p| p.id == from).unwrap();
+        let others: Vec<&Arc<PathState>> = all.iter().copied().filter(|p| p.id != from).collect();
+        // Source silent past its bulk clock; two siblings quiet; one fresh.
+        quiet_up(src, Duration::from_millis(300));
+        quiet_up(others[0], Duration::from_millis(300));
+        quiet_up(others[1], Duration::from_millis(300));
+        let fresh = others[2];
+        {
+            let mut u = st.unacked.lock().unwrap();
+            for x in u.values_mut() {
+                x.last_sent = Instant::now() - Duration::from_millis(300);
+            }
+        }
+        client.debug_maintain();
+        let s = client.snapshot();
+        assert_eq!(s.data_resend_silence, 1, "one silence re-send");
+        assert_eq!(s.data_resend_skipped_no_fresh_alt, 0);
+        let g = st.unacked.lock().unwrap();
+        let u = g.values().next().unwrap();
+        assert_eq!(u.path_id, fresh.id, "only the fresh sibling may take it");
+        // KD8: re-armed on the alt's own silence clock, rung-independent.
+        let rearm = u.retry_not_before.saturating_duration_since(u.last_sent);
+        assert_eq!(rearm, client.retry_after_bulk(fresh));
+        drop(g);
+        drop(tun);
+        client.shutdown();
+    }
+
+    /// P5: with no fresh candidate the piece waits (`skipped{no_fresh_alt}`)
+    /// instead of being buried on a quiet sibling; when a sibling turns
+    /// fresh it goes there on the next tick.
+    #[tokio::test]
+    async fn rehome_skips_until_a_candidate_is_fresh() {
+        let client = Session::new_client(SessionConfig::default());
+        let (pa, _wa, _ua) = inject_live(&client, 1, "a#0", 7);
+        let (pb, _wb, _ub) = inject_live(&client, 2, "b#0", 7);
+        let (tun, st) = one_bulk_piece(&client).await;
+        let from = st.unacked.lock().unwrap().values().next().unwrap().path_id;
+        let (src, sib) = if from == 1 { (&pa, &pb) } else { (&pb, &pa) };
+        quiet_up(src, Duration::from_millis(300));
+        quiet_up(sib, Duration::from_millis(300));
+        {
+            let mut u = st.unacked.lock().unwrap();
+            for x in u.values_mut() {
+                x.last_sent = Instant::now() - Duration::from_millis(300);
+            }
+        }
+        client.debug_maintain();
+        let s = client.snapshot();
+        assert_eq!(s.data_resend_silence, 0, "no copy onto a quiet sibling");
+        assert_eq!(s.data_resend_skipped_no_fresh_alt, 1);
+        {
+            let g = st.unacked.lock().unwrap();
+            let u = g.values().next().unwrap();
+            assert_eq!(u.path_id, from);
+            assert_eq!(u.tried, vec![from], "the stale alt is not marked tried");
+        }
+        // Sibling answers a Pong: fresh again ⇒ the piece moves.
+        sib.touch_rx();
+        {
+            let mut u = st.unacked.lock().unwrap();
+            for x in u.values_mut() {
+                x.retry_not_before = Instant::now();
+            }
+        }
+        client.debug_maintain();
+        assert_eq!(client.snapshot().data_resend_silence, 1);
+        assert_eq!(
+            st.unacked.lock().unwrap().values().next().unwrap().path_id,
+            sib.id
+        );
+        drop(tun);
+        client.shutdown();
+    }
+
+    /// P5 2b: the survivor's bulk queue is full ⇒ `send_on_path` fails ⇒
+    /// the survivor stays a candidate (not `tried`), the piece is `dropped`
+    /// and `skipped{queue_full}`; once the queue drains it is re-sent
+    /// there — never onto a quiet sibling.
+    #[tokio::test]
+    async fn retry_enqueue_failure_keeps_alt_untried() {
+        let client = Session::new_client(SessionConfig::default());
+        let (pa, wa, _ua) = inject_live_cap(&client, 1, "a#0", 7, 1);
+        let (pb, wb, _ub) = inject_live_cap(&client, 2, "b#0", 7, 1);
+        let (pc, wc, _uc) = inject_live_cap(&client, 3, "c#0", 7, 1);
+        let mut writers = std::collections::HashMap::from([(1u32, wa), (2, wb), (3, wc)]);
+        let (tun, st) = one_bulk_piece(&client).await;
+        let from = st.unacked.lock().unwrap().values().next().unwrap().path_id;
+        // Whatever the piece rode on is drained so nothing else is full.
+        let _ = writers.get_mut(&from).unwrap().try_recv();
+        let all = [&pa, &pb, &pc];
+        let src = all.iter().find(|p| p.id == from).unwrap();
+        let mut rest: Vec<&Arc<PathState>> = all.iter().copied().filter(|p| p.id != from).collect();
+        // One quiet sibling; the survivor fresh but with a full bulk queue.
+        quiet_up(rest.remove(0), Duration::from_millis(300));
+        let survivor = rest[0];
+        // > interactive_max so it rides the bulk queue, as the piece will.
+        let filler = Frame::StreamData(StreamData {
+            stream_id: 999,
+            offset: 0,
+            data: vec![0; 4000],
+        });
+        assert!(client.send_on_path(survivor.id, filler));
+        quiet_up(src, Duration::from_millis(300));
+        {
+            let mut u = st.unacked.lock().unwrap();
+            for x in u.values_mut() {
+                x.last_sent = Instant::now() - Duration::from_millis(300);
+            }
+        }
+        client.debug_maintain();
+        let s = client.snapshot();
+        assert_eq!(s.data_resend_silence, 0);
+        assert_eq!(s.data_resend_skipped_queue_full, 1);
+        {
+            let g = st.unacked.lock().unwrap();
+            let u = g.values().next().unwrap();
+            assert!(u.dropped, "owed a copy");
+            assert!(
+                !u.tried.contains(&survivor.id),
+                "survivor stays a candidate"
+            );
+            assert_eq!(u.path_id, from);
+        }
+        // Queue drains ⇒ next due tick re-sends on the survivor.
+        assert!(
+            writers.get_mut(&survivor.id).unwrap().try_recv().is_ok(),
+            "filler drained"
+        );
+        {
+            let mut u = st.unacked.lock().unwrap();
+            for x in u.values_mut() {
+                x.retry_not_before = Instant::now();
+            }
+        }
+        client.debug_maintain();
+        let s = client.snapshot();
+        assert_eq!(s.data_resend_dropped, 1);
+        let g = st.unacked.lock().unwrap();
+        let u = g.values().next().unwrap();
+        assert_eq!(u.path_id, survivor.id);
+        assert!(!u.dropped);
+        drop(g);
+        drop(tun);
+        client.shutdown();
+    }
+
+    /// P6: the bulk silence clock is never shorter than the path's own
+    /// degrade clock — a gap between Pongs is not silence.
+    #[tokio::test]
+    async fn retry_after_bulk_at_least_degrade() {
+        let mut cfg = SessionConfig::default();
+        cfg.ping_interval_max = Duration::from_millis(50);
+        let client = Session::new_client(cfg);
+        let (p, _w, _u) = inject_live(&client, 1, "a#0", 5);
+        p.record_ack_rtt(Duration::from_millis(10));
+        let quiet = client.retry_after_bulk(&p);
+        assert!(
+            quiet >= client.degrade_for(&p),
+            "retry_after_bulk {quiet:?} < degrade_for {:?}",
+            client.degrade_for(&p)
+        );
+        assert!(quiet >= Duration::from_millis(50));
+        client.shutdown();
+    }
+
+    /// P7: an idle path between Pongs (`last_rx_ago` just under
+    /// `probe + rtt`) is quiet-fresh although it is no longer loss-fresh;
+    /// bulk affinity keeps the sticky. At `degrade_for` both flip.
+    #[tokio::test]
+    async fn quiet_fresh_between_pongs() {
+        let client = Session::new_client(SessionConfig::default());
+        let (p, _w, _u) = inject_live(&client, 1, "a#0", 7);
+        let degrade = client.degrade_for(&p);
+        assert!(degrade > health::loss_timeout(&client.inner.cfg, p.rtt()));
+        quiet_up(&p, degrade - Duration::from_millis(5));
+        assert!(!crate::scheduler::is_loss_fresh(&client.inner.cfg, &p));
+        assert!(client.is_quiet_fresh(&p));
+        assert_eq!(client.bulk_affinity(1), Some(1), "idle sticky keeps bulk");
+        quiet_up(&p, degrade + Duration::from_millis(1));
+        assert!(!client.is_quiet_fresh(&p));
+        assert_eq!(client.bulk_affinity(1), None, "degrade_for loses it");
+        client.shutdown();
+    }
+
+    /// P7 effect: a slow bulk stream (one piece per ~66 ms, longer than the
+    /// 20 ms loss clock) on an idle pool stays on one sticky.
+    #[tokio::test]
+    async fn slow_stream_keeps_one_sticky() {
+        let client = Session::new_client(SessionConfig::default());
+        let paths: Vec<_> = (1..=4u32)
+            .map(|i| inject_live(&client, i, &format!("p{i}#0"), 7))
+            .collect();
+        let mut tun = client
+            .open_stream(Target {
+                host: "t".into(),
+                port: 1,
+            })
+            .await
+            .unwrap();
+        let st = client.get_stream(tun.id).unwrap();
+        st.bulk.store(true, Ordering::Relaxed);
+        for i in 0..20u64 {
+            tun.write_all(&vec![7u8; 16 * 1024]).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            // Pongs keep coming on every path (idle pool); ACKs release.
+            for (p, _, _) in &paths {
+                p.touch_rx();
+            }
+            client.on_ack(StreamAck {
+                stream_id: st.id,
+                acked_offset: (i + 1) * 16 * 1024,
+                window: 1 << 20,
+                sack: vec![],
+            });
+        }
+        assert_eq!(tun.stats().paths_used, 1, "one sticky for a slow stream");
         drop(tun);
         client.shutdown();
     }
@@ -3888,6 +4305,9 @@ mod tests {
                     data: vec![1, 2, 3],
                     path_id,
                     last_sent: Instant::now(),
+                    // Outstanding for longer than thresh: a piece sent just
+                    // now after an idle gap is not a stall (see next test).
+                    first_sent: Instant::now() - Duration::from_millis(250),
                     tried: vec![path_id],
                     retry_not_before: Instant::now(),
                     dropped: false,
@@ -3950,6 +4370,7 @@ mod tests {
                     data: vec![9],
                     path_id,
                     last_sent: Instant::now(),
+                    first_sent: Instant::now(),
                     tried: vec![path_id],
                     retry_not_before: Instant::now(),
                     dropped: false,
