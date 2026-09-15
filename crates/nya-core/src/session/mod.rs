@@ -3063,6 +3063,56 @@ mod tests {
         client.shutdown();
     }
 
+    /// P4: a sticky that turns bulk away for lack of room is marked
+    /// budget-limited for its round (so `end_budget_round` grows it), and
+    /// the divert is counted on the stream and the session.
+    #[tokio::test]
+    async fn budget_limited_marked_on_divert() {
+        let client = Session::new_client(SessionConfig::default());
+        let (pa, _wa, _ua) = inject_live(&client, 1, "a#0", 7);
+        let (pb, _wb, _ub) = inject_live(&client, 2, "b#0", 7);
+        let (mut tun, st) = one_bulk_piece(&client).await;
+        let sticky = st.sticky.load(Ordering::Relaxed);
+        let (home, sib) = if sticky == pa.id {
+            (&pa, &pb)
+        } else {
+            (&pb, &pa)
+        };
+        assert_eq!(st.budget_diverts.load(Ordering::Relaxed), 0);
+        // Sticky at budget; the round's "limited" flag is clear.
+        home.add_inflight(10 * 1024 * 1024);
+        home.round_limited.store(false, Ordering::Relaxed);
+        assert_eq!(home.room_bytes(), 0);
+        assert!(sib.room_bytes() >= nya_proto::MAX_STREAM_PAYLOAD as u64);
+        tun.write_all(&vec![0x43u8; 4000]).await.unwrap();
+        let deadline = Instant::now() + Duration::from_millis(300);
+        loop {
+            if st.unacked.lock().unwrap().len() >= 2 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "second piece must be sent");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let diverted = {
+            let g = st.unacked.lock().unwrap();
+            g.values().filter(|u| u.path_id == sib.id).count()
+        };
+        assert_eq!(diverted, 1, "the second piece overflows to the sibling");
+        assert_eq!(
+            st.sticky.load(Ordering::Relaxed),
+            sticky,
+            "overflow keeps sticky"
+        );
+        assert!(
+            home.round_limited.load(Ordering::Relaxed),
+            "sticky must be marked limited when it turns bulk away"
+        );
+        assert_eq!(st.budget_diverts.load(Ordering::Relaxed), 1);
+        assert_eq!(client.snapshot().send_budget_diverts, 1);
+        drop(tun);
+        client.shutdown();
+    }
+
     /// P6: the bulk silence clock is never shorter than the path's own
     /// degrade clock — a gap between Pongs is not silence.
     #[tokio::test]

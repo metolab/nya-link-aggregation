@@ -237,11 +237,33 @@ impl Session {
                         .or_else(|| self.pick_pref(pref))
                 } else {
                     overflow = false;
+                    // P4: the sticky had affinity but no room in this pick.
+                    let mut sticky_full = false;
                     self.bulk_affinity(sticky)
-                        .filter(|id| self.get_path(*id).is_some_and(|p| p.room_bytes() >= 1))
+                        .filter(|id| {
+                            let has_room = self.get_path(*id).is_some_and(|p| p.room_bytes() >= 1);
+                            if !has_room {
+                                // P4: the sticky turned bulk away this
+                                // round. Its budget controller must see
+                                // "limited" or it never grows past a budget
+                                // that the overflow siblings are absorbing.
+                                sticky_full = true;
+                                if let Some(p) = self.get_path(*id) {
+                                    p.note_budget_limited();
+                                }
+                            }
+                            has_room
+                        })
                         .or_else(|| {
                             let alt = self.bulk_overflow_pick(sticky);
                             overflow = alt.is_some();
+                            if overflow && sticky_full {
+                                st.budget_diverts.fetch_add(1, Ordering::Relaxed);
+                                self.inner
+                                    .metrics
+                                    .send_budget_diverts
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
                             alt
                         })
                         .or_else(|| {

@@ -2132,13 +2132,35 @@ pub async fn bulk_bottleneck_single() -> Result<ScenarioReport> {
     bulk_tracer(&h);
     const N: usize = 12 * 1024 * 1024;
     let o = run_bulk(&h, N, Duration::from_secs(40)).await;
-    Ok(bulk_report(
+    let mut r = bulk_report(
         "bulk_bottleneck_single",
         &h,
         &[o],
         rate_gate(N, RATE, 0.7),
         &snap0,
-    ))
+    );
+    // P4 door (G3): the lone sticky turned bulk away all copy long, so its
+    // round was marked limited and the budget controller must have grown
+    // it past the floor. 50 Mbit/s × 10 ms = 62.5 KB BDP; the floor is
+    // 64 KiB, so a floor-locked budget is exactly the row this scenario
+    // exists to catch.
+    let floor = nya_core::Tuning::STANDARD.inflight_bias;
+    let budget_max = r
+        .snap
+        .paths
+        .iter()
+        .map(|p| p.budget_bytes)
+        .max()
+        .unwrap_or(0);
+    r.notes
+        .push(format!("bulk=budget_max={budget_max} floor={floor}"));
+    if budget_max <= floor {
+        r.notes.push(format!(
+            "FAIL budget {budget_max} never grew past the floor {floor}"
+        ));
+        r.sla.min_success = 2.0;
+    }
+    Ok(r)
 }
 
 /// Two bulk streams on the same 50 Mbps TCP: aggregate ≥ 80 % and the
