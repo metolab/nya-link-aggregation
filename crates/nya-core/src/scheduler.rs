@@ -264,6 +264,7 @@ pub(crate) fn bulk_overflow_pick(
     paths: &[Arc<PathState>],
     cfg: &SessionConfig,
     sticky: u32,
+    pool_ref: Option<Duration>,
     has_interactive: impl Fn(u32) -> bool,
 ) -> Option<u32> {
     let set = fastest_class_set(paths, cfg);
@@ -273,7 +274,10 @@ pub(crate) fn bulk_overflow_pick(
             p.id != sticky
                 && p.is_schedulable()
                 && is_quiet_fresh(cfg, p)
-                && p.room_bytes() >= nya_proto::MAX_STREAM_PAYLOAD as u64
+                // P3.2 fit-or-wait: an unfit sibling is not an overflow
+                // target; with nothing fit the piece parks on budget_wait.
+                && p.loop_fit(cfg, pool_ref)
+                && has_room_or_mark(p)
         })
         .collect();
     if room.is_empty() {
@@ -323,6 +327,75 @@ pub fn is_quiet_fresh(cfg: &SessionConfig, p: &PathState) -> bool {
     p.last_rx_ago() < health::degrade_timeout(cfg, p.rtt_known(), p.stable_rtt())
 }
 
+/// P4 for siblings: a bulk piece that would have gone to `p` but for its
+/// budget marks `p`'s round limited — the budget controller grows only
+/// budgets that turned bulk away, and an overflow target that is skipped
+/// silently would stay at the floor forever while carrying a third of the
+/// copy (bulk_bottleneck_lossy_sibling: siblings stuck at 64 k).
+fn has_room_or_mark(p: &PathState) -> bool {
+    if p.room_bytes() >= nya_proto::MAX_STREAM_PAYLOAD as u64 {
+        true
+    } else {
+        p.note_budget_limited();
+        false
+    }
+}
+
+/// P3.2: fit-or-all — mirrors [`loss_fresh_or_all`]: the least-bad path
+/// is a home when nothing is fit.
+pub(crate) fn loop_fit_or_all<'a>(
+    cfg: &SessionConfig,
+    pool_ref: Option<Duration>,
+    cands: &[&'a Arc<PathState>],
+) -> Vec<&'a Arc<PathState>> {
+    let fit: Vec<_> = cands
+        .iter()
+        .copied()
+        .filter(|p| p.loop_fit(cfg, pool_ref))
+        .collect();
+    if fit.is_empty() {
+        cands.to_vec()
+    } else {
+        fit
+    }
+}
+
+/// P3.2 `pick_bulk`: the one candidate order for a bulk home —
+/// schedulable ⇒ quiet-fresh-or-all ⇒ room ⇒ fit-or-all ⇒ prefer no
+/// interactive on the TCP ⇒ ≠ exclude ⇒ score. `None` when the room filter
+/// empties the set (the caller parks or falls back by *why*).
+pub(crate) fn pick_bulk(
+    paths: &[Arc<PathState>],
+    cfg: &SessionConfig,
+    pool_ref: Option<Duration>,
+    exclude: Option<u32>,
+    has_interactive: impl Fn(u32) -> bool,
+) -> Option<u32> {
+    let set = fastest_class_set(paths, cfg);
+    let sched: Vec<&Arc<PathState>> = set
+        .into_iter()
+        .filter(|p| p.is_schedulable() && Some(p.id) != exclude)
+        .collect();
+    let fresh: Vec<&Arc<PathState>> = sched
+        .iter()
+        .copied()
+        .filter(|p| is_quiet_fresh(cfg, p))
+        .collect();
+    let fresh = if fresh.is_empty() { sched } else { fresh };
+    let room: Vec<&Arc<PathState>> = fresh.into_iter().filter(|p| has_room_or_mark(p)).collect();
+    if room.is_empty() {
+        return None;
+    }
+    let fit = loop_fit_or_all(cfg, pool_ref, &room);
+    let quiet: Vec<&Arc<PathState>> = fit
+        .iter()
+        .copied()
+        .filter(|p| !has_interactive(p.id))
+        .collect();
+    let cands = if quiet.is_empty() { fit } else { quiet };
+    pick_from_scored(&cands, cfg, PickPref::Any)
+}
+
 fn loss_fresh_or_all<'a>(
     cfg: &SessionConfig,
     cands: &[&'a Arc<PathState>],
@@ -339,7 +412,7 @@ fn loss_fresh_or_all<'a>(
     }
 }
 
-fn pick_from_scored(
+pub(crate) fn pick_from_scored(
     candidates: &[&Arc<PathState>],
     cfg: &SessionConfig,
     pref: PickPref,
@@ -458,6 +531,7 @@ pub(crate) fn hol_place_bulk_fallback(
     paths: &[Arc<PathState>],
     cur: &PathState,
     cfg: &SessionConfig,
+    pool_ref: Option<Duration>,
     conn_has_interactive: impl Fn(u32) -> bool,
 ) -> Option<u32> {
     let cands: Vec<&Arc<PathState>> = paths
@@ -469,6 +543,7 @@ pub(crate) fn hol_place_bulk_fallback(
                 && effective_class_rtt(cfg, p) <= effective_class_rtt(cfg, cur)
         })
         .collect();
+    let cands = loop_fit_or_all(cfg, pool_ref, &cands);
     pick_from(&cands, cfg, PickPref::Any)
 }
 
@@ -1405,7 +1480,7 @@ mod tests {
         let cfg = SessionConfig::default();
         let cur = mk_class(1, "c#0", 182, 182);
         let s1 = mk_class(2, "s1#0", 255, 255);
-        let dest = hol_place_bulk_fallback(&[cur.clone(), s1], &cur, &cfg, |id| id == 1);
+        let dest = hol_place_bulk_fallback(&[cur.clone(), s1], &cur, &cfg, None, |id| id == 1);
         assert_ne!(dest, Some(2), "never s1 from 182, got {dest:?}");
         assert!(dest.is_none());
     }
@@ -1419,7 +1494,7 @@ mod tests {
         let cur = mk_named(1, "soy#0".into(), 7);
         let stalled = mk_named(2, "nsix#0".into(), 7);
         stalled.set_write_stalled(true);
-        let dest = hol_place_bulk_fallback(&[cur.clone(), stalled], &cur, &cfg, |id| id == 1);
+        let dest = hol_place_bulk_fallback(&[cur.clone(), stalled], &cur, &cfg, None, |id| id == 1);
         assert_eq!(dest, Some(2), "write-stalled dest is a bulk HOL target");
     }
 

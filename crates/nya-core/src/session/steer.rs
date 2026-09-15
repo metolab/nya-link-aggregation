@@ -190,6 +190,21 @@ impl Session {
         }
 
         let alive: Vec<&Arc<PathState>> = paths.iter().filter(|p| p.is_alive()).collect();
+        // P3.1: pool reference = min expected sojourn over alive ∧
+        // schedulable paths (filter_map: an unknown-RTT path does not make
+        // it None); then sample every path's fit for the gauges/counter.
+        let pool_ref = alive
+            .iter()
+            .filter(|p| p.is_schedulable())
+            .filter_map(|p| p.sojourn())
+            .min();
+        self.inner.pool_ref_us.store(
+            pool_ref.map(|d| d.as_micros() as u64).unwrap_or(0),
+            Ordering::Relaxed,
+        );
+        for p in &alive {
+            p.loop_fit(&self.inner.cfg, pool_ref);
+        }
         let quiet: Vec<&Arc<PathState>> = alive
             .iter()
             .copied()
@@ -529,9 +544,68 @@ impl Session {
         }) {
             return Some(sib.id);
         }
-        hol_place_bulk_fallback(&paths, &cur, &self.inner.cfg, |id| {
+        hol_place_bulk_fallback(&paths, &cur, &self.inner.cfg, self.pool_ref(), |id| {
             self.conn_has_interactive(id)
         })
+    }
+
+    /// P3.3 re-stick: a bulk sticky whose loaded loop has turned unfit
+    /// moves — once — to a fit, quiet-fresh sibling with room and no
+    /// interactive on it. Fit-or-all here means *stay put*. Holds: one
+    /// `loop_unfit` move per stream per `MIN_RTT_WIN_US`; one incoming
+    /// re-stick per dest until it has an `ack_rtt` sample since the last
+    /// one and never within `bw_window_us` (N streams must not herd onto a
+    /// never-loaded sibling within a second). Pieces already on `cur` stay
+    /// (KD6). Counted on `nya_migrates_loop_unfit_total`, not HOL.
+    fn maybe_restick_unfit(&self, st: &StreamState, cur: &PathState) -> bool {
+        if self.loop_fit(cur) {
+            return false;
+        }
+        if !st.stick_changed_ago_ge(Duration::from_micros(crate::path::MIN_RTT_WIN_US)) {
+            return false;
+        }
+        let paths = self.path_list();
+        let set = crate::scheduler::fastest_class_set(&paths, &self.inner.cfg);
+        let now = crate::metrics::mono_us();
+        let cands: Vec<&Arc<PathState>> = set
+            .into_iter()
+            .filter(|p| {
+                p.id != cur.id
+                    && p.is_schedulable()
+                    && self.is_quiet_fresh(p)
+                    && p.room_bytes() >= nya_proto::MAX_STREAM_PAYLOAD as u64
+                    && !self.conn_has_interactive(p.id)
+                    && self.loop_fit(p)
+                    && {
+                        let last = p.restick_in_at_us.load(Ordering::Relaxed);
+                        last == 0
+                            || (p.ack_rtt_at_us.load(Ordering::Relaxed) > last
+                                && now.saturating_sub(last) >= p.bw_window_us())
+                    }
+            })
+            .collect();
+        let Some(dest) = crate::scheduler::pick_from_scored(
+            &cands,
+            &self.inner.cfg,
+            crate::scheduler::PickPref::Any,
+        ) else {
+            return false;
+        };
+        if let Some(d) = self.get_path(dest) {
+            d.restick_in_at_us.store(now.max(1), Ordering::Relaxed);
+        }
+        self.set_sticky(st.id, dest);
+        self.note_migrate("loop_unfit");
+        debug!(
+            stream_id = st.id,
+            from = cur.id,
+            to = dest,
+            cur_sojourn_us = cur.sojourn().map(|d| d.as_micros() as u64).unwrap_or(0),
+            pool_ref_us = self.inner.pool_ref_us.load(Ordering::Relaxed),
+            reason = "loop_unfit",
+            "restick"
+        );
+        true
     }
 
     fn maybe_hol(&self, st: &StreamState) {
@@ -543,6 +617,9 @@ impl Session {
             return;
         };
         let dest = if st.bulk.load(Ordering::Relaxed) {
+            if self.maybe_restick_unfit(st, &cur) {
+                return;
+            }
             self.hol_place_bulk(cur_id)
         } else {
             let paths = self.path_list();

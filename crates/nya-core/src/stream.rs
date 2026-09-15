@@ -194,7 +194,7 @@ pub struct StreamState {
     /// Bytes since the last rate sample. Coalesced so FramedRead gaps are not a rate.
     pending_deliver: AtomicU64,
     last_deliver: Mutex<Option<Instant>>,
-    last_stick_change: Mutex<Instant>,
+    pub(crate) last_stick_change: Mutex<Instant>,
     /// 0 = never. Written when `send_acked` advances.
     pub last_ack_ms: AtomicU64,
     /// 0 = never. Written on successful inbound `try_send`.

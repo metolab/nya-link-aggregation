@@ -113,6 +113,9 @@ pub(crate) struct Inner {
     quiet_episode: Mutex<Option<steer::QuietEpisode>>,
     /// P2.4: Σ over live streams of `recv_cap − floor` (memory guard).
     recv_cap_extra: Arc<std::sync::atomic::AtomicU64>,
+    /// P3.1: best expected sojourn over alive ∧ schedulable paths, µs,
+    /// computed once per `maintain` tick (0 = unknown).
+    pool_ref_us: std::sync::atomic::AtomicU64,
     metrics: Counters,
     process: Arc<ProcessCounters>,
     last_rtt_us: Mutex<HashMap<String, u64>>,
@@ -168,6 +171,7 @@ impl Session {
             correlated_since: Mutex::new(None),
             quiet_episode: Mutex::new(None),
             recv_cap_extra: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            pool_ref_us: std::sync::atomic::AtomicU64::new(0),
             metrics: Counters::default(),
             process,
             last_rtt_us: Mutex::new(HashMap::new()),
@@ -587,9 +591,37 @@ impl Session {
     /// P2 fan-out target for a bulk stream whose sticky is at budget.
     fn bulk_overflow_pick(&self, sticky: u32) -> Option<u32> {
         let paths = self.path_list();
-        crate::scheduler::bulk_overflow_pick(&paths, &self.inner.cfg, sticky, |id| {
-            self.conn_has_interactive(id)
-        })
+        crate::scheduler::bulk_overflow_pick(
+            &paths,
+            &self.inner.cfg,
+            sticky,
+            self.pool_ref(),
+            |id| self.conn_has_interactive(id),
+        )
+    }
+
+    /// P3.1: the pool reference sojourn from the last `maintain` tick.
+    pub(super) fn pool_ref(&self) -> Option<Duration> {
+        match self.inner.pool_ref_us.load(Ordering::Relaxed) {
+            0 => None,
+            us => Some(Duration::from_micros(us)),
+        }
+    }
+
+    /// P3.1: is `p` a fit bulk home relative to the pool right now?
+    pub(super) fn loop_fit(&self, p: &PathState) -> bool {
+        p.loop_fit(&self.inner.cfg, self.pool_ref())
+    }
+
+    /// P3.2: one candidate order for a bulk home (see `scheduler::pick_bulk`).
+    pub(super) fn pick_bulk(&self, exclude: Option<u32>) -> Option<u32> {
+        crate::scheduler::pick_bulk(
+            &self.path_list(),
+            &self.inner.cfg,
+            self.pool_ref(),
+            exclude,
+            |id| self.conn_has_interactive(id),
+        )
     }
 
     /// Per-stream limiter summary (P6), for the hop span at copy end.
@@ -3113,6 +3145,172 @@ mod tests {
         assert_eq!(st.budget_diverts.load(Ordering::Relaxed), 1);
         assert_eq!(client.snapshot().send_budget_diverts, 1);
         drop(tun);
+        client.shutdown();
+    }
+
+    /// P3.1: fit is relative to the pool. {idle 13, loaded 26, loaded 170}
+    /// ⇒ pool_ref 13 ms, bound 2× + 20 = 46 ms ⇒ fit, fit, unfit; a pool of
+    /// {170, 190} ⇒ both fit (least-bad is fit); a stuck path (bytes
+    /// outstanding, no ACK for 300 ms) reads ≥ 300 ms without a sample; an
+    /// idle path's `ack_rtt_fresh` expires after `bw_window_us` while the
+    /// retained `ack_rtt` does not.
+    #[tokio::test]
+    async fn loop_fit_bound_and_expiry() {
+        let client = Session::new_client(SessionConfig::default());
+        let (a, _wa, _ua) = inject_live(&client, 1, "a#0", 13);
+        let (b, _wb, _ub) = inject_live(&client, 2, "b#0", 13);
+        let (c, _wc, _uc) = inject_live(&client, 3, "c#0", 13);
+        b.record_ack_rtt(Duration::from_millis(26));
+        b.add_inflight(1000);
+        c.record_ack_rtt(Duration::from_millis(170));
+        c.add_inflight(1000);
+        client.debug_maintain();
+        let r = client.pool_ref().unwrap();
+        assert!(
+            r <= Duration::from_millis(14),
+            "pool_ref {r:?} is the idle 13 ms"
+        );
+        assert!(client.loop_fit(&a));
+        assert!(client.loop_fit(&b));
+        assert!(
+            !client.loop_fit(&c),
+            "170 ms vs 13 ms reference is a backup"
+        );
+        assert_eq!(c.loop_unfit_total.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            client
+                .snapshot()
+                .paths
+                .iter()
+                .filter(|p| !p.loop_fit)
+                .count(),
+            1
+        );
+        // Steady state does not normalise (round 4 B1): still unfit.
+        client.debug_maintain();
+        assert!(!client.loop_fit(&c));
+        // Stuck: bytes outstanding, no ACK sample, quiet for 300 ms.
+        let (d, _wd, _ud) = inject_live(&client, 4, "d#0", 13);
+        d.add_inflight(1000);
+        quiet_up(&d, Duration::from_millis(300));
+        assert!(d.loaded_sojourn().unwrap() >= Duration::from_millis(300));
+        assert!(!client.loop_fit(&d));
+        // Least-bad is fit: only loaded 170 / 190 schedulable.
+        let client2 = Session::new_client(SessionConfig::default());
+        let (x, _wx, _ux) = inject_live(&client2, 1, "x#0", 13);
+        let (y, _wy, _uy) = inject_live(&client2, 2, "y#0", 13);
+        x.record_ack_rtt(Duration::from_millis(170));
+        x.add_inflight(1);
+        y.record_ack_rtt(Duration::from_millis(190));
+        y.add_inflight(1);
+        client2.debug_maintain();
+        assert!(client2.loop_fit(&x) && client2.loop_fit(&y));
+        // KD7: idle ⇒ ack_rtt_fresh expires, ack_rtt is retained.
+        x.add_inflight(0);
+        x.inflight.store(0, Ordering::Relaxed);
+        assert!(x.ack_rtt_fresh().is_some(), "idle but within the bw window");
+        tokio::time::sleep(Duration::from_micros(x.bw_window_us() + 20_000)).await;
+        assert!(x.ack_rtt_fresh().is_none());
+        assert_eq!(x.ack_rtt(), Some(Duration::from_millis(170)));
+        client.shutdown();
+        client2.shutdown();
+    }
+
+    /// P3.3: a bulk sticky whose loop turned unfit moves once to a fit,
+    /// never-loaded sibling with room; `migrates_loop_unfit == 1`,
+    /// `hol_rebalances` unchanged, no DATA re-sent; no second move within
+    /// `MIN_RTT_WIN_US`; a second stream on the unfit path cannot follow
+    /// onto the same dest until that dest has an `ack_rtt` sample.
+    #[tokio::test]
+    async fn bulk_restick_off_unfit_sticky() {
+        let client = Session::new_client(SessionConfig::default());
+        let (pa, _wa, _ua) = inject_live(&client, 1, "a#0", 13);
+        let (pb, _wb, _ub) = inject_live(&client, 2, "b#0", 13);
+        let (tun, st) = one_bulk_piece(&client).await;
+        let mut tun2 = client
+            .open_stream(Target {
+                host: "t".into(),
+                port: 1,
+            })
+            .await
+            .unwrap();
+        tun2.write_all(&vec![0x42u8; 4000]).await.unwrap();
+        let st2 = {
+            let g = client.inner.streams.lock().unwrap();
+            g.values().find(|x| x.id != st.id).unwrap().clone()
+        };
+        assert_ne!(st.id, st2.id);
+        let sticky = st.sticky.load(Ordering::Relaxed);
+        assert_ne!(sticky, 0);
+        for x in [&st, &st2] {
+            x.bulk.store(true, Ordering::Relaxed);
+            x.sticky.store(sticky, Ordering::Relaxed);
+        }
+        let all = [&pa, &pb];
+        let home = all.iter().find(|p| p.id == sticky).unwrap();
+        home.add_inflight(4000);
+        // The home's loaded loop is 170 ms against idle 13 ms siblings.
+        home.record_ack_rtt(Duration::from_millis(170));
+        // The per-stream hold: pretend the sticks are old.
+        *st.last_stick_change.lock().unwrap() = Instant::now() - Duration::from_secs(20);
+        *st2.last_stick_change.lock().unwrap() = Instant::now() - Duration::from_secs(20);
+        let hol0 = client.snapshot().hol_rebalances;
+        let rtx0 = client.snapshot().data_retransmit + client.snapshot().data_hedge;
+        client.debug_maintain();
+        let s = client.snapshot();
+        assert_eq!(
+            s.migrates_loop_unfit, 1,
+            "exactly one stream moved this tick"
+        );
+        assert_eq!(s.hol_rebalances, hol0, "not a HOL rebalance");
+        assert_eq!(s.data_retransmit + s.data_hedge, rtx0, "no DATA re-sent");
+        let moved = [&st, &st2]
+            .iter()
+            .filter(|x| x.sticky.load(Ordering::Relaxed) != sticky)
+            .count();
+        assert_eq!(moved, 1, "the dest hold keeps the second stream put");
+        let dest = if st.sticky.load(Ordering::Relaxed) != sticky {
+            st.sticky.load(Ordering::Relaxed)
+        } else {
+            st2.sticky.load(Ordering::Relaxed)
+        };
+        assert_ne!(dest, sticky);
+        client.debug_maintain();
+        assert_eq!(client.snapshot().migrates_loop_unfit, 1, "no herd");
+        // The dest records a sample and its bw window passes ⇒ the second
+        // stream may follow.
+        let d = client.get_path(dest).unwrap();
+        tokio::time::sleep(Duration::from_micros(d.bw_window_us() + 20_000)).await;
+        // The sleep outlived the probe clock of these never-ponged paths;
+        // re-up them (the hold under test is the re-stick one).
+        for p in all {
+            quiet_up(p, Duration::ZERO);
+            p.state.store(crate::path::STATE_UP, Ordering::Relaxed);
+        }
+        d.record_ack_rtt(Duration::from_millis(14));
+        client.debug_maintain();
+        assert_eq!(client.snapshot().migrates_loop_unfit, 2);
+        assert_ne!(st2.sticky.load(Ordering::Relaxed), sticky);
+        // A moved stream lives with its choice: no second move for 10 s.
+        home.record_ack_rtt(Duration::from_millis(10));
+        let (moved_st, moved_dest) = if st.sticky.load(Ordering::Relaxed) == dest {
+            (&st, dest)
+        } else {
+            (&st2, st2.sticky.load(Ordering::Relaxed))
+        };
+        client
+            .get_path(moved_dest)
+            .unwrap()
+            .record_ack_rtt(Duration::from_millis(500));
+        client.get_path(moved_dest).unwrap().add_inflight(10);
+        client.debug_maintain();
+        assert_eq!(
+            moved_st.sticky.load(Ordering::Relaxed),
+            moved_dest,
+            "per-stream hold"
+        );
+        drop(tun);
+        drop(tun2);
         client.shutdown();
     }
 

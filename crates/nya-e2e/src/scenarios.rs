@@ -2307,6 +2307,25 @@ pub async fn bulk_fanout_three_paths() -> Result<ScenarioReport> {
         .collect();
     r.notes
         .push(format!("bulk=paths_delivered={}", used.join(",")));
+    // P3 door: equal clean siblings never read unfit; no loop_unfit moves
+    // on either end.
+    let srv = h.server_table.aggregate_snapshot().session;
+    let unfit_moves = r.snap.migrates_loop_unfit + srv.migrates_loop_unfit;
+    r.notes.push(format!(
+        "bulk=mig_loop_unfit={unfit_moves} unfit_n={}",
+        r.snap
+            .paths
+            .iter()
+            .chain(srv.paths.iter())
+            .map(|p| p.loop_unfit_total)
+            .sum::<u64>()
+    ));
+    if unfit_moves > 0 {
+        r.notes.push(format!(
+            "FAIL {unfit_moves} loop_unfit moves between equal siblings"
+        ));
+        r.sla.min_success = 2.0;
+    }
     Ok(r)
 }
 
@@ -2367,12 +2386,15 @@ pub async fn bulk_bottleneck_lossy_sibling() -> Result<ScenarioReport> {
         .filter(|p| p.delivered > 0)
         .map(|p| {
             format!(
-                "{}:{}MiB bud={}k bw={}k/s loop={}ms",
+                "{}:{}MiB bud={}k bw={}k/s loop={}ms min={}ms fit={} unfit_n={}",
                 p.name,
                 p.delivered / (1024 * 1024),
                 p.budget_bytes / 1024,
                 p.bw_bytes_s / 1024,
-                p.ack_rtt_us / 1000
+                p.ack_rtt_us / 1000,
+                p.min_rtt_us / 1000,
+                u8::from(p.loop_fit),
+                p.loop_unfit_total
             )
         })
         .collect();
@@ -2415,6 +2437,30 @@ pub async fn bulk_bottleneck_lossy_sibling() -> Result<ScenarioReport> {
         if p99 > 400 {
             fail.push(format!("FAIL stall p99 {p99}ms > 2 × 200ms RTO hold"));
         }
+    }
+    // P3 door: the lossy path's loaded loop (RTO holds) is a backup to the
+    // clean siblings' — it must have read unfit at least once on the
+    // sender, and the clean siblings never.
+    let lossy_unfit = srv
+        .paths
+        .iter()
+        .filter(|p| p.name.starts_with('d'))
+        .map(|p| p.loop_unfit_total)
+        .max()
+        .unwrap_or(0);
+    let clean_unfit: u64 = srv
+        .paths
+        .iter()
+        .filter(|p| !p.name.starts_with('d'))
+        .map(|p| p.loop_unfit_total)
+        .sum();
+    if lossy_unfit == 0 {
+        fail.push("FAIL lossy path never read loop-unfit".into());
+    }
+    if clean_unfit > 2 {
+        fail.push(format!(
+            "FAIL clean siblings read unfit {clean_unfit} times"
+        ));
     }
     if !fail.is_empty() {
         r.notes.extend(fail);

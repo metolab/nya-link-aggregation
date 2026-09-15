@@ -168,6 +168,10 @@ pub struct PathState {
     /// Last loop-fit verdict sampled by `maintain` and fit→unfit count (P3.4).
     pub loop_fit_last: AtomicBool,
     pub loop_unfit_total: AtomicU64,
+    /// P3.3: `mono_us` of the last incoming `loop_unfit` re-stick onto this
+    /// path (0 = never). A dest takes another only once it has recorded an
+    /// `ack_rtt` sample since, and never within `bw_window_us`.
+    pub restick_in_at_us: AtomicU64,
     /// Duplicated socket fd for `TCP_INFO` (P6). `None` off Linux, in unit
     /// tests over duplex pipes, and after path IO exit.
     pub tcp_fd: std::sync::Mutex<Option<crate::net::PathFd>>,
@@ -247,6 +251,7 @@ impl PathState {
             ack_rtt_at_us: AtomicU64::new(0),
             loop_fit_last: AtomicBool::new(true),
             loop_unfit_total: AtomicU64::new(0),
+            restick_in_at_us: AtomicU64::new(0),
             tcp_fd: std::sync::Mutex::new(None),
         })
     }
@@ -265,6 +270,86 @@ impl PathState {
 
     pub fn loop_fit_last(&self) -> bool {
         self.loop_fit_last.load(Ordering::Relaxed)
+    }
+
+    /// KD7: the loaded ACK RTT unless the path has been idle (nothing in
+    /// flight) for longer than its bandwidth window — then a stale loop
+    /// must not stretch the first rounds after the idle.
+    pub fn ack_rtt_fresh(&self) -> Option<Duration> {
+        let a = self.ack_rtt()?;
+        if self.inflight_bytes() == 0 {
+            let at = self.ack_rtt_at_us.load(Ordering::Relaxed);
+            let age = crate::metrics::mono_us().saturating_sub(at);
+            if at == 0 || age > self.bw_window_us() {
+                return None;
+            }
+        }
+        Some(a)
+    }
+
+    /// P3.1 `loaded(p)`: the expected sojourn of a piece placed now, from
+    /// what the path is doing — the fresh ACK loop, floored by how long it
+    /// has been quiet with bytes outstanding (a stuck path with no ACK for
+    /// 300 ms reads ≥ 300 ms even without a sample). `None` = idle.
+    pub fn loaded_sojourn(&self) -> Option<Duration> {
+        let outstanding = self.inflight_bytes() > 0;
+        match self.ack_rtt_fresh() {
+            Some(a) if outstanding => Some(a.max(self.last_rx_ago())),
+            Some(a) => Some(a),
+            // First round after an idle: no fresh loop yet. The quiet
+            // floor applies, but never below the path's own RTT — a
+            // just-fed path with a 1 ms `last_rx_ago` is not a 1 ms loop
+            // (it would make every loaded sibling a backup).
+            None if outstanding => {
+                let base = self.min_rtt().unwrap_or_else(|| self.rtt());
+                Some(base.max(self.last_rx_ago()))
+            }
+            None => None,
+        }
+    }
+
+    /// P3.1 `decayed(p)`: an idle path keeps its last loaded loop, decaying
+    /// linearly toward `min_rtt` over `MIN_RTT_WIN_US` — otherwise under
+    /// pool-wide loss every idle path looks best and N streams herd onto
+    /// it each tick. `None` if never loaded or RTT unknown.
+    pub fn decayed_sojourn(&self) -> Option<Duration> {
+        let last = self.ack_rtt()?;
+        let m = self.min_rtt()?;
+        let at = self.ack_rtt_at_us.load(Ordering::Relaxed);
+        if at == 0 {
+            return None;
+        }
+        let age = crate::metrics::mono_us().saturating_sub(at);
+        let frac = 1.0 - (age as f64 / MIN_RTT_WIN_US as f64).min(1.0);
+        let extra = last.saturating_sub(m).mul_f64(frac);
+        Some(m + extra)
+    }
+
+    /// P3.1: the expected sojourn used for the pool reference — loaded,
+    /// else decayed, else the quiet min RTT.
+    pub fn sojourn(&self) -> Option<Duration> {
+        self.loaded_sojourn()
+            .or_else(|| self.decayed_sojourn())
+            .or_else(|| self.min_rtt())
+    }
+
+    /// P3.1: is this path a fit home for bulk *relative to the pool*? A
+    /// path is unfit only when its (loaded or decaying) loop is a backup
+    /// (`2× + 20 ms`) to the best sojourn anywhere in the pool. Never
+    /// loaded = fit. Also records the fit → unfit transition counter.
+    pub fn loop_fit(&self, cfg: &crate::SessionConfig, pool_ref: Option<Duration>) -> bool {
+        let fit = match (
+            self.loaded_sojourn().or_else(|| self.decayed_sojourn()),
+            pool_ref,
+        ) {
+            (Some(a), Some(r)) => !crate::health::is_backup(cfg, a, r),
+            _ => true,
+        };
+        let was = self.loop_fit_last.swap(fit, Ordering::Relaxed);
+        if was && !fit {
+            self.loop_unfit_total.fetch_add(1, Ordering::Relaxed);
+        }
+        fit
     }
 
     /// EWMA(1/8) update of the loaded ACK RTT.
@@ -350,7 +435,7 @@ impl PathState {
             return;
         }
         let round_us = self
-            .ack_rtt()
+            .ack_rtt_fresh()
             .or_else(|| self.min_rtt())
             .map(|d| d.as_micros() as u64)
             .unwrap_or(Tuning::STANDARD.unknown_rtt_us)
@@ -430,7 +515,10 @@ impl PathState {
         );
         let sagged = full > 0 && (bw_now as f64) < full as f64 * (1.0 - BUDGET_GROWTH_MIN);
         let probe_from = self.probe_from.swap(0, Ordering::Relaxed);
-        let loop_us = self.ack_rtt().map(|d| d.as_micros() as u64).unwrap_or(0);
+        let loop_us = self
+            .ack_rtt_fresh()
+            .map(|d| d.as_micros() as u64)
+            .unwrap_or(0);
         let carried = (bw_now as u128 * loop_us as u128 / 1_000_000) as u64;
 
         if stepped {

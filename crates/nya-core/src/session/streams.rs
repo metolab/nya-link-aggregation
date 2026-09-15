@@ -267,8 +267,21 @@ impl Session {
                             alt
                         })
                         .or_else(|| {
-                            if crate::scheduler::any_bulk_room(&self.path_list()) {
-                                self.pick_pref(pref)
+                            // P3.2 (iv): split by *why* we got here. A
+                            // sticky that exists but is full is overflow:
+                            // fit-only with room, else park — never a
+                            // re-home onto an unfit path that P3.3 could
+                            // not undo for 10 s. No sticky at all
+                            // (first bulk piece, sticky gone): re-home
+                            // fit-or-all inside the any-room guard.
+                            if sticky_full {
+                                let alt = self.pick_bulk(Some(sticky)).filter(|id| {
+                                    self.get_path(*id).is_some_and(|p| self.loop_fit(&p))
+                                });
+                                overflow = alt.is_some();
+                                alt
+                            } else if crate::scheduler::any_bulk_room(&self.path_list()) {
+                                self.pick_bulk(None).or_else(|| self.pick_pref(pref))
                             } else {
                                 None
                             }
@@ -321,6 +334,27 @@ impl Session {
                         .metrics
                         .hol_rebalances
                         .fetch_add(1, Ordering::Relaxed);
+                }
+                // P3.2 (i): HOL first, fit second. Nothing has been sent
+                // yet; if the home-to-be is unfit and a *fit* alternative
+                // has room, the first bulk piece goes there and sticks.
+                let unfit = self.get_path(path_id).is_some_and(|p| !self.loop_fit(&p));
+                if unfit {
+                    if let Some(f) = self
+                        .pick_bulk(Some(path_id))
+                        .filter(|id| self.get_path(*id).is_some_and(|p| self.loop_fit(&p)))
+                    {
+                        debug!(
+                            stream_id = st.id,
+                            from = path_id,
+                            to = f,
+                            reason = "loop_unfit",
+                            "restick"
+                        );
+                        path_id = f;
+                        overflow = false;
+                        self.note_migrate("loop_unfit");
+                    }
                 }
             }
             if !overflow {
