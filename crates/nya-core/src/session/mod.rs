@@ -3318,8 +3318,10 @@ mod tests {
     /// degrade clock — a gap between Pongs is not silence.
     #[tokio::test]
     async fn retry_after_bulk_at_least_degrade() {
-        let mut cfg = SessionConfig::default();
-        cfg.ping_interval_max = Duration::from_millis(50);
+        let cfg = SessionConfig {
+            ping_interval_max: Duration::from_millis(50),
+            ..Default::default()
+        };
         let client = Session::new_client(cfg);
         let (p, _w, _u) = inject_live(&client, 1, "a#0", 5);
         p.record_ack_rtt(Duration::from_millis(10));
@@ -6041,6 +6043,9 @@ mod tests {
             crate::metrics::mono_ms().saturating_sub(80).max(1),
             Ordering::Relaxed,
         );
+        // The StreamOpen retry clock (`retry_after`) is not under test and
+        // fires on a loaded runner; treat the Open as acknowledged.
+        client.forget_open(id);
         let hedge0 = client.snapshot().data_hedge;
         let rtx0 = client.snapshot().data_retransmit;
         client.debug_maintain();
