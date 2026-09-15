@@ -6035,6 +6035,10 @@ mod tests {
             for x in u.values_mut() {
                 x.tried = vec![1, 2];
                 x.last_sent = Instant::now() - Duration::from_millis(100);
+                // The stall clock starts at the oldest outstanding piece's
+                // first send; backdate it too or `scan_stall` clears the
+                // stall this test set by hand.
+                x.first_sent = Instant::now() - Duration::from_millis(100);
                 x.retry_not_before = Instant::now() - Duration::from_millis(100);
             }
         }
