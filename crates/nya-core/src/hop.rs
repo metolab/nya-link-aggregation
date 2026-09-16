@@ -292,6 +292,14 @@ pub struct HopSample {
     pub waits: Option<HopWaits>,
     /// Kernel `TCP_INFO` of the origin socket at copy end (server, Linux).
     pub origin_tcp: Option<crate::net::TcpInfo>,
+    /// How an `Ok` copy ended: `"eof"` (both sides closed) or `"reaped"`
+    /// (the session removed the stream first; see
+    /// [`copy_bidirectional_timed_until`]). `None` when the copy did not
+    /// run or errored.
+    pub close: Option<&'static str>,
+    /// Bytes read from the local peer after the stream was gone (never
+    /// delivered; included in `rx_bytes`). `None` when the copy did not run.
+    pub dropped_bytes: Option<u64>,
 }
 
 /// Copy-task wait times, µs (P1.2). `local` is the origin socket on the
@@ -325,12 +333,33 @@ pub struct DirCopy {
     pub read_wait_us: u64,
     /// Wall time spent with `poll_write` Pending.
     pub write_wait_us: u64,
+    /// Bytes read from this direction's source that were discarded because
+    /// the overlay stream was gone before they could be written.
+    pub dropped_bytes: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CopyOutcome {
     pub a_to_b: DirCopy,
     pub b_to_a: DirCopy,
+    /// The `a→b` direction was ended by the overlay stream's removal
+    /// (`b_gone`), not by `a`'s EOF. See [`copy_bidirectional_timed_until`].
+    pub reaped: bool,
+}
+
+impl CopyOutcome {
+    /// `nya.close` label for an `Ok` copy.
+    pub fn close_label(&self) -> &'static str {
+        if self.reaped {
+            "reaped"
+        } else {
+            "eof"
+        }
+    }
+
+    pub fn dropped_bytes(&self) -> u64 {
+        self.a_to_b.dropped_bytes + self.b_to_a.dropped_bytes
+    }
 }
 
 /// Buffer per direction. Pinned to tokio's `copy_bidirectional` size: the
@@ -475,28 +504,52 @@ impl DirState {
     }
 }
 
-struct CopyTimed<'a, A: ?Sized, B: ?Sized> {
+struct CopyTimed<'a, A: ?Sized, B: ?Sized, G> {
     a: &'a mut A,
     b: &'a mut B,
     ab: DirState,
     ba: DirState,
+    /// Resolves when `b`'s overlay stream is gone. Fused: taken on Ready.
+    gone: Option<Pin<Box<G>>>,
+    reaped: bool,
 }
 
-impl<A, B> Future for CopyTimed<'_, A, B>
+impl<A, B, G> Future for CopyTimed<'_, A, B, G>
 where
     A: AsyncRead + AsyncWrite + Unpin + ?Sized,
     B: AsyncRead + AsyncWrite + Unpin + ?Sized,
+    G: Future<Output = ()>,
 {
     type Output = io::Result<CopyOutcome>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let me = self.get_mut();
+        if let Some(g) = me.gone.as_mut() {
+            if g.as_mut().poll(cx).is_ready() {
+                me.gone = None;
+                // `b`'s overlay stream no longer exists: nothing read from
+                // `a` can be delivered. Treat `a→b` as at EOF (unless it
+                // already is — a graceful close racing the removal keeps
+                // its own label) so the existing flush → shutdown → done
+                // sequence runs. Shutting down `b`'s writer is what lets
+                // the pump behind it exit and `b→a` reach EOF after
+                // draining what was already written.
+                if !me.ab.read_done {
+                    me.ab.ready();
+                    me.ab.out.dropped_bytes += (me.ab.cap - me.ab.pos) as u64;
+                    me.ab.pos = me.ab.cap;
+                    me.ab.read_done = true;
+                    me.reaped = true;
+                }
+            }
+        }
         let ab = me.ab.poll(cx, &mut *me.a, &mut *me.b)?;
         let ba = me.ba.poll(cx, &mut *me.b, &mut *me.a)?;
         match (ab, ba) {
             (Poll::Ready(()), Poll::Ready(())) => Poll::Ready(Ok(CopyOutcome {
                 a_to_b: me.ab.out,
                 b_to_a: me.ba.out,
+                reaped: me.reaped,
             })),
             _ => Poll::Pending,
         }
@@ -513,11 +566,43 @@ where
     A: AsyncRead + AsyncWrite + Unpin + ?Sized,
     B: AsyncRead + AsyncWrite + Unpin + ?Sized,
 {
+    CopyTimed::<A, B, std::future::Pending<()>> {
+        a,
+        b,
+        ab: DirState::new(),
+        ba: DirState::new(),
+        gone: None,
+        reaped: false,
+    }
+    .await
+}
+
+/// [`copy_bidirectional_timed`] whose `a→b` direction is also ended when
+/// `b_gone` resolves — `b` is the overlay `TunnelStream`, `b_gone` its
+/// [`crate::TunnelStream::gone`]. Once the session has removed the stream,
+/// bytes read from `a` have no destination; the copier stops reading `a`,
+/// counts anything buffered as `dropped_bytes`, shuts down `b`'s writer,
+/// and finishes when `b→a` has drained to EOF. Without this, a local peer
+/// that never sends EOF after our half-close keeps the copy, its socket
+/// and the pump alive for a stream the session forgot (`nya-server-hytron`:
+/// 843 fds / 84 MB after 19 h). `reaped` is set on the outcome.
+pub async fn copy_bidirectional_timed_until<A, B, G>(
+    a: &mut A,
+    b: &mut B,
+    b_gone: G,
+) -> io::Result<CopyOutcome>
+where
+    A: AsyncRead + AsyncWrite + Unpin + ?Sized,
+    B: AsyncRead + AsyncWrite + Unpin + ?Sized,
+    G: Future<Output = ()>,
+{
     CopyTimed {
         a,
         b,
         ab: DirState::new(),
         ba: DirState::new(),
+        gone: Some(Box::pin(b_gone)),
+        reaped: false,
     }
     .await
 }
@@ -604,6 +689,10 @@ impl HopSample {
         if let Some(ref e) = self.copy_err {
             parts.push(format!("copy_err={e}"));
         }
+        if let Some(c) = self.close {
+            parts.push(format!("close={c}"));
+        }
+        push(&mut parts, "dropped_bytes", self.dropped_bytes);
         if let Some(ref st) = self.stream {
             parts.push(format!(
                 "limiter={} wblk={} bblk={} wroom={} cap_max={} hedges={} dup_rx={} paths={} hole_us={} hole_max={} backlog_max={} zw_hole={} zw_app={} diverts={}",
@@ -635,8 +724,8 @@ impl HopSample {
         }
         if let Some(t) = self.origin_tcp {
             parts.push(format!(
-                "origin_tcp_rtt_us={} origin_tcp_retrans={} origin_tcp_bytes_retrans={} origin_tcp_rwnd_limited_us={} origin_tcp_rcv_ooopack={}",
-                t.rtt_us, t.total_retrans, t.bytes_retrans, t.rwnd_limited_us, t.rcv_ooopack
+                "origin_tcp_rtt_us={} origin_tcp_retrans={} origin_tcp_bytes_retrans={} origin_tcp_bytes_sent={} origin_tcp_app_limited={} origin_tcp_rwnd_limited_us={} origin_tcp_rcv_ooopack={}",
+                t.rtt_us, t.total_retrans, t.bytes_retrans, t.bytes_sent, u8::from(t.app_limited), t.rwnd_limited_us, t.rcv_ooopack
             ));
         }
         parts.join(" ")
@@ -672,6 +761,8 @@ impl HopSample {
             nya.rx_bytes = tracing::field::Empty,
             nya.tx_bytes = tracing::field::Empty,
             nya.copy_err = tracing::field::Empty,
+            nya.close = tracing::field::Empty,
+            nya.dropped_bytes = tracing::field::Empty,
             nya.limiter = tracing::field::Empty,
             nya.window_blocks = tracing::field::Empty,
             nya.budget_blocks = tracing::field::Empty,
@@ -696,6 +787,8 @@ impl HopSample {
             nya.origin_tcp_min_rtt_us = tracing::field::Empty,
             nya.origin_tcp_retrans = tracing::field::Empty,
             nya.origin_tcp_bytes_retrans = tracing::field::Empty,
+            nya.origin_tcp_bytes_sent = tracing::field::Empty,
+            nya.origin_tcp_app_limited = tracing::field::Empty,
             nya.origin_tcp_delivery_rate = tracing::field::Empty,
             nya.origin_tcp_busy_us = tracing::field::Empty,
             nya.origin_tcp_rwnd_limited_us = tracing::field::Empty,
@@ -730,6 +823,10 @@ impl HopSample {
         if let Some(ref e) = self.copy_err {
             span.record("nya.copy_err", e.as_str());
         }
+        if let Some(c) = self.close {
+            span.record("nya.close", c);
+        }
+        rec(&span, "nya.dropped_bytes", self.dropped_bytes);
         if let Some(ref st) = self.stream {
             span.record("nya.limiter", self.limiter().unwrap_or("none"));
             span.record("nya.window_blocks", st.window_blocks);
@@ -765,6 +862,8 @@ impl HopSample {
             span.record("nya.origin_tcp_min_rtt_us", u64::from(t.min_rtt_us));
             span.record("nya.origin_tcp_retrans", u64::from(t.total_retrans));
             span.record("nya.origin_tcp_bytes_retrans", t.bytes_retrans);
+            span.record("nya.origin_tcp_bytes_sent", t.bytes_sent);
+            span.record("nya.origin_tcp_app_limited", t.app_limited);
             span.record("nya.origin_tcp_delivery_rate", t.delivery_rate_bytes_s);
             span.record("nya.origin_tcp_busy_us", t.busy_time_us);
             span.record("nya.origin_tcp_rwnd_limited_us", t.rwnd_limited_us);
@@ -2085,6 +2184,112 @@ mod tests {
         assert_eq!(back_t, back_r);
         assert_eq!(back_t, b"reply");
         assert_eq!(got_t.len(), 20_000);
+    }
+
+    /// §B: the local peer (`a_far`) never sends EOF after the overlay side
+    /// finished. Without `b_gone` the copy would sit in `a→b` read forever
+    /// (the hytron 843-fd shape). With it, cancelling ends `a→b`, shuts
+    /// `b`'s writer, and the copy returns `reaped` once `b→a` drains.
+    #[tokio::test]
+    async fn copier_until_ends_when_stream_gone_and_local_never_eofs() {
+        let (mut a_far, mut a) = tokio::io::duplex(4096);
+        let (mut b_far, mut b) = tokio::io::duplex(4096);
+        let gone = tokio_util::sync::CancellationToken::new();
+        let g = gone.clone();
+        let copier = tokio::spawn(async move {
+            let r = copy_bidirectional_timed_until(&mut a, &mut b, g.cancelled_owned()).await;
+            (r, a, b)
+        });
+        // Overlay side delivers a reply and closes its write half; the
+        // local peer reads it but never closes.
+        b_far.write_all(b"reply").await.unwrap();
+        b_far.shutdown().await.unwrap();
+        let mut got = [0u8; 5];
+        a_far.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"reply");
+        // Still running: a→b has no EOF.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !copier.is_finished(),
+            "copy must wait for a's EOF until gone"
+        );
+        gone.cancel();
+        let (r, _a, _b) = tokio::time::timeout(Duration::from_secs(1), copier)
+            .await
+            .expect("gone must end the copy")
+            .unwrap();
+        let o = r.unwrap();
+        assert!(o.reaped);
+        assert_eq!(o.close_label(), "reaped");
+        assert_eq!(o.b_to_a.bytes, 5);
+        assert_eq!(o.a_to_b.bytes, 0);
+        assert_eq!(o.dropped_bytes(), 0);
+        // b's writer was shut: the overlay far end sees EOF.
+        let mut rest = Vec::new();
+        b_far.read_to_end(&mut rest).await.unwrap();
+        assert!(rest.is_empty());
+        drop(a_far);
+    }
+
+    /// §B: a graceful close that completes before `b_gone` fires keeps the
+    /// `eof` label — the token must not relabel a normal end.
+    #[tokio::test]
+    async fn copier_until_graceful_close_is_eof() {
+        let (mut a_far, mut a) = tokio::io::duplex(1024);
+        let (mut b_far, mut b) = tokio::io::duplex(1024);
+        let gone = tokio_util::sync::CancellationToken::new();
+        let g = gone.clone();
+        let copier = tokio::spawn(async move {
+            copy_bidirectional_timed_until(&mut a, &mut b, g.cancelled_owned()).await
+        });
+        a_far.write_all(b"ask").await.unwrap();
+        a_far.shutdown().await.unwrap();
+        let mut got = Vec::new();
+        b_far.read_to_end(&mut got).await.unwrap();
+        b_far.write_all(b"reply").await.unwrap();
+        b_far.shutdown().await.unwrap();
+        let mut back = Vec::new();
+        a_far.read_to_end(&mut back).await.unwrap();
+        let o = copier.await.unwrap().unwrap();
+        assert!(!o.reaped);
+        assert_eq!(o.close_label(), "eof");
+        assert_eq!((o.a_to_b.bytes, o.b_to_a.bytes), (3, 5));
+        // Cancelling afterwards is a no-op.
+        gone.cancel();
+    }
+
+    /// §B: bytes already read from `a` but not yet written to `b` when the
+    /// stream is gone are counted as `dropped_bytes`, not delivered.
+    #[tokio::test]
+    async fn copier_until_counts_dropped_bytes() {
+        // b's pipe holds 16 bytes and nobody reads it: a→b writes 16 then
+        // blocks with the remainder of the 64-byte read in its buffer.
+        let (mut a_far, mut a) = tokio::io::duplex(4096);
+        let (mut b_far, mut b) = tokio::io::duplex(16);
+        let gone = tokio_util::sync::CancellationToken::new();
+        let g = gone.clone();
+        let copier = tokio::spawn(async move {
+            copy_bidirectional_timed_until(&mut a, &mut b, g.cancelled_owned()).await
+        });
+        a_far.write_all(&[9u8; 64]).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        gone.cancel();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        // a→b is done (reaped); b→a still needs the overlay EOF.
+        assert!(!copier.is_finished());
+        let mut drained = [0u8; 16];
+        b_far.read_exact(&mut drained).await.unwrap();
+        drop(b_far);
+        let o = tokio::time::timeout(Duration::from_secs(1), copier)
+            .await
+            .expect("finishes after overlay EOF")
+            .unwrap()
+            .unwrap();
+        assert!(o.reaped);
+        assert_eq!(o.a_to_b.bytes, 16, "delivered bytes stay in `bytes`");
+        assert_eq!(o.a_to_b.dropped_bytes, 48);
+        assert_eq!(o.dropped_bytes(), 48);
+        drop(a_far);
     }
 
     /// Error on either side ends the copy with that error and partial counts.

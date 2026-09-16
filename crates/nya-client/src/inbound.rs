@@ -8,8 +8,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tracing::{info, warn, Instrument};
 
 use nya_core::{
-    copy_bidirectional_timed, io_err_kind, HopClock, HopOutcome, HopProbe, HopRole, HopSample,
-    HopWaits, Session, TunnelStream,
+    copy_bidirectional_timed_until, io_err_kind, HopClock, HopOutcome, HopProbe, HopRole,
+    HopSample, HopWaits, Session, TunnelStream,
 };
 use nya_proto::Target;
 
@@ -265,12 +265,16 @@ async fn copy_with_hop(
     let clock = HopClock::new();
     let stream_id = tun.id;
     let mut overlay = HopProbe::wrap(tun, clock.clone());
+    // Owned before `&mut overlay` is borrowed by the copy.
+    let gone = overlay.inner().gone();
     let t_copy = Instant::now();
-    let copy = copy_bidirectional_timed(&mut tcp, &mut overlay).await;
+    let copy = copy_bidirectional_timed_until(&mut tcp, &mut overlay, gone).await;
     let (outcome, copy_err, waits) = match &copy {
         Ok(o) => (HopOutcome::Ok, None, Some(HopWaits::from_outcome(o))),
         Err(e) => (HopOutcome::CopyErr, Some(io_err_kind(e)), None),
     };
+    let close = copy.as_ref().ok().map(|o| o.close_label());
+    let dropped_bytes = copy.as_ref().ok().map(|o| o.dropped_bytes());
     // P1.1: counters live on the handle, past any reap.
     let stream = Some(overlay.inner().stats());
     session.process().record_hop(HopSample {
@@ -289,6 +293,8 @@ async fn copy_with_hop(
         copy_err,
         stream,
         waits,
+        close,
+        dropped_bytes,
         ..Default::default()
     });
 }

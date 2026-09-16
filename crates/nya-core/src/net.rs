@@ -78,6 +78,13 @@ pub struct TcpInfo {
     pub sndbuf_limited_us: u64,
     pub bytes_retrans: u64,
     pub rcv_ooopack: u32,
+    /// `tcpi_bytes_sent` (RFC 4898 `DataOctetsOut`, includes retransmits;
+    /// Linux ≥ 4.19). Denominator for the retransmitted-bytes ratio.
+    pub bytes_sent: u64,
+    /// `tcpi_delivery_rate_app_limited`: the kernel's last delivery-rate
+    /// sample was capped by the application, i.e. we (not cwnd) were the
+    /// limiter of this socket.
+    pub app_limited: bool,
 }
 
 /// Owned duplicate of a socket fd for `TCP_INFO` reads that outlive the
@@ -142,6 +149,10 @@ pub fn parse_tcp_info(buf: &[u8]) -> TcpInfo {
         sndbuf_limited_us: u64_at(buf, 184),
         bytes_retrans: u64_at(buf, 208),
         rcv_ooopack: u32_at(buf, 224),
+        bytes_sent: u64_at(buf, 200),
+        // Byte 7 is the bitfield after snd_wscale/rcv_wscale (byte 6):
+        // `delivery_rate_app_limited:1, fastopen_client_fail:2`.
+        app_limited: buf.len() > 7 && (buf[7] & 0x01) != 0,
     }
 }
 
@@ -284,6 +295,8 @@ mod tests {
         assert!(t.min_rtt_us > 0, "{t:?}");
         assert_eq!(t.total_retrans, 0);
         assert_eq!(t.bytes_retrans, 0);
+        // Linux ≥ 4.19 reports bytes_sent; the 4 KiB we wrote are in it.
+        assert!(t.bytes_sent >= 4096, "{t:?}");
         // receiver side reads too (P1.5 fields are parsed only when the
         // kernel returns them; a short struct leaves them 0, never garbage).
         assert!(tcp_info_of(&b).is_some());
@@ -295,6 +308,14 @@ mod tests {
         assert_eq!(t.snd_mss, 0);
         assert_eq!(t.cwnd_bytes, 0);
         assert_eq!(t.delivery_rate_bytes_s, 0);
+        // Pre-4.19 struct (no bytes_sent): 0, and never garbage.
+        let t = parse_tcp_info(&[0xffu8; 200]);
+        assert_eq!(t.bytes_sent, 0);
+        assert_eq!(t.bytes_retrans, 0);
+        // Shorter than the bitfield byte: app_limited is false.
+        let t = parse_tcp_info(&[0xffu8; 7]);
+        assert!(!t.app_limited);
+        assert!(parse_tcp_info(&[0xffu8; 8]).app_limited);
     }
 
     #[test]
@@ -308,10 +329,14 @@ mod tests {
         b[144..148].copy_from_slice(&65_536u32.to_ne_bytes());
         b[160..168].copy_from_slice(&6_250_000u64.to_ne_bytes());
         b[176..184].copy_from_slice(&123_456u64.to_ne_bytes());
+        b[200..208].copy_from_slice(&1_000_000u64.to_ne_bytes());
         b[208..216].copy_from_slice(&9_999u64.to_ne_bytes());
         b[224..228].copy_from_slice(&3u32.to_ne_bytes());
+        b[7] = 0b0000_0101; // app_limited=1, fastopen_client_fail=0b10
         let t = parse_tcp_info(&b);
         assert_eq!(t.rwnd_limited_us, 123_456);
+        assert_eq!(t.bytes_sent, 1_000_000);
+        assert!(t.app_limited);
         assert_eq!(t.bytes_retrans, 9_999);
         assert_eq!(t.rcv_ooopack, 3);
         assert_eq!(t.snd_mss, 1448);

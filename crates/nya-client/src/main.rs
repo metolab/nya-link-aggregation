@@ -34,6 +34,8 @@ async fn main() -> Result<()> {
             )
             .init();
     }
+    // Static fd baseline: before any session dial or inbound listener.
+    nya_core::procself::mark_fd_baseline();
 
     #[cfg(feature = "otel")]
     let session = {

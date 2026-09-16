@@ -204,6 +204,11 @@ pub fn visit_metrics(ps: &ProcessSnapshot, sink: &mut impl MetricSink) {
         s.probe_miss,
     );
     sink.counter(
+        "nya_pings_total",
+        "pings written to the wire, all paths",
+        s.pings_sent,
+    );
+    sink.counter(
         "nya_window_blocks_total",
         "times send waited on stream window",
         s.window_blocks,
@@ -349,7 +354,7 @@ pub fn visit_metrics(ps: &ProcessSnapshot, sink: &mut impl MetricSink) {
     ] {
         sink.counter_labeled(
             "nya_stall_enter_total",
-            "stall entries by kind",
+            "stall entries by kind (since v0.1.7: busy bursts no longer count; not comparable with earlier versions)",
             &[("kind", kind)],
             v,
         );
@@ -474,6 +479,11 @@ pub fn visit_metrics(ps: &ProcessSnapshot, sink: &mut impl MetricSink) {
         p.sessions_created,
     );
     sink.counter("nya_sessions_dead_total", "sessions dead", p.sessions_dead);
+    sink.counter(
+        "nya_hop_reaped_total",
+        "hop copies ended by stream removal while the local peer had not sent EOF",
+        p.hop_reaped,
+    );
 
     sink.gauge(
         "nya_streams_stalled",
@@ -489,6 +499,29 @@ pub fn visit_metrics(ps: &ProcessSnapshot, sink: &mut impl MetricSink) {
         s.streams_held,
     );
     sink.gauge("nya_sessions_live", "live sessions", &[], p.sessions_live);
+    sink.counter(
+        "nya_process_cpu_ms_total",
+        "process CPU time user+sys, ms (/proc/self/stat; Linux only)",
+        p.process_cpu_ms,
+    );
+    sink.gauge(
+        "nya_process_open_fds",
+        "open file descriptors (/proc/self/fd; Linux only)",
+        &[],
+        p.process_open_fds,
+    );
+    sink.gauge(
+        "nya_process_open_fds_baseline",
+        "open fds recorded at process start before any session or listener",
+        &[],
+        p.process_open_fds_baseline,
+    );
+    sink.gauge(
+        "nya_process_rss_bytes",
+        "resident set size (/proc/self/status VmRSS; Linux only)",
+        &[],
+        p.process_rss_bytes,
+    );
     sink.gauge(
         "nya_recv_cap_extra_bytes",
         "sum over live streams of recv_cap above the floor (P2.4)",
@@ -510,7 +543,7 @@ pub fn visit_metrics(ps: &ProcessSnapshot, sink: &mut impl MetricSink) {
     );
     sink.histogram(
         "nya_stall_ms",
-        "send-unacked or recv-hole stall duration, milliseconds",
+        "send-unacked or recv-hole stall duration, milliseconds (clock redefined in v0.1.7; not comparable with earlier versions)",
         STALL_MS_BOUNDS,
         &s.stall_ms,
     );
@@ -748,6 +781,18 @@ pub fn visit_metrics(ps: &ProcessSnapshot, sink: &mut impl MetricSink) {
             "kernel bytes_retrans of this socket",
             &lab,
             t.bytes_retrans,
+        );
+        sink.counter_labeled(
+            "nya_path_tcp_bytes_sent_total",
+            "kernel bytes_sent of this socket (incl. retransmits); ratio denominator",
+            &lab,
+            t.bytes_sent,
+        );
+        sink.gauge(
+            "nya_path_tcp_app_limited",
+            "1 if the kernel's last delivery-rate sample was app-limited (we were the limiter)",
+            &lab,
+            u64::from(t.app_limited),
         );
         sink.gauge(
             "nya_path_tcp_busy_us",

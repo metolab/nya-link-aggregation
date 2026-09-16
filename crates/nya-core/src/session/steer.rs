@@ -177,7 +177,7 @@ impl Session {
             if !p.is_alive() {
                 continue;
             }
-            let loss_for = health::loss_timeout(&self.inner.cfg, p.stable_rtt());
+            let loss_for = self.loss_timeout_for(p);
             let miss = p.expire_stale_pings(loss_for);
             if miss > 0 {
                 self.inner
@@ -953,6 +953,20 @@ impl Session {
 
     pub(super) fn degrade_for(&self, p: &PathState) -> Duration {
         health::degrade_timeout(&self.inner.cfg, p.rtt_known(), p.stable_rtt())
+    }
+
+    /// The clock `maintain` hands to `expire_stale_pings`: how long an
+    /// in-flight Ping may go unanswered. The write task uses the same
+    /// clock to know when its Pong gate can clear.
+    pub fn loss_timeout_for(&self, p: &PathState) -> Duration {
+        health::loss_timeout(&self.inner.cfg, p.stable_rtt())
+    }
+
+    pub(crate) fn note_ping_sent(&self) {
+        self.inner
+            .metrics
+            .pings_sent
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// P7: bulk-destination freshness; the complement of `maintain`'s

@@ -418,6 +418,12 @@ mod tests {
         assert!(body.contains("nya_failover_ms_count 5"));
         assert!(body.contains("# TYPE nya_sessions_live gauge"));
         assert!(body.contains("# TYPE nya_streams_held gauge"));
+        assert!(body.contains("# TYPE nya_pings_total counter"));
+        assert!(body.contains("# TYPE nya_hop_reaped_total counter"));
+        assert!(body.contains("# TYPE nya_process_cpu_ms_total counter"));
+        assert!(body.contains("# TYPE nya_process_open_fds gauge"));
+        assert!(body.contains("# TYPE nya_process_open_fds_baseline gauge"));
+        assert!(body.contains("# TYPE nya_process_rss_bytes gauge"));
         assert!(body.contains("# TYPE nya_path_added_total counter"));
     }
 
@@ -448,7 +454,7 @@ mod tests {
         assert!(names.contains("nya_path_rtt_us"));
         assert!(names.contains("nya_failover_ms_bucket"));
         let n_counter = names.iter().filter(|n| n.ends_with("_total")).count();
-        assert_eq!(n_counter, 70, "{names:?}");
+        assert_eq!(n_counter, 74, "{names:?}");
         assert!(names.contains("nya_path_ack_pending"));
         assert!(names.contains("nya_ack_flush_us_bucket"));
         assert!(names.contains("nya_path_outlier_recycle_total"));

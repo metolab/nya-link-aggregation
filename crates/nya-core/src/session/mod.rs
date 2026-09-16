@@ -1690,6 +1690,10 @@ impl Session {
         }
     }
 
+    /// The single point where a stream leaves `streams`. The `streams`
+    /// guard is a temporary of the `let-else` and is released before the
+    /// body runs; `gone.cancel()` therefore wakes hop copiers with no
+    /// session lock held.
     fn remove_held_stream(&self, id: u32) {
         let Some(st) = self.inner.streams.lock().unwrap().remove(&id) else {
             return;
@@ -1697,6 +1701,7 @@ impl Session {
         self.unstick(&st);
         self.release_unacked(&st);
         self.forget_open(id);
+        st.gone.cancel();
     }
 
     fn xfer_inflight(&self, from: u32, to: u32, n: u64) {
@@ -2270,6 +2275,7 @@ impl Drop for Inner {
                     .inbound_tx
                     .try_send(crate::stream::Inbound::Reset(ResetReason::SessionDead));
                 st.send_wait.notify_waiters();
+                st.gone.cancel();
                 if st
                     .counted_close
                     .compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed)
@@ -2638,6 +2644,145 @@ mod tests {
                 }
             });
         }
+    }
+
+    /// §A: with the peer answering and pinging back, RX lands inside every
+    /// `ping_every`, so `next_ping` is always in the past when the gate is
+    /// checked. The timer arm must wait for the gate to open, not fire
+    /// back-to-back (v0.1.1–v0.1.7 spun here at one core per process).
+    /// Ping cadence itself must be unchanged.
+    #[tokio::test]
+    async fn idle_pair_writer_timer_wakes_are_bounded() {
+        let (client, server) = pair_echo(&["a"]).await;
+        for s in [&client, &server] {
+            for p in s.path_list() {
+                p.timer_wakes.store(0, Ordering::Relaxed);
+            }
+        }
+        let pings0 = (client.snapshot().pings_sent, server.snapshot().pings_sent);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        for (s, who) in [(&client, "client"), (&server, "server")] {
+            for p in s.path_list() {
+                let wakes = p.timer_wakes.load(Ordering::Relaxed);
+                // Gate interval is ping_interval_min (10 ms) here: a few
+                // wakes per interval at most; a spin is 10^5+.
+                assert!(
+                    wakes <= 400,
+                    "{who} {}: {wakes} timer wakes in 500 ms is a spin",
+                    p.name
+                );
+                assert!(p.is_alive(), "{who} {}", p.name);
+            }
+        }
+        let pings1 = (client.snapshot().pings_sent, server.snapshot().pings_sent);
+        assert!(
+            pings1.0 - pings0.0 >= 8 && pings1.1 - pings0.1 >= 8,
+            "ping cadence must survive the wake fix: {pings0:?} -> {pings1:?}"
+        );
+        assert_eq!(client.snapshot().probe_miss, 0);
+        assert_eq!(server.snapshot().probe_miss, 0);
+        client.shutdown();
+        server.shutdown();
+    }
+
+    /// §A: a Pong never comes. `should_send_ping` is false while the ping
+    /// is pending, and `next_ping` is in the past; the writer must wake at
+    /// the loss-timeout expiry cadence (≤ one per maintain tick), then
+    /// keep probing.
+    #[tokio::test]
+    async fn unanswered_ping_writer_timer_wakes_are_bounded() {
+        let client = Session::new_client(SessionConfig::default());
+        let (a, _peer) = duplex(64 * 1024);
+        let _done = client.start_path("p#0".into(), a);
+        let p = client.path_list().into_iter().next().unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let wakes = p.timer_wakes.load(Ordering::Relaxed);
+        assert!(
+            wakes <= 150,
+            "{wakes} timer wakes in 300 ms with a pending ping is a spin"
+        );
+        assert!(
+            client.snapshot().pings_sent >= 2,
+            "probing must continue after the first ping expires"
+        );
+        assert!(client.snapshot().probe_miss >= 1);
+        client.shutdown();
+    }
+
+    /// §B end-to-end inside one process: the origin swallows the request
+    /// and never sends EOF after the client's close. The client's linger
+    /// reset makes the server remove the stream; the server's hop copy must
+    /// end on that removal (`reaped`), not hang holding the origin socket
+    /// (nya-server-hytron: 843 fds / 84 MB after 19 h).
+    #[tokio::test]
+    async fn server_hop_copy_ends_when_stream_reaped_without_origin_eof() {
+        let mut cfg = SessionConfig::default();
+        cfg.tuning.loss_timeout_floor = Duration::from_millis(150);
+        cfg.all_down_timeout = Duration::from_secs(2);
+        cfg.tuning.close_linger = Duration::from_millis(200);
+        let client = Session::new_client(cfg.clone());
+        let (server, mut incoming) = Session::new_server(cfg);
+        let (ca, sa) = duplex(64 * 1024);
+        {
+            let c = client.clone();
+            let s = server.clone();
+            tokio::spawn(async move { c.add_path("a".into(), ca).await });
+            tokio::spawn(async move { s.add_path("a".into(), sa).await });
+        }
+        client.wait_paths(1, Duration::from_secs(2)).await.unwrap();
+
+        let (copy_tx, copy_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let inc = incoming.recv().await.expect("stream open");
+            // "origin": far end reads everything, never closes.
+            let (mut origin, mut origin_far) = duplex(4096);
+            let swallow = tokio::spawn(async move {
+                let mut b = [0u8; 1024];
+                loop {
+                    match origin_far.read(&mut b).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                }
+                origin_far
+            });
+            let mut tun = inc.io;
+            let gone = tun.gone();
+            let r = crate::hop::copy_bidirectional_timed_until(&mut origin, &mut tun, gone).await;
+            let _ = copy_tx.send(r);
+            drop(swallow);
+        });
+
+        let mut tun = client
+            .open_stream(Target {
+                host: "t".into(),
+                port: 1,
+            })
+            .await
+            .unwrap();
+        tun.write_all(b"hello").await.unwrap();
+        tun.shutdown().await.unwrap();
+        drop(tun);
+
+        let r = tokio::time::timeout(Duration::from_secs(5), copy_rx)
+            .await
+            .expect("server hop copy must end once the stream is reaped")
+            .unwrap();
+        let o = r.expect("copy ends Ok, not Err");
+        assert!(o.reaped, "{o:?}");
+        assert_eq!(o.close_label(), "reaped");
+        assert_eq!(o.b_to_a.bytes, 5, "client bytes reached the origin: {o:?}");
+        assert_eq!(o.a_to_b.bytes, 0);
+        assert_eq!(o.dropped_bytes(), 0);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            server.inner.streams.lock().unwrap().len(),
+            0,
+            "server must hold no stream after the copy ended"
+        );
+        assert_eq!(client.inner.streams.lock().unwrap().len(), 0);
+        client.shutdown();
+        server.shutdown();
     }
 
     #[tokio::test]

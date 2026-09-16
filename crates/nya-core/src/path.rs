@@ -74,6 +74,10 @@ pub struct PathState {
     pub ack_wait: Notify,
     /// Writer dequeue wakeup. Bulk `send_data` waits here on a full queue.
     pub queue_wait: Notify,
+    /// Times the write task's ping timer arm fired without a ping being
+    /// due. Diagnostic for the idle-spin fix: bounded by one per gate
+    /// interval, not one per loop iteration.
+    pub timer_wakes: AtomicU64,
     pub rtt_ewma_us: AtomicU64,
     pub rtt_stable_us: AtomicU64,
     /// Two-sided class membership. 0 = unset (`class_rtt()` falls back to fast).
@@ -198,6 +202,7 @@ impl PathState {
             pending_acks: std::sync::Mutex::new(HashMap::new()),
             ack_wait: Notify::new(),
             queue_wait: Notify::new(),
+            timer_wakes: AtomicU64::new(0),
             rtt_ewma_us: AtomicU64::new(0),
             rtt_stable_us: AtomicU64::new(0),
             rtt_class_us: AtomicU64::new(0),
@@ -1309,15 +1314,46 @@ pub fn spawn_path_io<T>(
 
         let session_w = session.clone();
         let path_w = path.clone();
+        let maintain_tick = session.config().tuning.maintain_interval;
         let mut write_task = tokio::spawn(async move {
             let mut next_ping = tokio::time::Instant::now();
             loop {
                 let ping_every = session_w.probe_interval_for(&path_w);
                 let deadline = session_w.write_deadline(path_w.id);
-                let ping_due = tokio::time::Instant::now() >= next_ping
+                let now = tokio::time::Instant::now();
+                let ago = path_w.last_rx_ago();
+                let ping_due = now >= next_ping
                     && path_w.is_alive()
                     && !session_w.is_dead()
-                    && path_w.should_send_ping(path_w.last_rx_ago(), ping_every);
+                    && path_w.should_send_ping(ago, ping_every);
+                // The timer arm must never target an instant already past:
+                // while the ping is gated (Pong outstanding, or RX within
+                // `ping_every`) `next_ping` lies behind `now`, and sleeping
+                // until it returns immediately — the loop then spins without
+                // yielding (v0.1.1–v0.1.7: one core per process). Wait for the
+                // earliest instant at which `should_send_ping` can flip.
+                // Every wait below is ≥ 1 ms even if an operator sets
+                // `ping_interval_min` to 0.
+                let gate = ping_every.max(Duration::from_millis(1));
+                let ping_wait = if now < next_ping {
+                    next_ping
+                } else if let Some(age) = path_w.pending_ping_age() {
+                    // The pending gate clears when `maintain` expires the
+                    // ping at `loss_timeout`; wake within one tick of that.
+                    // Floor at one tick, cap at `gate`; `min` first so a
+                    // `ping_min` below the tick cannot invert the clamp.
+                    let loss_for = session_w.loss_timeout_for(&path_w);
+                    let floor = maintain_tick.min(gate);
+                    now + loss_for.saturating_sub(age).clamp(floor, gate)
+                } else if ago < ping_every {
+                    // Idle gate: opens when the path has been silent for
+                    // `ping_every`.
+                    now + (ping_every - ago).max(Duration::from_millis(1))
+                } else {
+                    // Not alive / session dead / no ping would be sent: the
+                    // other arms (frames, ACKs, close) drive the loop.
+                    now + gate
+                };
                 let acks_ready = path_w.ack_pending() > 0;
 
                 tokio::select! {
@@ -1350,6 +1386,7 @@ pub fn spawn_path_io<T>(
                                 if !stalled {
                                     path_w.set_write_stalled(false);
                                 }
+                                session_w.note_ping_sent();
                                 next_ping = tokio::time::Instant::now() + ping_every;
                             }
                             WriteOne::Interrupted => {
@@ -1510,7 +1547,9 @@ pub fn spawn_path_io<T>(
                             }
                         }
                     }
-                    _ = tokio::time::sleep_until(next_ping), if !ping_due => {}
+                    _ = tokio::time::sleep_until(ping_wait), if !ping_due => {
+                        path_w.timer_wakes.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
         });

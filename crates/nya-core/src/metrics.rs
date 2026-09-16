@@ -194,6 +194,8 @@ pub struct Counters {
     pub reset_retry: AtomicU64,
     pub pick_rtt_us: AtomicU64,
     pub probe_miss: AtomicU64,
+    /// Pings written to the wire (all paths).
+    pub pings_sent: AtomicU64,
     pub window_blocks: AtomicU64,
     /// Bulk piece waited for per-path budget room (P2).
     pub send_budget_blocks: AtomicU64,
@@ -291,6 +293,7 @@ impl Default for Counters {
             reset_retry: AtomicU64::new(0),
             pick_rtt_us: AtomicU64::new(0),
             probe_miss: AtomicU64::new(0),
+            pings_sent: AtomicU64::new(0),
             window_blocks: AtomicU64::new(0),
             send_budget_blocks: AtomicU64::new(0),
             send_window_limited_with_room: AtomicU64::new(0),
@@ -517,6 +520,7 @@ pub struct Snapshot {
     pub reset_retry: u64,
     pub pick_rtt_us: u64,
     pub probe_miss: u64,
+    pub pings_sent: u64,
     pub window_blocks: u64,
     pub send_budget_blocks: u64,
     pub send_window_limited_with_room: u64,
@@ -626,6 +630,7 @@ impl Snapshot {
             self.pick_rtt_us = other.pick_rtt_us;
         }
         self.probe_miss += other.probe_miss;
+        self.pings_sent += other.pings_sent;
         self.window_blocks += other.window_blocks;
         self.send_budget_blocks += other.send_budget_blocks;
         self.send_window_limited_with_room += other.send_window_limited_with_room;
@@ -708,6 +713,7 @@ impl Counters {
             reset_retry: self.reset_retry.load(Ordering::Relaxed),
             pick_rtt_us: self.pick_rtt_us.load(Ordering::Relaxed),
             probe_miss: self.probe_miss.load(Ordering::Relaxed),
+            pings_sent: self.pings_sent.load(Ordering::Relaxed),
             window_blocks: self.window_blocks.load(Ordering::Relaxed),
             send_budget_blocks: self.send_budget_blocks.load(Ordering::Relaxed),
             send_window_limited_with_room: self
@@ -836,6 +842,9 @@ pub struct ProcessCounters {
     pub sessions_created: AtomicU64,
     pub sessions_dead: AtomicU64,
     pub sessions_live: AtomicU64,
+    /// Hops whose copy ended because the session removed the stream while
+    /// the local peer had not sent EOF (`nya.close = reaped`).
+    pub hop_reaped: AtomicU64,
     hop_open_ms: Histogram,
     hop_first_rx_ms: Histogram,
     hop_last_rx_ms: Histogram,
@@ -864,6 +873,7 @@ impl Default for ProcessCounters {
             sessions_created: AtomicU64::new(0),
             sessions_dead: AtomicU64::new(0),
             sessions_live: AtomicU64::new(0),
+            hop_reaped: AtomicU64::new(0),
             hop_open_ms: Histogram::new(STALL_MS_BOUNDS),
             hop_first_rx_ms: Histogram::new(STALL_MS_BOUNDS),
             hop_last_rx_ms: Histogram::new(STALL_MS_BOUNDS),
@@ -894,6 +904,9 @@ impl ProcessCounters {
             "hop"
         );
         sample.emit_otel_span();
+        if sample.close == Some("reaped") {
+            self.hop_reaped.fetch_add(1, Ordering::Relaxed);
+        }
         match sample.role {
             HopRole::Client => {
                 observe_us_as_ms(&self.hop_open_ms, sample.open_us);
@@ -936,6 +949,11 @@ impl ProcessCounters {
             sessions_created: self.sessions_created.load(Ordering::Relaxed),
             sessions_dead: self.sessions_dead.load(Ordering::Relaxed),
             sessions_live: self.sessions_live.load(Ordering::Relaxed),
+            hop_reaped: self.hop_reaped.load(Ordering::Relaxed),
+            process_cpu_ms: crate::procself::cpu_ms().unwrap_or(0),
+            process_open_fds: crate::procself::open_fds().unwrap_or(0),
+            process_open_fds_baseline: crate::procself::fd_baseline(),
+            process_rss_bytes: crate::procself::rss_bytes().unwrap_or(0),
             hop_open_ms: self.hop_open_ms.snap(),
             hop_first_rx_ms: self.hop_first_rx_ms.snap(),
             hop_last_rx_ms: self.hop_last_rx_ms.snap(),
@@ -982,6 +1000,12 @@ pub struct ProcessCountersSnap {
     pub sessions_created: u64,
     pub sessions_dead: u64,
     pub sessions_live: u64,
+    pub hop_reaped: u64,
+    /// `/proc/self` at snapshot time (Linux; 0 elsewhere).
+    pub process_cpu_ms: u64,
+    pub process_open_fds: u64,
+    pub process_open_fds_baseline: u64,
+    pub process_rss_bytes: u64,
     pub hop_open_ms: HistSnap,
     pub hop_first_rx_ms: HistSnap,
     pub hop_last_rx_ms: HistSnap,

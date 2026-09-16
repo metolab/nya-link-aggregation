@@ -845,6 +845,7 @@ TYPE 行必写。counter 名加 `_total`；gauge 不加；histogram 用 raw→cu
 | `data_retransmit` | `nya_data_retransmit_total` | frames |
 | `data_hedge` | `nya_data_hedge_total` | frames |
 | `probe_miss` | `nya_probe_miss_total` | pings |
+| `pings_sent` | `nya_pings_total` | pings（写到线上的 Ping；空闲时上界 Σ 1/`probe_interval_for`，对端 ping/pong 会复位 idle gate，所以实际 ≤ 上界） |
 | `window_blocks` | `nya_window_blocks_total` | events |
 | `picks_unknown_rtt` | `nya_picks_unknown_rtt_total` | streams |
 | `picks_unknown_over_known` | `nya_picks_unknown_over_known_total` | streams |
@@ -888,10 +889,12 @@ TYPE 行必写。counter 名加 `_total`；gauge 不加；histogram 用 raw→cu
 | `streams_stalled` | `nya_streams_stalled` | 无 | streams |
 | `streams_live` | `nya_streams_live` | 无 | streams |
 | `sessions_live` | `nya_sessions_live` | 无 | sessions |
+| `ProcessCounters.hop_reaped` | `nya_hop_reaped_total`（counter） | 无 | 会话已 `remove_held_stream` 但本地对端（origin/app）未发 EOF、由 copier 自行收尾的 hop；对应 span `nya.close=reaped` |
+| `/proc/self` | `nya_process_cpu_ms_total`（counter）/ `nya_process_open_fds` / `nya_process_open_fds_baseline` / `nya_process_rss_bytes` | 无 | 仅 Linux；`baseline` 在 `main()` 任何会话/监听之前采一次。空闲验收：`rate(cpu_ms_total)` ≤ 20 ms/s；泄漏验收：`open_fds − streams_held − 2×alive_paths − baseline` 24 h 平坦 |
 | `PathSnap.rtt_us` 等 | `nya_path_*` | `path`, `link` | 见实现 |
 | `PathSnap.budget_bytes` / `bw_bytes_s` / `ack_rtt_us` | `nya_path_budget_bytes` / `nya_path_bw_bytes_s` / `nya_path_ack_rtt_us` | `path`, `link` | overlay 每路径发送预算、ACK-clock 送达率、bulk ACK 往返 |
 | `PathSnap.delivered` | `nya_path_delivered_bytes_total`（counter） | `path`, `link` | 这条路被 ACK 的 DATA 字节 |
-| `PathSnap.tcp` | `nya_path_tcp_known` / `_cwnd_bytes` / `_unacked_bytes` / `_notsent_bytes` / `_rtt_us` / `_min_rtt_us` / `_delivery_rate_bytes_s` / `_busy_us` / `_rwnd_limited_us` / `_sndbuf_limited_us` / `nya_path_tcp_retrans_total` / `nya_path_tcp_bytes_retrans_total`（counter） | `path`, `link` | Linux `TCP_INFO`；非 Linux 或无 fd 时 `known=0`、其余为 0；`busy`/`rwnd_limited`/`sndbuf_limited`/`bytes_retrans` 旧内核为 0 |
+| `PathSnap.tcp` | `nya_path_tcp_known` / `_cwnd_bytes` / `_unacked_bytes` / `_notsent_bytes` / `_rtt_us` / `_min_rtt_us` / `_delivery_rate_bytes_s` / `_busy_us` / `_rwnd_limited_us` / `_sndbuf_limited_us` / `_app_limited` / `nya_path_tcp_retrans_total` / `nya_path_tcp_bytes_retrans_total` / `nya_path_tcp_bytes_sent_total`（counter） | `path`, `link` | Linux `TCP_INFO`；非 Linux 或无 fd 时 `known=0`、其余为 0；`busy`/`rwnd_limited`/`sndbuf_limited`/`bytes_retrans`/`bytes_sent` 旧内核为 0。丢包归因：`Δbytes_retrans/Δbytes_sent` 配 `app_limited`（1 = 内核被我们限住，不是 cwnd）与 `budget_bytes` vs `cwnd_bytes` 一起读 |
 | `PathSnap.min_rtt_us` / `loop_fit` / `loop_unfit_total` | `nya_path_min_rtt_us` / `nya_path_loop_fit` / `nya_path_loop_unfit_total`（counter） | `path`, `link` | overlay 10 s 窗 min RTT；P3 loop-fit 判定（相对 `pool_ref`，每 `maintain` tick 采样；`loop_unfit_total` 数 fit→unfit 翻转） |
 | `recv_cap_extra_bytes` | `nya_recv_cap_extra_bytes` | 无 | Σ(recv_cap − floor)，P2.4 内存护栏；上限 alive_paths × ceil |
 | `LinkSnap.*` | `nya_link_*` | `link` | 连接数 / RTT / sticky / 队列 / rx |

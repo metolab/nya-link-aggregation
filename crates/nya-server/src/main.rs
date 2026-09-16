@@ -60,6 +60,8 @@ async fn main() -> Result<()> {
             let guard = nya_obs::install("server", env!("CARGO_PKG_VERSION"), &cfg.obs)?;
             #[cfg(not(feature = "otel"))]
             init_fmt();
+            // Static fd baseline: before the listener, exporter, or any session.
+            nya_core::procself::mark_fd_baseline();
 
             #[cfg(feature = "otel")]
             let (listener, table) = {

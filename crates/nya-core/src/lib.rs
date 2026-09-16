@@ -30,6 +30,7 @@ mod hop;
 mod metrics;
 pub mod net;
 mod path;
+pub mod procself;
 mod scheduler;
 mod session;
 mod stream;
@@ -47,8 +48,8 @@ pub use handshake::{
     HandshakeResult,
 };
 pub use hop::{
-    connect_origin, connect_origin_meta, copy_bidirectional_timed, interleave_families,
-    io_err_kind, race_origin_addrs, race_origin_connects, race_origin_lookups,
+    connect_origin, connect_origin_meta, copy_bidirectional_timed, copy_bidirectional_timed_until,
+    interleave_families, io_err_kind, race_origin_addrs, race_origin_connects, race_origin_lookups,
     race_origin_lookups_seeded, session_fp_hex, CopyOutcome, DirCopy, HopClock, HopOutcome,
     HopProbe, HopRole, HopSample, HopWaits, OriginDial, OriginDialMeta, OriginPeerSlots,
 };

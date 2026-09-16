@@ -10,6 +10,7 @@ use bytes::Bytes;
 use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf};
 use tokio::sync::mpsc;
 use tokio::sync::Notify;
+use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
 
 use nya_proto::ResetReason;
 
@@ -47,9 +48,14 @@ pub struct Unacked {
 
 /// The atomics `StreamStats` reads, split out of `StreamState` so a
 /// `TunnelStream` can read them after the session has reaped the stream
-/// (KD13). Holds no channel, buffer or `Notify`: sharing it cannot keep
-/// the pump alive. `StreamState` derefs to it.
+/// (KD13). Holds nothing that can keep the pump alive (no channel, no
+/// buffer; the cancellation token owns no task). `StreamState` derefs to it.
 pub struct StreamCounters {
+    /// Cancelled by `remove_held_stream`: the session has forgotten this
+    /// stream and no byte can cross the overlay for it any more. The hop
+    /// copier watches it so a local peer that never sends EOF cannot keep
+    /// the copy (and its socket) alive past the stream.
+    pub gone: CancellationToken,
     pub send_next: AtomicU64,
     pub send_window: AtomicU32,
     pub recv_next: AtomicU64,
@@ -81,6 +87,7 @@ pub struct StreamCounters {
 impl StreamCounters {
     fn new(initial_window: u32) -> Arc<Self> {
         Arc::new(Self {
+            gone: CancellationToken::new(),
             send_next: AtomicU64::new(0),
             send_window: AtomicU32::new(initial_window),
             recv_next: AtomicU64::new(0),
@@ -570,6 +577,13 @@ impl TunnelStream {
 
     pub fn counters(&self) -> &Arc<StreamCounters> {
         &self.counters
+    }
+
+    /// Resolves once the session has removed this stream from its table.
+    /// Owned (`'static`), so it can be taken before the stream is borrowed
+    /// mutably by the copier.
+    pub fn gone(&self) -> WaitForCancellationFutureOwned {
+        self.counters.gone.clone().cancelled_owned()
     }
 }
 

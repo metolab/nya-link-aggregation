@@ -7,8 +7,9 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn, Instrument};
 
 use nya_core::{
-    connect_origin_meta, copy_bidirectional_timed, io_err_kind, HopClock, HopOutcome, HopProbe,
-    HopRole, HopSample, HopWaits, IncomingStream, OriginDialMeta, OriginPeerSlots, Tuning,
+    connect_origin_meta, copy_bidirectional_timed_until, io_err_kind, HopClock, HopOutcome,
+    HopProbe, HopRole, HopSample, HopWaits, IncomingStream, OriginDialMeta, OriginPeerSlots,
+    Tuning,
 };
 use nya_proto::ResetReason;
 
@@ -103,12 +104,17 @@ pub async fn handle_incoming(mut incoming: mpsc::Receiver<IncomingStream>) {
                     let mut origin = HopProbe::wrap(tcp, origin_clock.clone())
                         .sample_peer_last_on_read(overlay_clock.clone(), slots.clone());
                     let mut overlay = HopProbe::wrap(inc.io, overlay_clock.clone());
+                    // Owned before `&mut overlay` is borrowed by the copy.
+                    let gone = overlay.inner().gone();
                     let t_copy = Instant::now();
-                    let copy = copy_bidirectional_timed(&mut origin, &mut overlay).await;
+                    let copy =
+                        copy_bidirectional_timed_until(&mut origin, &mut overlay, gone).await;
                     let (outcome, copy_err, waits) = match &copy {
                         Ok(o) => (HopOutcome::Ok, None, Some(HopWaits::from_outcome(o))),
                         Err(e) => (HopOutcome::CopyErr, Some(io_err_kind(e)), None),
                     };
+                    let close = copy.as_ref().ok().map(|o| o.close_label());
+                    let dropped_bytes = copy.as_ref().ok().map(|o| o.dropped_bytes());
                     // P1.5: the origin socket is still ours here.
                     let origin_tcp = nya_core::net::tcp_info_of(origin.inner());
                     process.record_hop(HopSample {
@@ -134,6 +140,8 @@ pub async fn handle_incoming(mut incoming: mpsc::Receiver<IncomingStream>) {
                         stream: Some(overlay.inner().stats()),
                         waits,
                         origin_tcp,
+                        close,
+                        dropped_bytes,
                         ..Default::default()
                     });
                 }
